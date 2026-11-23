@@ -110,11 +110,36 @@ private func hasClass(_ name: String, on element: XMLElement) -> Bool {
     return classNames.utf8.split { [9, 10, 12, 13, 32].contains($0) }.contains { $0.elementsEqual(target) }
 }
 
+private func repairedAQICategoryWrapper(for heading: XMLElement) -> XMLElement? {
+    guard heading.localName == "h3", hasClass("air-quality-data", on: heading),
+          heading.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+          let parent = heading.parent as? XMLElement, parent.localName == "div" else { return nil }
+    let wrapper = hasClass("category-color-bar", on: parent) ? parent.parent as? XMLElement : parent
+    guard let wrapper, wrapper.localName == "div", hasClass("air-quality-data-wrapper", on: wrapper) else { return nil }
+    return wrapper
+}
+
+private func isRepairedPollutantCategory(_ category: XMLElement, in card: XMLElement) -> Bool {
+    guard category.localName == "div",
+          let colorBar = category.parent as? XMLElement, colorBar.localName == "div",
+          hasClass("category-color-bar", on: colorBar),
+          let display = colorBar.parent as? XMLElement, display.localName == "div",
+          display.parent === card else { return false }
+    return hasClass("display-type", on: display)
+}
+
 private func field(_ name: String, in card: XMLElement, stopsAtHeading: Bool = false) -> String? {
+    var categoryWrapper: XMLElement?
     for element in elements(in: card, matching: ".//*") {
-        if element.attribute(forName: "data-qa") != nil ||
-            (stopsAtHeading && ["h1", "h2", "h3", "h4", "h5", "h6"].contains(element.localName)) { return nil }
+        if element.attribute(forName: "data-qa") != nil { return nil }
+        if stopsAtHeading && ["h1", "h2", "h3", "h4", "h5", "h6"].contains(element.localName) {
+            guard name == "category-text", let wrapper = repairedAQICategoryWrapper(for: element),
+                  categoryWrapper == nil || categoryWrapper === wrapper else { return nil }
+            categoryWrapper = wrapper
+            continue
+        }
         guard ["p", "div"].contains(element.localName), hasClass(name, on: element) else { continue }
+        if let categoryWrapper, element.parent !== categoryWrapper { return nil }
         let boundaries = ".//*[@data-qa or local-name()='script' or local-name()='h1' or local-name()='h2' or " +
             "local-name()='h3' or local-name()='h4' or local-name()='h5' or local-name()='h6']"
         let value: String?
@@ -122,7 +147,12 @@ private func field(_ name: String, in card: XMLElement, stopsAtHeading: Bool = f
             value = element.stringValue
         } else {
             guard let copy = element.copy() as? XMLElement else { return nil }
-            for nested in elements(in: copy, matching: boundaries) { nested.detach() }
+            let preserveCategoryHeading = name == "category" && isRepairedPollutantCategory(element, in: card)
+            for nested in elements(in: copy, matching: boundaries) {
+                if preserveCategoryHeading, nested.localName == "h3", nested.parent === copy,
+                   nested.attribute(forName: "data-qa") == nil, hasClass("column", on: nested) { continue }
+                nested.detach()
+            }
             value = copy.stringValue
         }
         let text = value?.trimmingCharacters(in: .whitespacesAndNewlines)

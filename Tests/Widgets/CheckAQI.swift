@@ -73,6 +73,65 @@ struct CheckAQI {
         precondition(reading?.pollutants.map(\.name) == ["NO₂", "PM₂.₅", "PM₁₀", "O₃", "SO₂", "CO"])
         precondition(reading?.pollutants.map(\.category) == Array(repeating: "Средний", count: 6))
         precondition(reading?.pollutants.map(\.concentration) == ["1 µg/m³", "2 µg/m³", "3 µg/m³", "4 µg/m³", "5 µg/m³", "6 µg/m³"])
+        let headedCategories = """
+        <div data-qa="airQualityCard">
+          <h2>Current air quality</h2>
+          <div class="air-quality-content">
+            <div class="aq-number">65</div>
+            <div class="air-quality-data-wrapper">
+              <h3 class="air-quality-data">
+                <div class="category-color-bar"></div>
+                <p class="category-text">Poor</p>
+              </h3>
+            </div>
+          </div>
+        </div>
+        <div data-qa="airQualityPollutantNO2">
+          <h3 class="column">
+            <div class="display-type">NO<sub>2</sub></div>
+            <div class="category-color-bar"></div>
+            <div class="category">Fair</div>
+          </h3>
+          <div class="column">
+            <div class="pollutant-concentration">60 &micro;g/m&sup3;</div>
+          </div>
+        </div>
+        """
+        let headedReading = currentAirQuality(in: headedCategories)
+        precondition(headedReading?.index == 65 && headedReading?.pollutants.first?.concentration == "60 µg/m³")
+        precondition(headedReading?.category == "Poor" && headedReading?.pollutants.first?.category == "Fair",
+                     "Current and pollutant categories survive HTML Tidy's heading repair")
+        let afterForecastHeading = headedCategories.replacingOccurrences(of: #"<div class="air-quality-data-wrapper">"#,
+            with: #"<h3>Forecast</h3><div class="air-quality-data-wrapper">"#)
+        precondition(currentAirQuality(in: afterForecastHeading)?.category == nil,
+                     "An ordinary heading still ends the current category search")
+        let forecastWithMatchingClass = headedCategories.replacingOccurrences(of: #"<h3 class="air-quality-data">"#,
+            with: #"<h3 class="air-quality-data">Forecast</h3><h3 class="air-quality-data">"#)
+        let unrelatedColumnHeading = current + """
+        <div data-qa="airQualityPollutantNO2">
+          <div class="category"><h3 class="column">Forecast</h3></div>
+        </div>
+        """
+        let categoryOutsideWrapper = headedCategories
+            .replacingOccurrences(of: #"<p class="category-text">Poor</p>"#, with: "")
+            .replacingOccurrences(of: "    </div>\n  </div>\n</div>", with: """
+                    </div>
+                    <p class="category-text">Forecast</p>
+                  </div>
+                </div>
+                """)
+        let forecastCategory = currentAirQuality(in: forecastWithMatchingClass)?.category
+        let unrelatedCategory = currentAirQuality(in: unrelatedColumnHeading)?.pollutants.first?.category
+        let outsideCategory = currentAirQuality(in: categoryOutsideWrapper)?.category
+        precondition(forecastCategory == nil && unrelatedCategory == nil && outsideCategory == nil,
+                     "Category boundaries must survive heading repair: \(forecastCategory as Any), \(unrelatedCategory as Any), \(outsideCategory as Any)")
+        let foreignPollutantCategory = current + """
+        <div data-qa="airQualityPollutantNO2">
+          <div class="category"><h3 class="column" data-qa="forecast">Poor</h3></div>
+        </div>
+        """
+        precondition(currentAirQuality(in: foreignPollutantCategory)?.pollutants.first?.category == nil,
+                     "A nested card still cannot supply a pollutant category")
         let titled = pollutantCards[0].replacingOccurrences(of: "<div class=\"category\">",
             with: "<h3>NO₂</h3><div class=\"category\">")
         let packaged = current + #"<section data-qa="airQualityPollutants">"# + titled + "</section>"
