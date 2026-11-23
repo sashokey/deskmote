@@ -1,0 +1,6 @@
+{
+  "version": "v1",
+  "draft": false,
+  "prerelease": false,
+  "notes": "- Improved taskbar behavior across Spaces, displays and fullscreen windows. Window actions verify their target before applying changes, and the taskbar restores window geometry after interrupted adjustments.\n- Finder verifies the selected folder before writing and preserves existing files. ZIP creation requires a volume that can publish the complete archive safely.\n- Battery Run handles sleep, wake, power transitions and clock changes more reliably. Air-quality widgets handle more source-page variations.\n- Strengthened release and package verification."
+}

@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+build/
+.build/
+dist/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+default.profraw
+.env
+.env.*
+*.p12
+*.p8
+*.pfx
+*.key
+*.pem

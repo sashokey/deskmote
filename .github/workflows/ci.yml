@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['.github/release.json']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: ''
+    outputs:
+      package_sha256:
+        value: ${{ jobs.check.outputs.package_sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Build and test
+    runs-on: xcode-27
+    timeout-minutes: 45
+    outputs:
+      package_sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode for all runner processes
+        run: |
+          set -euo pipefail
+          source Scripts/lib/xcode.sh
+          select_deskmote_xcode
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcodebuild -version
+          env -u DEVELOPER_DIR /usr/bin/python3 -c 'import fcntl'
+
+      - name: Verify build and release tooling
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sw_vers
+          xcrun swift --version
+          python3 --version
+          node --version
+          python3 -m unittest discover -s Scripts -p 'test_*.py'
+          node --test Scripts/check_release_workflow.mjs
+          python3 Scripts/check_localization.py
+          python3 Scripts/check_debug_switches.py
+
+      - name: Test full build
+        run: bash Scripts/test.sh full
+
+      - name: Test base build
+        run: bash Scripts/test.sh base
+
+      - name: Build and verify base app
+        env:
+          DESKMOTE_VERSION: ${{ inputs.version }}
+        run: bash Scripts/build.sh base
+
+      - name: Build and verify full ZIP
+        id: package
+        env:
+          DESKMOTE_VERSION: ${{ inputs.version }}
+        run: bash Scripts/package_release.sh
+
+      - name: Upload DeskMote
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: DeskMote
+          path: dist/DeskMote-*.zip
+          if-no-files-found: error
+          retention-days: 7

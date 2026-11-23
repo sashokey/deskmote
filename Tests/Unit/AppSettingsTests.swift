@@ -1,0 +1,513 @@
+import AppKit
+import Combine
+import XCTest
+
+@MainActor
+final class SettingsCoordinatorTests: XCTestCase {
+    func testLaunchStateWaitsForTheServiceWhenTheStoredChoiceIsStale() async {
+        let store = makeStore(launchAtLogin: true)
+        let launch = LaunchServiceStub(state: .off)
+        let coordinator = makeCoordinator(store: store, launch: launch)
+
+        XCTAssertNil(coordinator.launchAtLoginState)
+        let firstRefreshAccepted = await coordinator.refreshLaunchAtLoginState()
+        XCTAssertTrue(firstRefreshAccepted)
+        XCTAssertEqual(coordinator.launchAtLoginState, .off)
+
+        launch.state = .requiresApproval
+        let secondRefreshAccepted = await coordinator.refreshLaunchAtLoginState()
+        XCTAssertTrue(secondRefreshAccepted)
+        XCTAssertEqual(coordinator.launchAtLoginState, .requiresApproval)
+    }
+
+    func testLaunchFailureDoesNotChangeStoredMirror() {
+        let store = makeStore(launchAtLogin: false)
+        let launch = LaunchServiceStub(state: .off)
+        launch.setError = TestError.failed
+        let coordinator = makeCoordinator(store: store, launch: launch)
+
+        guard case .failure = coordinator.setLaunchAtLogin(true) else {
+            return XCTFail("expected failure")
+        }
+        XCTAssertFalse(store.launchAtLogin)
+        XCTAssertNil(coordinator.launchAtLoginState)
+    }
+
+    func testLaunchSuccessUpdatesMirrorAndWaitsForActualApprovalState() async {
+        let store = makeStore(launchAtLogin: false)
+        let launch = LaunchServiceStub(state: .off)
+        launch.stateAfterSet = .requiresApproval
+        let coordinator = makeCoordinator(store: store, launch: launch)
+
+        guard case .success = coordinator.setLaunchAtLogin(true) else {
+            return XCTFail("expected success")
+        }
+        XCTAssertTrue(store.launchAtLogin)
+        XCTAssertNil(coordinator.launchAtLoginState)
+        let deadline = ContinuousClock.now + .seconds(1)
+        while coordinator.launchAtLoginState == nil, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertEqual(coordinator.launchAtLoginState, .requiresApproval)
+    }
+
+    func testOlderLaunchRefreshCannotOverwriteNewerResult() async {
+        let reader = ControlledLaunchStateReader()
+        let launch = ControlledLaunchService(reader: reader)
+        let coordinator = SettingsCoordinator(
+            store: makeStore(),
+            launchAtLoginService: launch
+        )
+
+        let older = Task { await coordinator.refreshLaunchAtLoginState() }
+        await reader.waitForReadCount(1)
+        let newer = Task { await coordinator.refreshLaunchAtLoginState() }
+        await reader.waitForReadCount(2)
+
+        await reader.resume(id: 1, state: .on)
+        let newerAccepted = await newer.value
+        XCTAssertTrue(newerAccepted)
+        await reader.resume(id: 0, state: .off)
+        let olderAccepted = await older.value
+        XCTAssertFalse(olderAccepted)
+        XCTAssertEqual(coordinator.launchAtLoginState, .on)
+    }
+
+    func testCancelledRefreshDoesNotPublishAResult() async {
+        let reader = ControlledLaunchStateReader()
+        let launch = ControlledLaunchService(reader: reader)
+        let coordinator = makeCoordinator(launch: launch)
+        let refresh = Task { await coordinator.refreshLaunchAtLoginState() }
+        await reader.waitForReadCount(1)
+        refresh.cancel()
+        await reader.resume(id: 0, state: .on)
+        let accepted = await refresh.value
+        XCTAssertFalse(accepted)
+        XCTAssertNil(coordinator.launchAtLoginState)
+    }
+
+    func testLaunchApprovalCanOpenSystemSettings() {
+        let launch = LaunchServiceStub(state: .requiresApproval)
+        let coordinator = makeCoordinator(launch: launch)
+        coordinator.openLoginItemsSettings()
+        XCTAssertEqual(launch.settingsOpenCount, 1)
+    }
+
+    func testDisablingLoginUpdatesTheStoredChoice() {
+        let store = makeStore(launchAtLogin: true)
+        let launch = LaunchServiceStub(state: .on)
+        let coordinator = makeCoordinator(store: store, launch: launch)
+        guard case .success = coordinator.setLaunchAtLogin(false) else {
+            return XCTFail("Expected successful disable")
+        }
+        XCTAssertFalse(store.launchAtLogin)
+        XCTAssertNil(coordinator.launchAtLoginState)
+        XCTAssertEqual(launch.requests, [false])
+    }
+
+    private func makeCoordinator(
+        store: AppSettingsStore? = nil,
+        launch: LaunchAtLoginServicing? = nil
+    ) -> SettingsCoordinator {
+        SettingsCoordinator(
+            store: store ?? makeStore(),
+            launchAtLoginService: launch ?? LaunchServiceStub(state: .off)
+        )
+    }
+
+    private func makeStore(launchAtLogin: Bool = false) -> AppSettingsStore {
+        let suite = "DeskMote.SettingsCoordinatorTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        defaults.set(launchAtLogin, forKey: "deskmote.launchAtLogin")
+        return AppSettingsStore(defaults: defaults)
+    }
+}
+
+@MainActor
+private final class LaunchServiceStub: LaunchAtLoginServicing {
+    var state: LaunchAtLoginState
+    var stateAfterSet: LaunchAtLoginState?
+    var setError: Error?
+    private(set) var settingsOpenCount = 0
+    private(set) var requests: [Bool] = []
+
+    init(state: LaunchAtLoginState) {
+        self.state = state
+    }
+
+    func currentState() async -> LaunchAtLoginState { state }
+
+    func setEnabled(_ enabled: Bool) throws {
+        requests.append(enabled)
+        if let setError { throw setError }
+        state = stateAfterSet ?? (enabled ? .on : .off)
+    }
+
+    func openSystemSettings() {
+        settingsOpenCount += 1
+    }
+}
+
+private actor ControlledLaunchStateReader {
+    private var nextID = 0
+    private var continuations: [Int: CheckedContinuation<LaunchAtLoginState, Never>] = [:]
+
+    func read() async -> LaunchAtLoginState {
+        let id = nextID
+        nextID += 1
+        return await withCheckedContinuation { continuations[id] = $0 }
+    }
+
+    func waitForReadCount(_ count: Int) async {
+        while nextID < count { await Task.yield() }
+    }
+
+    func resume(id: Int, state: LaunchAtLoginState) {
+        continuations.removeValue(forKey: id)?.resume(returning: state)
+    }
+}
+
+@MainActor
+private final class ControlledLaunchService: LaunchAtLoginServicing {
+    private let reader: ControlledLaunchStateReader
+    private(set) var requests: [Bool] = []
+
+    init(reader: ControlledLaunchStateReader) {
+        self.reader = reader
+    }
+
+    func currentState() async -> LaunchAtLoginState { await reader.read() }
+    func setEnabled(_ enabled: Bool) throws { requests.append(enabled) }
+    func openSystemSettings() {}
+}
+
+private enum TestError: Error {
+    case failed
+}
+
+@MainActor
+final class StatusMenuControllerTests: XCTestCase {
+    private final class StatusItem: StatusItemPresenting {
+        var autosaveName: NSStatusItem.AutosaveName?
+        var menu: NSMenu?
+        var image: NSImage?
+        private var visible: Bool
+        private(set) var visibilityWrites: [Bool] = []
+        private(set) var imageConfigurations = 0
+
+        var isVisible: Bool {
+            get { visible }
+            set { visible = newValue; visibilityWrites.append(newValue) }
+        }
+
+        init(visible: Bool = true) { self.visible = visible }
+
+        func configureAutosaveName(_ name: NSStatusItem.AutosaveName) { autosaveName = name }
+
+        func configureButtonImage(_ image: NSImage?) {
+            self.image = image
+            imageConfigurations += 1
+        }
+    }
+
+    private func makeController(item: StatusItem, launch: any LaunchAtLoginServicing,
+                                modules: [DeskMoteModule] = [],
+                                quit: @escaping @MainActor () -> Void = {}) -> StatusMenuController {
+        let suite = "DeskMote.StatusMenuControllerTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let coordinator = SettingsCoordinator(store: AppSettingsStore(defaults: defaults), launchAtLoginService: launch)
+        return StatusMenuController(settingsCoordinator: coordinator,
+                                    statusItem: item, modules: modules, quit: quit)
+    }
+
+    func testModuleMenuUsesNativeSectionsAndDispatchesOnlySelectedActions() throws {
+        let item = StatusItem()
+        let suite = "DeskMote.ModuleMenuTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        var starts = 0
+        var stops = 0
+        var shows = 0
+        let input = DeskMoteModuleToggle(
+            id: "test-input", title: "Use Shift–Command to Switch Input Sources", defaults: defaults,
+            start: { _ in starts += 1; return .running }, stop: { stops += 1 }
+        )
+        let controller = makeController(
+            item: item, launch: LaunchServiceStub(state: .off),
+            modules: [.toggle(input), .utility(title: "Show Battery Runtime Estimates", show: { shows += 1 })]
+        )
+        let menu = try XCTUnwrap(item.menu)
+        XCTAssertEqual(menu.items.map(\.title), [
+            "Open at Login", "Hide Status Bar Icon", "", "Input", "Use Shift–Command to Switch Input Sources",
+            "", "Utilities", "Show Battery Runtime Estimates", "", "Quit"
+        ])
+        XCTAssertTrue(menu.items[3].isSectionHeader)
+        XCTAssertTrue(menu.items[6].isSectionHeader)
+        XCTAssertEqual(menu.items[4].state, .off)
+        XCTAssertEqual(starts, 0)
+        menu.performActionForItem(at: 4)
+        XCTAssertEqual(menu.items[4].state, .on)
+        XCTAssertEqual(starts, 1)
+        menu.performActionForItem(at: 7)
+        XCTAssertEqual(shows, 1)
+        menu.performActionForItem(at: 4)
+        XCTAssertEqual(menu.items[4].state, .off)
+        XCTAssertEqual(stops, 1)
+        withExtendedLifetime(controller) {}
+    }
+
+    func testDeniedPermissionDoesNotPersistAndSuccessfulActivationRestoresOnNextLaunch() {
+        let suite = "DeskMote.ModuleToggleTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        var access = false
+        var attempts: [Bool] = []
+        var stops = 0
+        func makeToggle() -> DeskMoteModuleToggle {
+            DeskMoteModuleToggle(id: "test-access", title: "Input", defaults: defaults, start: { prompt in
+                attempts.append(prompt)
+                return access ? .running : .permissionRequired
+            }, stop: { stops += 1 })
+        }
+
+        let first = makeToggle()
+        first.restore()
+        XCTAssertTrue(attempts.isEmpty)
+        first.choose()
+        XCTAssertFalse(first.isRunning)
+        makeToggle().restore()
+        XCTAssertEqual(attempts, [true])
+        access = true
+        first.retryWaiting()
+        XCTAssertTrue(first.isRunning)
+        XCTAssertEqual(attempts, [true, false])
+        first.stop()
+        let next = makeToggle()
+        next.restore()
+        XCTAssertTrue(next.isRunning)
+        XCTAssertEqual(attempts, [true, false, false])
+        next.choose()
+        XCTAssertFalse(next.isRunning)
+        XCTAssertEqual(stops, 2)
+        makeToggle().restore()
+        XCTAssertEqual(attempts, [true, false, false])
+    }
+
+    func testUnavailableRestoredModuleStartsOnTheNextSelection() {
+        let suite = "DeskMote.ModuleRestoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: "deskmote.module.test-restore")
+        var starts: [Bool] = []
+        let input = DeskMoteModuleToggle(id: "test-restore", title: "Input", defaults: defaults, start: { prompt in
+            starts.append(prompt)
+            return prompt ? .running : .unavailable
+        }, stop: {})
+        input.restore()
+        XCTAssertFalse(input.isRunning)
+        input.choose()
+        XCTAssertTrue(input.isRunning)
+        XCTAssertEqual(starts, [false, true])
+    }
+
+    func testReportedModuleFailureClearsTheMenuAndTheNextSelectionStartsIt() throws {
+        let item = StatusItem()
+        let suite = "DeskMote.ModuleFailureTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        var starts = 0
+        let input = DeskMoteModuleToggle(id: "test-failure", title: "Input", defaults: defaults, start: { _ in
+            starts += 1
+            return .running
+        }, stop: {})
+        let controller = makeController(item: item, launch: LaunchServiceStub(state: .off), modules: [.toggle(input)])
+        let menu = try XCTUnwrap(item.menu)
+        menu.performActionForItem(at: 4)
+        XCTAssertEqual(menu.items[4].state, .on)
+        input.moduleStopped(.unavailable)
+        XCTAssertEqual(menu.items[4].state, .off)
+        menu.performActionForItem(at: 4)
+        XCTAssertEqual(menu.items[4].state, .on)
+        XCTAssertEqual(starts, 2)
+        withExtendedLifetime(controller) {}
+    }
+
+    func testHideActionChangesOnlyStatusItemVisibilityAndMenuRefreshDoesNotRestoreIt() throws {
+        let item = StatusItem()
+        let launch = LaunchServiceStub(state: .off)
+        var quits = 0
+        let controller = makeController(item: item, launch: launch, quit: { quits += 1 })
+        let menu = try XCTUnwrap(item.menu)
+        XCTAssertEqual(menu.items.map(\.title), ["Open at Login", "Hide Status Bar Icon", "", "Quit"])
+        XCTAssertEqual(menu.items[1].state, .off)
+        menu.performActionForItem(at: 1)
+        XCTAssertFalse(item.isVisible)
+        XCTAssertTrue(menu.items[1].isEnabled)
+        XCTAssertEqual(menu.items[1].state, .on)
+        controller.menuWillOpen(menu)
+        controller.menuDidClose(menu)
+        XCTAssertFalse(item.isVisible)
+        XCTAssertEqual(quits, 0)
+        XCTAssertTrue(launch.requests.isEmpty)
+    }
+
+    func testNativeRestoredVisibilityIsNotOverriddenAtStartup() throws {
+        let item = StatusItem(visible: false)
+        let controller = makeController(item: item, launch: LaunchServiceStub(state: .off))
+        withExtendedLifetime(controller) {
+            XCTAssertEqual(item.autosaveName, "DeskMote.StatusBarIcon")
+            XCTAssertFalse(item.isVisible)
+            XCTAssertTrue(item.visibilityWrites.isEmpty)
+            XCTAssertEqual(item.menu?.items[1].isEnabled, true)
+            XCTAssertEqual(item.menu?.items[1].state, .on)
+            XCTAssertEqual(item.image?.isTemplate, true)
+        }
+    }
+
+    func testRestoringTheIconReusesItsMenuAndStablePersistenceIdentity() throws {
+        let item = StatusItem(visible: false)
+        let controller = makeController(item: item, launch: LaunchServiceStub(state: .off))
+        let menu = try XCTUnwrap(item.menu)
+        controller.showStatusBarIcon()
+        controller.showStatusBarIcon()
+        XCTAssertTrue(item.isVisible)
+        XCTAssertTrue(menu.items[1].isEnabled)
+        XCTAssertEqual(menu.items[1].state, .off)
+        XCTAssertTrue(item.menu === menu)
+        XCTAssertEqual(item.imageConfigurations, 1)
+        XCTAssertEqual(item.autosaveName, "DeskMote.StatusBarIcon")
+        let restoredItem = StatusItem(visible: false)
+        let restoredController = makeController(item: restoredItem, launch: LaunchServiceStub(state: .off))
+        withExtendedLifetime(restoredController) {
+            XCTAssertEqual(restoredItem.autosaveName, item.autosaveName)
+            XCTAssertFalse(restoredItem.isVisible)
+        }
+    }
+
+    func testHideMenuItemTogglesBothWaysFromEitherRestoredState() throws {
+        for initiallyVisible in [false, true] {
+            let item = StatusItem(visible: initiallyVisible)
+            let launch = LaunchServiceStub(state: .off)
+            let controller = makeController(item: item, launch: launch)
+            let menu = try XCTUnwrap(item.menu)
+            XCTAssertTrue(item.visibilityWrites.isEmpty)
+            for expectedVisibility in [!initiallyVisible, initiallyVisible, !initiallyVisible] {
+                controller.menuWillOpen(menu)
+                XCTAssertTrue(menu.items[1].isEnabled)
+                XCTAssertEqual(menu.items[1].state, item.isVisible ? .off : .on)
+                menu.performActionForItem(at: 1)
+                controller.menuDidClose(menu)
+                XCTAssertEqual(item.isVisible, expectedVisibility)
+                XCTAssertEqual(menu.items[1].state, expectedVisibility ? .off : .on)
+                XCTAssertTrue(menu.items[1].isEnabled)
+            }
+            XCTAssertEqual(item.visibilityWrites, [!initiallyVisible, initiallyVisible, !initiallyVisible])
+            XCTAssertTrue(launch.requests.isEmpty)
+            XCTAssertTrue(item.menu === menu)
+        }
+    }
+
+    func testOpeningTheSharedMenuReflectsExternalVisibilityChangesWithoutWritingThem() throws {
+        let item = StatusItem()
+        let controller = makeController(item: item, launch: LaunchServiceStub(state: .off))
+        let menu = try XCTUnwrap(item.menu)
+        for visible in [false, true] {
+            item.isVisible = visible
+            let writes = item.visibilityWrites
+            controller.menuWillOpen(menu)
+            XCTAssertEqual(menu.items[1].state, visible ? .off : .on)
+            XCTAssertTrue(menu.items[1].isEnabled)
+            controller.menuDidClose(menu)
+            XCTAssertEqual(item.visibilityWrites, writes)
+        }
+    }
+
+    func testQuitRemainsSeparateFromHidingTheIcon() throws {
+        let item = StatusItem()
+        var quits = 0
+        let controller = makeController(item: item, launch: LaunchServiceStub(state: .off), quit: { quits += 1 })
+        let menu = try XCTUnwrap(item.menu)
+        withExtendedLifetime(controller) {
+            menu.performActionForItem(at: 3)
+            XCTAssertEqual(quits, 1)
+            XCTAssertTrue(item.isVisible)
+            XCTAssertTrue(item.visibilityWrites.isEmpty)
+        }
+    }
+
+    func testLaunchAtLoginRechecksTheSystemBeforeActingOnTheMenu() async throws {
+        _ = NSApplication.shared
+        let item = StatusItem()
+        let launch = LaunchServiceStub(state: .off)
+        let controller = makeController(item: item, launch: launch)
+        let menu = try XCTUnwrap(item.menu)
+        XCTAssertFalse(menu.items[0].isEnabled)
+        await waitForEnabledLoginItem(menu)
+        XCTAssertEqual(menu.items[0].state, .off)
+        launch.state = .on
+        menu.performActionForItem(at: 0)
+        await waitForLaunchRequests(1, launch: launch)
+        XCTAssertEqual(launch.requests, [false])
+        withExtendedLifetime(controller) {}
+    }
+
+    func testBackgroundLoginStateRefreshCannotDiscardAnAcceptedMenuAction() async throws {
+        _ = NSApplication.shared
+        let reader = ControlledLaunchStateReader()
+        let launch = ControlledLaunchService(reader: reader)
+        let item = StatusItem()
+        let suite = "DeskMote.LoginActionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = SettingsCoordinator(store: AppSettingsStore(defaults: defaults), launchAtLoginService: launch)
+        let controller = StatusMenuController(settingsCoordinator: settings, statusItem: item)
+        let menu = try XCTUnwrap(item.menu)
+        await reader.waitForReadCount(1)
+        await reader.resume(id: 0, state: .on)
+        await waitForEnabledLoginItem(menu)
+        menu.performActionForItem(at: 0)
+        await reader.waitForReadCount(2)
+        let refresh = Task { await settings.refreshLaunchAtLoginState() }
+        await reader.waitForReadCount(3)
+        await reader.resume(id: 2, state: .on)
+        _ = await refresh.value
+        await reader.resume(id: 1, state: .on)
+        let deadline = ContinuousClock.now + .seconds(1)
+        while launch.requests.isEmpty, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertEqual(launch.requests, [false])
+        if !launch.requests.isEmpty {
+            await reader.waitForReadCount(4)
+            await reader.resume(id: 3, state: .off)
+        }
+        withExtendedLifetime(controller) {}
+    }
+
+    func testLaunchAtLoginRemainsIndependentOfIconVisibility() async throws {
+        let item = StatusItem()
+        let launch = LaunchServiceStub(state: .off)
+        let controller = makeController(item: item, launch: launch)
+        let menu = try XCTUnwrap(item.menu)
+        await waitForEnabledLoginItem(menu)
+        menu.performActionForItem(at: 0)
+        await waitForLaunchRequests(1, launch: launch)
+        XCTAssertEqual(launch.requests, [true])
+        menu.performActionForItem(at: 1)
+        controller.showStatusBarIcon()
+        await waitForEnabledLoginItem(menu)
+        menu.performActionForItem(at: 0)
+        await waitForLaunchRequests(2, launch: launch)
+        XCTAssertEqual(launch.requests, [true, false])
+        XCTAssertTrue(item.isVisible)
+    }
+
+    private func waitForEnabledLoginItem(_ menu: NSMenu) async {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while !menu.items[0].isEnabled, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertTrue(menu.items[0].isEnabled)
+    }
+
+    private func waitForLaunchRequests(_ count: Int, launch: LaunchServiceStub) async {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while launch.requests.count < count, ContinuousClock.now < deadline { await Task.yield() }
+    }
+}
