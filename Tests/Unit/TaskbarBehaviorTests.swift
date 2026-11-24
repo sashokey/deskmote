@@ -1268,7 +1268,10 @@ final class TaskbarBehaviorTests: XCTestCase {
         await ready(fixture)
         fixture.desktop.state.withLock { $0.cgOwnerOverride = -43000 }
         try press("editor-a", fixture)
-        await wait { fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"]?.phase == .failure }
+        let pending = fixture.runtime.pendingActionsForTesting
+        XCTAssertEqual(pending.count, 1)
+        for task in pending { await task.value }
+        XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"]?.phase, .failure)
         XCTAssertTrue(fixture.desktop.state.withLock { $0.writes.isEmpty })
         XCTAssertEqual(fixture.desktop.state.withLock { $0.windows[1001]?.status }, .active)
     }
@@ -3137,25 +3140,31 @@ final class WindowLiftBehaviorTests: XCTestCase {
         XCTAssertEqual(desktop.state.withLock { $0.writes }, shouldRestore ? ["1001:AXSize"] : [])
     }
 
-    func testAnimatedLiftPreservesAnUnacknowledgedHeightBetweenNativeAndTarget() async {
+    func testAnimatedLiftPreservesAnUnacknowledgedHeightBetweenNativeAndTarget() async throws {
         let desktop = BehaviorDesktop()
-        let manual = CGRect(x: 0, y: 30, width: 1920, height: 1030)
+        let nativeHeight: CGFloat = 1050
+        let targetHeight: CGFloat = 1016
+        let midpoint = (nativeHeight + targetHeight) / 2
         let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
-        let progression = Mutex((firstWrite: CGRect?.none, positionReads: 0))
+        let progression = Mutex((firstWrite: CGRect?.none, positionReads: 0, manual: CGRect?.none))
         desktop.state.withLock {
-            $0.afterAttributeWrite = { id, attribute in
-                guard id == key.cgWindowID, attribute == kAXSizeAttribute as String else { return }
+            $0.omittedCG = [1002, 2001]
+            $0.afterAttributeWrite = { [weak desktop] id, attribute in
+                guard let desktop, id == key.cgWindowID, attribute == kAXSizeAttribute as String else { return }
                 let current = desktop.state.withLock { $0.windows[id]?.bounds }
                 progression.withLock { if $0.firstWrite == nil { $0.firstWrite = current } }
             }
-            $0.beforeRead = { attribute in
-                guard attribute == kAXPositionAttribute as String else { return }
-                let replace = progression.withLock {
-                    guard $0.firstWrite != nil else { return false }
-                    $0.positionReads += 1
-                    return $0.positionReads == 2
+            $0.beforeRead = { [weak desktop] attribute in
+                guard let desktop, attribute == kAXPositionAttribute as String else { return }
+                let manual = progression.withLock { progress -> CGRect? in
+                    guard var frame = progress.firstWrite else { return nil }
+                    progress.positionReads += 1
+                    guard progress.positionReads == 2 else { return nil }
+                    frame.size.height = frame.height > midpoint ? 1025 : 1041
+                    progress.manual = frame
+                    return frame
                 }
-                if replace { desktop.state.withLock { $0.windows[key.cgWindowID]?.bounds = manual } }
+                if let manual { desktop.state.withLock { $0.windows[key.cgWindowID]?.bounds = manual } }
             }
         }
         let (controller, host) = makeController(desktop, workspaceNotificationCenter: NotificationCenter())
@@ -3165,11 +3174,19 @@ final class WindowLiftBehaviorTests: XCTestCase {
         await controller.scanTask?.value
         let writer = controller.writeTasks[key]
         XCTAssertNotNil(writer)
+        controller.isEnabled = false
+        controller.updatePollTimerLifecycle()
+        controller.updateTrackedProbeLifecycle()
         await writer?.value
 
-        let firstWrite = progression.withLock { $0.firstWrite?.height }
-        XCTAssertGreaterThan(firstWrite ?? 0, 1032)
-        XCTAssertLessThan(firstWrite ?? 0, 1050)
+        let firstWrite = try XCTUnwrap(progression.withLock { $0.firstWrite })
+        let manual = try XCTUnwrap(progression.withLock { $0.manual })
+        let tolerance = WindowLiftAvoidance.frameVerificationTolerance
+        XCTAssertGreaterThanOrEqual(firstWrite.height, targetHeight)
+        XCTAssertLessThan(firstWrite.height, nativeHeight - tolerance)
+        XCTAssertGreaterThan(manual.height, targetHeight + tolerance)
+        XCTAssertLessThan(manual.height, nativeHeight - tolerance)
+        XCTAssertGreaterThan(abs(manual.height - firstWrite.height), tolerance)
         XCTAssertEqual(desktop.state.withLock { $0.windows[key.cgWindowID]?.bounds }, manual)
         XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize"])
         let stopped = await controller.stopAndRestore()
