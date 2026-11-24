@@ -1,5 +1,13 @@
 # DeskMote
 
+## Release approval
+
+Prepare releases as drafts. Apply this check before publishing a release or prerelease, including retries and recovery.
+
+1. Resolve the release tag to its full commit SHA. Find the standalone `CI` runs in this repository for that exact SHA. If a release-manifest-only push did not trigger `CI`, dispatch `ci.yml` at the release tag.
+2. Wait for `CI` to finish and review every run and attempt for that SHA, including earlier attempts. Publish only when the history is available and every run, attempt, and required test step completed successfully. A skipped, cancelled, missing, or unknown result blocks publication. A test failure permanently disqualifies the SHA, even after a successful rerun. Use a new commit and require its own passing `CI`.
+3. Confirm the tag still points to the verified SHA immediately before publishing.
+
 ## Environment
 
 - Build for macOS 27 or later and Apple silicon. Use Xcode 27.2 (27B52), Swift 6, Git, Python 3 and Node.js.
