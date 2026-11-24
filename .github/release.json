@@ -1,6 +1,6 @@
 {
-  "version": "v4",
-  "draft": true,
+  "version": "v5",
+  "draft": false,
   "prerelease": false,
-  "notes": "- Fixed the taskbar disappearing and adjusted windows returning to full height when revealing the auto-hidden macOS Dock on the desktop.\n- Stabilized regression tests for focus handoff after closing windows and for window height adjustment."
+  "notes": "- Added Apps, a launcher with installed app search, pinned apps and folders, customizable catalog views, and a row for running apps including apps without windows.\n- Improved launcher responsiveness, menu transitions, pin reordering, keyboard navigation, tooltips, and control alignment.\n- Disambiguated app names when localized labels collide, including existing cached catalogs.\n- Improved taskbar visibility around macOS system overlays and window activation after transient Accessibility failures."
 }
