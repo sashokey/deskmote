@@ -81,6 +81,49 @@ final class TaskbarRendererTests: XCTestCase {
         func dismiss() { menu = nil }
     }
 
+    func testAppsButtonOpensAndDismissesAnExplicitPopupWithoutWindowGroups() throws {
+        _ = NSApplication.shared
+        let screen = try XCTUnwrap(NSScreen.main)
+        let frame = TaskbarMetrics.panelFrame(on: screen.frame)
+        let panel = NSPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        defer { panel.close() }
+        let popup = Popup()
+        let content = TaskbarContentView(frame: CGRect(origin: .zero, size: frame.size),
+                                         popup: popup, contextMenu: ContextMenu())
+        panel.contentView = content
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DeskMoteTests.AppsPopup.\(UUID())"))
+        content.enableAppsMenu(store: AppsMenuStore(defaults: defaults, applicationDirectories: [],
+                                                   runningApplicationSnapshot: { [] }))
+        var admissions: [Bool] = []
+        content.admitWindowList = { explicit in admissions.append(explicit); return true }
+        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
+            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
+        XCTAssertEqual(button.frame, AppsMenuGeometry.buttonFrame)
+        button.performClick(nil)
+        XCTAssertTrue(popup.content is AppsMenuView)
+        XCTAssertEqual(admissions, [true])
+        XCTAssertTrue(content.hasExplicitPopup)
+        XCTAssertEqual(button.state, .on)
+
+        let otherDisplay = TaskbarContentView(frame: content.frame, popup: Popup(), contextMenu: ContextMenu())
+        otherDisplay.onBackgroundClick = { content.dismissAppsMenu() }
+        let click = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [],
+                                                    timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1,
+                                                    clickCount: 1, pressure: 1))
+        otherDisplay.mouseDown(with: click)
+        XCTAssertFalse(content.hasExplicitPopup)
+        XCTAssertEqual(button.state, .off)
+
+        button.performClick(nil)
+        XCTAssertTrue(content.hasExplicitPopup)
+        content.prepareForHiding()
+        XCTAssertFalse(content.hasExplicitPopup)
+        XCTAssertFalse(popup.isPresented)
+        XCTAssertEqual(button.state, .off)
+        XCTAssertFalse(panel.isVisible)
+    }
+
     @MainActor
     private final class FileDrag: NSObject, NSDraggingInfo {
         weak var draggingDestinationWindow: NSWindow?

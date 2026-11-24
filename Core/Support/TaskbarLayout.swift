@@ -31,6 +31,20 @@ enum TaskbarMetrics {
     }
 }
 
+enum AppsMenuGeometry {
+    static let buttonFrame = CGRect(x: TaskbarMetrics.leadingInset, y: TaskbarMetrics.buttonTop,
+                                   width: 29, height: TaskbarMetrics.buttonHeight)
+    static let windowLeadingInset = buttonFrame.maxX + TaskbarMetrics.buttonSpacing
+
+    static func popupFrame(taskbar: CGRect, screen: CGRect, visibleTop: CGFloat) -> CGRect {
+        let inset: CGFloat = 12
+        let width = min(642, max(0, screen.width - inset * 2))
+        let bottom = taskbar.maxY + inset
+        let height = min(676, max(0, min(screen.maxY, visibleTop) - 8 - bottom))
+        return CGRect(x: screen.minX + inset, y: bottom, width: width, height: height)
+    }
+}
+
 struct TaskbarLayoutWindow: Equatable {
     let id: String
     let desiredWidth: CGFloat
@@ -67,9 +81,10 @@ enum TaskbarLayout {
     }
 
     static func resolve(groups input: [TaskbarLayoutGroup], width: CGFloat,
-                        previewOrder: [String]? = nil) -> TaskbarLayoutResult {
+                        previewOrder: [String]? = nil,
+                        leadingInset: CGFloat = TaskbarMetrics.leadingInset) -> TaskbarLayoutResult {
         let groups = input.filter { !$0.windows.isEmpty }
-        let available = width.isFinite ? max(0, width - TaskbarMetrics.leadingInset - TaskbarMetrics.trailingInset) : 0
+        let available = width.isFinite ? max(0, width - leadingInset - TaskbarMetrics.trailingInset) : 0
         var combined = Set<String>()
         let priorities = groups.filter { $0.windows.count > 1 }
         var candidates = candidates(for: groups, combined: combined)
@@ -102,7 +117,7 @@ enum TaskbarLayout {
         }
 
         let widths = fittedWidths(candidates.map(\.desiredWidth), available: contentWidth)
-        var x = TaskbarMetrics.leadingInset
+        var x = leadingInset
         let buttons = zip(candidates, widths).map { candidate, buttonWidth in
             defer { x += buttonWidth + TaskbarMetrics.buttonSpacing }
             return TaskbarButtonLayout(
@@ -114,7 +129,7 @@ enum TaskbarLayout {
             )
         }
         let overflowFrame = overflow.isEmpty ? nil : CGRect(
-            x: min(x, max(TaskbarMetrics.leadingInset, width - TaskbarMetrics.trailingInset - TaskbarMetrics.overflowWidth)),
+            x: min(x, max(leadingInset, width - TaskbarMetrics.trailingInset - TaskbarMetrics.overflowWidth)),
             y: TaskbarMetrics.buttonTop,
             width: min(TaskbarMetrics.overflowWidth, available),
             height: TaskbarMetrics.buttonHeight

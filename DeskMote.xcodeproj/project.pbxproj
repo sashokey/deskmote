@@ -210,6 +210,12 @@
 		CF33F5D1994448D5BCD5424F = {isa = PBXBuildFile; fileRef = 5CB431CC28174E9C80A53086; };
 		42DF1BB75786469A97FBDE8D = {isa = PBXBuildFile; fileRef = DB55DB751A744E458536784D; };
 		3E958158FEE645A791E6686D = {isa = PBXBuildFile; fileRef = DB55DB751A744E458536784D; };
+		A99000000000000000000008 = {isa = PBXBuildFile; fileRef = A99000000000000000000001; };
+		A99000000000000000000009 = {isa = PBXBuildFile; fileRef = A99000000000000000000002; };
+		A9900000000000000000000A = {isa = PBXBuildFile; fileRef = A99000000000000000000001; };
+		A9900000000000000000000B = {isa = PBXBuildFile; fileRef = A99000000000000000000002; };
+		A9900000000000000000000C = {isa = PBXBuildFile; fileRef = A99000000000000000000003; };
+		A9900000000000000000000D = {isa = PBXBuildFile; fileRef = A99000000000000000000004; };
 		990C73B8755645A6A2C7C8FA = {isa = PBXBuildFile; fileRef = 4F8E48E4B631405DB7B93363; };
 		845E3AC75B674A1DB2254E95 = {isa = PBXBuildFile; fileRef = 8A24DAFE66FE4DD58ED1F6DA; };
 		7E00449F40734FF98AF73E32 = {isa = PBXBuildFile; fileRef = A3CA53A11380411C94525C61; };
@@ -509,6 +515,10 @@
 		24628E8457A743C195444566 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/DesktopViews/TaskbarButtonView.swift"; sourceTree = SOURCE_ROOT; };
 		5CB431CC28174E9C80A53086 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/DesktopViews/TaskbarPopups.swift"; sourceTree = SOURCE_ROOT; };
 		DB55DB751A744E458536784D = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/DesktopViews/TaskbarView.swift"; sourceTree = SOURCE_ROOT; };
+		A99000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/DesktopViews/AppsMenuView.swift"; sourceTree = SOURCE_ROOT; };
+		A99000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/DesktopViews/AppsMenuStore.swift"; sourceTree = SOURCE_ROOT; };
+		A99000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tests/Unit/AppsMenuStoreTests.swift"; sourceTree = SOURCE_ROOT; };
+		A99000000000000000000004 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tests/Unit/AppsMenuViewTests.swift"; sourceTree = SOURCE_ROOT; };
 		4F8E48E4B631405DB7B93363 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "App/DesktopRuntime/TaskbarPresenter.swift"; sourceTree = SOURCE_ROOT; };
 		8A24DAFE66FE4DD58ED1F6DA = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tests/Unit/TaskbarLayoutTests.swift"; sourceTree = SOURCE_ROOT; };
 		A3CA53A11380411C94525C61 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Tests/Unit/TaskbarPresentationTests.swift"; sourceTree = SOURCE_ROOT; };
@@ -657,6 +667,10 @@
 				8A24DAFE66FE4DD58ED1F6DA,
 				4F8E48E4B631405DB7B93363,
 				DB55DB751A744E458536784D,
+				A99000000000000000000001,
+				A99000000000000000000002,
+				A99000000000000000000003,
+				A99000000000000000000004,
 				5CB431CC28174E9C80A53086,
 				24628E8457A743C195444566,
 				3A9AD9233AAF4A50A4976BA4,
@@ -1241,6 +1255,8 @@
 				CE4B249A2C3346E2AEB41DA2,
 				990C73B8755645A6A2C7C8FA,
 				42DF1BB75786469A97FBDE8D,
+				A99000000000000000000008,
+				A99000000000000000000009,
 				2EC1DDE7C5CA431799EE1A93,
 				B9E65B806A194CAB9BF05DBA,
 				F8A4F179D2C24B2EA5ED5181,
@@ -1430,6 +1446,10 @@
 				7E00449F40734FF98AF73E32,
 				845E3AC75B674A1DB2254E95,
 				3E958158FEE645A791E6686D,
+				A9900000000000000000000A,
+				A9900000000000000000000B,
+				A9900000000000000000000C,
+				A9900000000000000000000D,
 				CF33F5D1994448D5BCD5424F,
 				F51C1B1E601A480CAA535288,
 				85FF79B3D196457F900E2ACB,

@@ -13,8 +13,13 @@ extension PanelCoordinator {
         let view = makeTaskbarView(CGRect(origin: .zero, size: frame.size))
         view.taskbarContent.admitWindowList = { [weak self] openedByClick in
             guard let self else { return false }
-            return self.onAccessoryWillOpen?(self, openedByClick ? .explicit : .implicit) ?? true
+            return self.onAccessoryInteraction?(self, openedByClick ? .explicit : .implicit) ?? true
         }
+        view.taskbarContent.onBackgroundClick = { [weak self] in
+            guard let self else { return }
+            _ = self.onAccessoryInteraction?(self, .backgroundClick)
+        }
+        view.taskbarContent.enableAppsMenu()
         view.autoresizingMask = [.width, .height]
         dockContentHost = ManualPanelHost(contentView: view, in: panel)
         taskbarView = view
@@ -28,7 +33,7 @@ extension PanelCoordinator {
             },
             contextMenuVisibilityChanged: { [weak self] visible in
                 guard let self, visible else { return }
-                _ = self.onAccessoryWillOpen?(self, .explicit)
+                _ = self.onAccessoryInteraction?(self, .explicit)
             }
         )
         return true

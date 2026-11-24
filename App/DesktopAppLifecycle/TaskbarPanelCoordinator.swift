@@ -43,9 +43,9 @@ final class PanelCoordinator: NSObject {
     var lastActiveApplicationPID: pid_t?
     var visibilityState = PanelVisibilityState()
     var panelsAreVisible = true
-    var onAccessoryWillOpen: ((PanelCoordinator, AccessoryKind) -> Bool)?
+    var onAccessoryInteraction: ((PanelCoordinator, AccessoryKind) -> Bool)?
 
-    enum AccessoryKind { case explicit, implicit }
+    enum AccessoryKind { case explicit, implicit, backgroundClick }
 
 
     let unitPlacement: TaskbarUnitPlacement

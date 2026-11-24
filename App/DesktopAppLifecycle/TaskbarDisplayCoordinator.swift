@@ -158,7 +158,7 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
             spaceStore: spaceStore
         )
         coordinator.onRequestTaskbarMenu = onRequestTaskbarMenu
-        coordinator.onAccessoryWillOpen = { [weak self] unit, kind in
+        coordinator.onAccessoryInteraction = { [weak self] unit, kind in
             self?.admitAccessory(for: unit, kind: kind) ?? false
         }
         guard startCoordinator(coordinator) else { return nil }
@@ -202,7 +202,11 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
 
     private func admitAccessory(for unit: PanelCoordinator, kind: PanelCoordinator.AccessoryKind) -> Bool {
         let others = units.filter { $0.coordinator !== unit }
-        if kind == .implicit, others.contains(where: { $0.coordinator.taskbarView?.taskbarContent.hasClickedWindowList == true }) {
+        if kind == .backgroundClick {
+            for other in others { other.coordinator.taskbarView?.taskbarContent.dismissAppsMenu() }
+            return true
+        }
+        if kind == .implicit, others.contains(where: { $0.coordinator.taskbarView?.taskbarContent.hasExplicitPopup == true }) {
             return false
         }
         for other in others {

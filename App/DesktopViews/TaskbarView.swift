@@ -37,6 +37,11 @@ final class TaskbarView: NSGlassEffectView {
 }
 
 @MainActor
+private final class TaskbarAppsButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+@MainActor
 final class TaskbarContentView: NSView {
     private enum PointerAnchor: Equatable {
         case mouse(String)
@@ -53,6 +58,7 @@ final class TaskbarContentView: NSView {
     var iconProvider: (TaskbarWindowPresentation) -> NSImage? = { _ in nil }
     var canUseWindowActions: () -> Bool = { true }
     var admitWindowList: (_ openedByClick: Bool) -> Bool = { _ in true }
+    var onBackgroundClick: () -> Void = {}
     private(set) var groups: [TaskbarGroupPresentation] = []
     private(set) var layoutResult = TaskbarLayoutResult(buttons: [], overflowGroups: [], overflowFrame: nil, combinedGroups: [])
     private(set) var buttonViews: [String: TaskbarButtonView] = [:]
@@ -64,6 +70,10 @@ final class TaskbarContentView: NSView {
     private weak var windowList: TaskbarWindowListView?
     private var listOpenedByClick = false
     var hasClickedWindowList: Bool { listOpenedByClick && popup.isPresented }
+    var hasExplicitPopup: Bool { popup.isPresented && (listOpenedByClick || appsMenu != nil) }
+    private var appsStore: AppsMenuStore?
+    private var appsButton: NSButton?
+    private weak var appsMenu: AppsMenuView?
     private var pointerAnchor: PointerAnchor?
     private var hoverTask: Task<Void, Never>?
     private var dismissTask: Task<Void, Never>?
@@ -107,6 +117,8 @@ final class TaskbarContentView: NSView {
             self?.listSignature = []
             self?.windowList = nil
             self?.listOpenedByClick = false
+            self?.appsMenu = nil
+            self?.appsButton?.state = .off
         }
     }
 
@@ -116,6 +128,53 @@ final class TaskbarContentView: NSView {
         hoverTask?.cancel()
         dismissTask?.cancel()
         fileHover.cancel()
+    }
+
+    func enableAppsMenu(store: AppsMenuStore = .shared) {
+        guard appsButton == nil else { return }
+        appsStore = store
+        let title = String(localized: "Apps")
+        let button = TaskbarAppsButton(frame: AppsMenuGeometry.buttonFrame)
+        button.setButtonType(.toggle)
+        button.bezelStyle = .accessoryBar
+        button.showsBorderOnlyWhileMouseInside = true
+        button.imagePosition = .imageOnly
+        button.image = NSImage(systemSymbolName: "square.grid.3x3.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .semibold))
+        button.toolTip = title
+        button.setAccessibilityLabel(title)
+        button.setAccessibilityIdentifier("DeskMote.Apps")
+        button.target = self
+        button.action = #selector(toggleAppsMenu)
+        addSubview(button)
+        appsButton = button
+        needsLayout = true
+    }
+
+    @objc private func toggleAppsMenu() {
+        guard let appsButton, let appsStore else { return }
+        if appsMenu != nil {
+            dismissPopups()
+            return
+        }
+        appsButton.state = .off
+        guard let window, let screen = window.screen ?? NSScreen.main, admitWindowList(true) else { return }
+        let frame = appsFrame(window: window, screen: screen)
+        guard !frame.isEmpty else { return }
+        dismissPopups()
+        cancelFileHover()
+        let menu = AppsMenuView(frame: CGRect(origin: .zero, size: frame.size), store: appsStore,
+                                dismiss: { [weak self] in self?.dismissPopups() })
+        popup.present(content: menu, frame: frame, anchorWindow: window)
+        appsMenu = menu
+        appsButton.state = .on
+        popup.makeKey()
+        menu.focusSearch()
+    }
+
+    private func appsFrame(window: NSWindow, screen: NSScreen) -> CGRect {
+        AppsMenuGeometry.popupFrame(taskbar: window.frame, screen: screen.frame,
+                                    visibleTop: screen.visibleFrame.maxY)
     }
 
     func update(groups: [TaskbarGroupPresentation], refreshIcons: Bool = false) {
@@ -161,11 +220,13 @@ final class TaskbarContentView: NSView {
         }
         let inputs = groups.compactMap { measuredLayoutGroups?[$0.id] }
         let previewOrder = groupDrag.target.map { _ in groupDrag.order(groups.map(\.id)) }
-        var result = TaskbarLayout.resolve(groups: inputs, width: bounds.width, previewOrder: previewOrder)
+        let leadingInset = appsButton == nil ? TaskbarMetrics.leadingInset : AppsMenuGeometry.windowLeadingInset
+        var result = TaskbarLayout.resolve(groups: inputs, width: bounds.width, previewOrder: previewOrder,
+                                           leadingInset: leadingInset)
         if let draggedGroupID,
            Set(result.buttons.filter { $0.groupID == draggedGroupID }.map(\.id)) != dragButtonIDs {
             endGroupDrag(event: nil, cancelled: true)
-            result = TaskbarLayout.resolve(groups: inputs, width: bounds.width)
+            result = TaskbarLayout.resolve(groups: inputs, width: bounds.width, leadingInset: leadingInset)
         }
         let changed = result != layoutResult
         layoutResult = result
@@ -233,6 +294,9 @@ final class TaskbarContentView: NSView {
             view.onHover = { [weak self] entered in self?.hover(buttonID: "overflow", entered: entered) }
         } else { overflowButton?.removeFromSuperview(); overflowButton = nil }
         updateOpenList(using: groupLookup)
+        if appsMenu != nil, let window, let screen = window.screen ?? NSScreen.main {
+            popup.updateFrame(appsFrame(window: window, screen: screen))
+        }
     }
 
     private func updateOpenList(using groupLookup: [String: TaskbarGroupPresentation]) {
@@ -278,7 +342,7 @@ final class TaskbarContentView: NSView {
     }
 
     private func hover(buttonID: String, entered: Bool) {
-        guard canUseWindowActions(), draggedGroupID == nil, !listOpenedByClick else { return }
+        guard canUseWindowActions(), draggedGroupID == nil, !hasExplicitPopup else { return }
         let anchor = PointerAnchor.mouse(buttonID)
         if entered { pointerAnchor = anchor }
         else {
@@ -335,6 +399,10 @@ final class TaskbarContentView: NSView {
         contextMenu.dismiss()
     }
 
+    func dismissAppsMenu() {
+        if appsMenu != nil { dismissPopups() }
+    }
+
     func prepareForHiding() {
         dismissPopups()
         cancelFileHover()
@@ -353,7 +421,7 @@ final class TaskbarContentView: NSView {
     }
 
     private func showWindowList(group: TaskbarGroupPresentation, anchor: CGRect, openedByClick: Bool = false) {
-        guard canUseWindowActions(), openedByClick || !listOpenedByClick,
+        guard canUseWindowActions(), openedByClick || !hasExplicitPopup,
               let screen = window?.screen ?? NSScreen.main,
               admitWindowList(openedByClick) else { return }
         cancelDismiss()
@@ -430,11 +498,15 @@ final class TaskbarContentView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        onBackgroundClick()
         dismissPopups()
         actions.backgroundMenu(event, self)
     }
 
-    override func mouseDown(with event: NSEvent) { dismissPopups() }
+    override func mouseDown(with event: NSEvent) {
+        onBackgroundClick()
+        dismissPopups()
+    }
 
     private func dragFrames(in result: TaskbarLayoutResult) -> (slot: CGRect, displayed: CGRect)? {
         guard let id = draggedGroupID, let dragGeometry else { return nil }
@@ -543,7 +615,7 @@ final class TaskbarContentView: NSView {
     func scheduleFileHover(buttonID: String, at location: CGPoint? = nil) {
         let button = layoutResult.buttons.first(where: { $0.id == buttonID })
         let group = button.flatMap { button in groups.first(where: { $0.id == button.groupID }) }
-        guard canUseWindowActions(), buttonID == "overflow" || group != nil else {
+        guard canUseWindowActions(), appsMenu == nil, buttonID == "overflow" || group != nil else {
             cancelFileHover()
             return
         }
