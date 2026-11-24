@@ -3890,32 +3890,43 @@ final class WindowLiftBehaviorTests: XCTestCase {
         await secondController.stopAndRestore()
     }
 
-    func testQuitRestoresAnAcknowledgedSizeThatAppearsAfterTheFirstCleanupRead() async throws {
+    func testQuitRestoresAnAcknowledgedSizeThatAppearsAfterTheFirstCleanupRead() async {
         let desktop = BehaviorDesktop()
         let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let writeGate = BehaviorReadGate(attribute: kAXSizeAttribute as String)
         let requested = Mutex<CGSize?>(nil)
-        let readsAfterWrite = Mutex(0)
+        let firstCleanupRead = Mutex(false)
         desktop.state.withLock {
+            $0.omittedCG = [1002, 2001]
             $0.beforeSizeWrite = { id, size in
                 guard id == 1001, size.height < native.height else { return nil }
                 requested.withLock { $0 = size }
+                writeGate.read(kAXSizeAttribute as String)
                 return .success
             }
-            $0.beforeFrameBatchRead = {
-                if requested.withLock({ $0 != nil }) { readsAfterWrite.withLock { $0 += 1 } }
+            $0.beforeRead = { [weak desktop] attribute in
+                guard attribute == kAXSizeAttribute as String, let desktop,
+                      let size = requested.withLock({ $0 }) else { return }
+                let first = firstCleanupRead.withLock {
+                    let first = !$0
+                    $0 = true
+                    return first
+                }
+                if first { desktop.state.withLock { $0.windows[1001]?.bounds = CGRect(origin: native.origin, size: size) } }
             }
         }
         let (controller, host) = makeController(desktop, workspaceNotificationCenter: NotificationCenter())
-        defer { withExtendedLifetime(host) {} }
+        defer { writeGate.release.signal(); withExtendedLifetime(host) {} }
         controller.poll()
-        await wait { readsAfterWrite.withLock { $0 >= 1 } }
+        await wait { writeGate.entered.withLock { $0 } }
         controller.stop()
-        await wait { readsAfterWrite.withLock { $0 >= 2 } }
-        let size = try XCTUnwrap(requested.withLock { $0 })
-        desktop.state.withLock { $0.windows[1001]?.bounds = CGRect(origin: native.origin, size: size) }
+        writeGate.release.signal()
         let result = await controller.stopAndRestore()
+        XCTAssertFalse(writeGate.timedOut.withLock { $0 })
+        XCTAssertTrue(firstCleanupRead.withLock { $0 })
         XCTAssertEqual(result, .complete)
         XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, native)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize"])
     }
 
     func testPermissionUncertaintyCancelsAQueuedAnimationStepAndRestoresItsAcknowledgedFrame() async {
@@ -4685,6 +4696,7 @@ final class WindowLiftBehaviorTests: XCTestCase {
     func testPendingRecoveryPreventsANewLiftUntilItsDelayedRestorationIsHandled() async {
         let desktop = BehaviorDesktop()
         let clock = Mutex<TimeInterval>(10)
+        desktop.state.withLock { $0.omittedCG = [1002, 2001] }
         failFrameReadsAfterAnimatedWrite(desktop, afterAcknowledgement: true)
         let (controller, host) = makeController(desktop, uptime: { clock.withLock { $0 } },
             workspaceNotificationCenter: NotificationCenter())

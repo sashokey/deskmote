@@ -2,5 +2,5 @@
   "version": "v3",
   "draft": false,
   "prerelease": false,
-  "notes": "- Fixed delayed taskbar buttons when opening apps or moving windows between displays. Improved active-window selection for Steam and rapid switching between apps.\n- Improved taskbar fullscreen detection, window height adjustment and restoration, and interactions with grouped window lists.\n- Fixed input monitoring recovery and improved Battery Run estimates across power transitions, observation gaps, and clock changes.\n- Improved Finder file creation, air-quality page parsing, and widget recovery.\n- Strengthened WindowLab identity checks and release verification."
+  "notes": "- Fixed delayed taskbar buttons when opening apps or moving windows between displays. Improved active-window selection for Steam and rapid switching between apps.\n- Improved taskbar fullscreen detection and grouped window lists. Preserve delayed window-height changes during restoration on quit.\n- Fixed input monitoring recovery and improved Battery Run estimates across power transitions, observation gaps, and clock changes.\n- Improved Finder file creation, air-quality page parsing, and widget recovery.\n- Strengthened WindowLab identity checks and release verification."
 }
