@@ -1919,6 +1919,7 @@ final class BehaviorLiftHost: WindowLiftAvoidanceHost {
 final class BehaviorLiftProbeGate: WindowLiftWindowProbing, Sendable {
     struct State: Sendable {
         var holdNext = false
+        var capturedWindowIDs: Set<CGWindowID> = []
         var entered = false
         var timedOut = false
         var providesFrames = true
@@ -1927,7 +1928,12 @@ final class BehaviorLiftProbeGate: WindowLiftWindowProbing, Sendable {
     let state = Mutex(State())
     let release = DispatchSemaphore(value: 0)
     let live: LiveWindowLiftProbe
-    init(_ desktop: BehaviorDesktop) { live = LiveWindowLiftProbe(system: desktop) }
+    private let gateDeadline: @Sendable () -> DispatchTime
+
+    init(_ desktop: BehaviorDesktop, gateDeadline: @escaping @Sendable () -> DispatchTime = { .now() + 3 }) {
+        live = LiveWindowLiftProbe(system: desktop)
+        self.gateDeadline = gateDeadline
+    }
     func capture(on contexts: [WindowLiftAvoidanceContext], excludingPID: pid_t,
                  includeLiveWindowKeys: Bool, includesTiles: Bool,
                  trackedKeys: Set<WindowLiftAvoidance.WindowKey>, livenessKeys: Set<WindowLiftAvoidance.WindowKey>) -> WindowLiftCGScanResult {
@@ -1936,10 +1942,11 @@ final class BehaviorLiftProbeGate: WindowLiftWindowProbing, Sendable {
         let hold = state.withLock { value in
             guard value.holdNext else { return false }
             value.holdNext = false
+            value.capturedWindowIDs = Set(result.candidatesByScreenIndex.values.joined().map(\.key.cgWindowID))
             value.entered = true
             return true
         }
-        if hold, release.wait(timeout: .now() + 3) == .timedOut {
+        if hold, release.wait(timeout: gateDeadline()) == .timedOut {
             state.withLock { $0.timedOut = true }
         }
         return result
@@ -2243,27 +2250,33 @@ final class WindowLiftBehaviorTests: XCTestCase {
             let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
             let floating = CGRect(x: 90, y: 150, width: 1700, height: 800)
             desktop.state.withLock { $0.omittedCG = [1002, 2001] }
-            let probe = BehaviorLiftProbeGate(desktop)
+            let probe = BehaviorLiftProbeGate(desktop, gateDeadline: { .distantFuture })
+            var diagnostics: [String] = []
             let (controller, host) = makeController(desktop, probe: probe, uptime: { 10 },
-                workspaceNotificationCenter: NotificationCenter())
+                workspaceNotificationCenter: NotificationCenter(), diagnosticReporter: { diagnostics.append($0) })
             defer { probe.release.signal(); withExtendedLifetime(host) {} }
             let managed = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
             let initial = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1002)
             controller.poll()
-            await controller.scanTask?.value
+            let firstScan = try XCTUnwrap(controller.scanTask)
+            controller.isEnabled = false
+            controller.updatePollTimerLifecycle()
+            controller.updateTrackedProbeLifecycle()
+            await firstScan.value
             await controller.writeTasks[managed]?.value
             XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
-            controller.trackedProbeTimer?.invalidate()
-            if let prior = controller.trackedProbeTask { await prior.value }
 
             desktop.state.withLock {
                 $0.omittedCG = [2001]
                 $0.writes.removeAll()
             }
             probe.state.withLock { $0.holdNext = true }
+            controller.isEnabled = true
             controller.poll()
             let captured = try XCTUnwrap(controller.scanTask)
+            controller.trackedProbeTimer?.invalidate()
             await wait { probe.state.withLock { $0.entered } }
+            XCTAssertEqual(probe.state.withLock { $0.capturedWindowIDs }, [1001, 1002])
             if retiresWindow { desktop.state.withLock { $0.windows[1001]?.bounds = floating } }
             controller.probeTrackedFrames()
             let newer = try XCTUnwrap(controller.trackedProbeTask)
@@ -2278,8 +2291,9 @@ final class WindowLiftBehaviorTests: XCTestCase {
 
             XCTAssertFalse(probe.state.withLock { $0.timedOut })
             XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, retiresWindow ? floating : adjusted)
-            XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, retiresWindow ? adjusted : native)
-            XCTAssertEqual(desktop.state.withLock { $0.writes }, retiresWindow ? ["1002:AXSize"] : [])
+            let report = diagnostics.joined(separator: "\n")
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, retiresWindow ? adjusted : native, report)
+            XCTAssertEqual(desktop.state.withLock { $0.writes }, retiresWindow ? ["1002:AXSize"] : [], report)
             await controller.stopAndRestore()
         }
     }

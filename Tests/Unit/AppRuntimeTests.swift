@@ -22,9 +22,12 @@ private final class RuntimeExecutor: WindowActionExecuting {
     let results: [Bool]
     let predictedWindow: WindowID?
     let predictionGate: DispatchSemaphore?
+    private let gateDeadline: @Sendable () -> DispatchTime
 
-    init(results: [Bool], predictedWindow: WindowID? = nil, pauseAfterPrediction: Bool = false) {
+    init(results: [Bool], predictedWindow: WindowID? = nil, pauseAfterPrediction: Bool = false,
+         gateDeadline: @escaping @Sendable () -> DispatchTime = { .now() + 3 }) {
         self.results = results
+        self.gateDeadline = gateDeadline
         self.predictedWindow = predictedWindow
         predictionGate = pauseAfterPrediction ? DispatchSemaphore(value: 0) : nil
     }
@@ -37,11 +40,11 @@ private final class RuntimeExecutor: WindowActionExecuting {
             return value
         }
         guard gates.indices.contains(index), results.indices.contains(index) else { return false }
-        guard gates[index].wait(timeout: .now() + 3) == .success else { return false }
+        guard gates[index].wait(timeout: gateDeadline()) == .success else { return false }
         if let predictedWindow, let onHandoffActivePrediction, index == 0 {
             onHandoffActivePrediction(predictedWindow)
             predictionReported.withLock { $0 = true }
-            if let predictionGate, predictionGate.wait(timeout: .now() + 3) != .success { return false }
+            if let predictionGate, predictionGate.wait(timeout: gateDeadline()) != .success { return false }
         }
         return results[index]
     }
@@ -452,9 +455,10 @@ final class AppRuntimeTests: XCTestCase {
     }
 
     func testCancelledQueuedActivationDoesNotBlockAnEarlierValidCloseHandoff() async throws {
+        let now = ContinuousClock.now
         let executor = RuntimeExecutor(results: [true], predictedWindow: WindowID(rawValue: "safari"),
-                                       pauseAfterPrediction: true)
-        let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true)
+                                       pauseAfterPrediction: true, gateDeadline: { .distantFuture })
+        let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true, monotonicNow: { now })
         defer { executor.gates[0].signal(); executor.predictionGate?.signal(); panels.stop() }
         await waitUntil { panels.ready }
         panels.runtime.close(windowID: "steam")
@@ -464,18 +468,17 @@ final class AppRuntimeTests: XCTestCase {
         let invalidations = PassthroughSubject<Void, Never>()
         panels.runtime.trigger(.activate(id), expected: target, projectionInvalidations: invalidations.eraseToAnyPublisher(),
                                isProjectionCurrent: { true })
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
+        await waitUntil { panels.highlights == ["chrome"] }
         invalidations.send(())
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
+        await waitUntil { panels.highlights == ["steam"] }
         XCTAssertEqual(executor.calls.withLock { $0 }, 1)
 
         executor.gates[0].signal()
+        await waitUntil { panels.runtime.optimisticStatesByWindowID["safari"]?.systemPredicted == true }
         executor.predictionGate?.signal()
         for task in panels.runtime.pendingActionsForTesting { await task.value }
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["safari"])
+        XCTAssertEqual(panels.runtime.effectiveActiveWindowID, WindowID(rawValue: "safari"))
+        await waitUntil { panels.highlights == ["safari"] }
         XCTAssertEqual(executor.calls.withLock { $0 }, 1)
     }
 
