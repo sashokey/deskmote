@@ -184,7 +184,6 @@ final class AppsMenuViewTests: XCTestCase {
         panel.isReleasedWhenClosed = false
         defer { panel.close() }
         let view = AppsMenuView(frame: frame, store: fixture.store) {}
-        view.appearance = NSAppearance(named: .darkAqua)
         panel.contentView = view
         try await waitForButton("Pinned Fixture", in: view)
         let pinned = try XCTUnwrap(button("Pinned Fixture", in: view))
@@ -197,7 +196,11 @@ final class AppsMenuViewTests: XCTestCase {
         XCTAssertNotNil(icon.image)
         XCTAssertEqual(icon.frame.size, pinnedIcon.frame.size)
 
-        for scale in [1, 2] {
+        let renderModes = [NSAppearance.Name.aqua, .darkAqua].flatMap { appearance in
+            [1, 2].map { (appearance, $0) }
+        }
+        for (appearance, scale) in renderModes {
+            view.appearance = NSAppearance(named: appearance)
             let pixelsWide = Int(footer.bounds.width) * scale
             let pixelsHigh = Int(footer.bounds.height) * scale
             let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixelsWide, pixelsHigh: pixelsHigh,
@@ -205,7 +208,7 @@ final class AppsMenuViewTests: XCTestCase {
                                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
             bitmap.size = footer.bounds.size
             footer.effectiveAppearance.performAsCurrentDrawingAppearance { footer.cacheDisplay(in: footer.bounds, to: bitmap) }
-            if scale == 1, let png = bitmap.representation(using: .png, properties: [:]) {
+            if appearance == .darkAqua, scale == 1, let png = bitmap.representation(using: .png, properties: [:]) {
                 let attachment = XCTAttachment(data: png, uniformTypeIdentifier: "public.png")
                 attachment.name = "Apps running footer"
                 attachment.lifetime = .keepAlways
@@ -214,8 +217,7 @@ final class AppsMenuViewTests: XCTestCase {
             let center = Int(icon.convert(icon.bounds, to: footer).midX) * scale
             let rows = (2 * scale..<(pixelsHigh - 2 * scale)).filter { y in
                 ((center - 5 * scale)...(center + 5 * scale)).contains { x in
-                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
-                    return color.alphaComponent > 0.4 && max(color.redComponent, color.greenComponent, color.blueComponent) > 0.45
+                    (bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.4
                 }
             }
             let first = try XCTUnwrap(rows.first)
