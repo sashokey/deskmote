@@ -147,23 +147,40 @@ enum WindowStatus: String, Hashable, Codable, Sendable {
 
 struct OptimisticWindowState: Hashable, Sendable {
     let status: WindowStatus
-    let createdAt: Date
+    let createdAt: ContinuousClock.Instant
     let focusHandoffGrace: Bool
     let systemPredicted: Bool
-    let handoffSourceToken: UUID?
+    let sourceActionToken: UUID?
 
-    init(status: WindowStatus, createdAt: Date, focusHandoffGrace: Bool = false,
-         systemPredicted: Bool = false, handoffSourceToken: UUID? = nil) {
+    init(status: WindowStatus, createdAt: ContinuousClock.Instant, focusHandoffGrace: Bool = false,
+         systemPredicted: Bool = false, sourceActionToken: UUID? = nil) {
         self.status = status
         self.createdAt = createdAt
         self.focusHandoffGrace = focusHandoffGrace
         self.systemPredicted = systemPredicted
-        self.handoffSourceToken = handoffSourceToken
+        self.sourceActionToken = sourceActionToken
     }
 }
 
 extension OptimisticWindowState {
-    static let handoffSupersessionGrace: TimeInterval = 1.5
+    static let handoffSupersessionGrace: Duration = .milliseconds(1500)
+
+    static func activeWindowID(in snapshot: DockSnapshot, states: [String: OptimisticWindowState]) -> WindowID? {
+        let prediction = snapshot.orderedWindowIDs.lazy.filter { id in
+            states[id.rawValue]?.status == .active && snapshot.windows[id] != nil
+        }.max { lhs, rhs in
+            guard let left = states[lhs.rawValue], let right = states[rhs.rawValue] else { return false }
+            return left.createdAt < right.createdAt
+        }
+        return prediction ?? confirmedActiveWindow(in: snapshot, states: states)?.id
+    }
+
+    static func confirmedActiveWindow(in snapshot: DockSnapshot, states: [String: OptimisticWindowState]) -> WindowRecord? {
+        snapshot.orderedWindowIDs.lazy.compactMap { snapshot.windows[$0] }.first { record in
+            let prediction = states[record.id.rawValue]?.status
+            return record.status == .active && prediction != .minimized && prediction != .hidden
+        }
+    }
 
     static func systemPredictionFalsified(state: OptimisticWindowState, actual: WindowStatus) -> Bool {
         guard state.systemPredicted, state.status == .active else { return false }
@@ -173,7 +190,7 @@ extension OptimisticWindowState {
     static func supersededByActiveSibling(
         windowID: String,
         state: OptimisticWindowState,
-        now: Date,
+        now: ContinuousClock.Instant,
         optimisticStates: [String: OptimisticWindowState],
         snapshot: DockSnapshot,
         handoffGraceEnabled: Bool
@@ -190,7 +207,7 @@ extension OptimisticWindowState {
         guard crediblyActiveSibling else { return false }
         guard handoffGraceEnabled,
               state.focusHandoffGrace,
-              now.timeIntervalSince(state.createdAt) <= Self.handoffSupersessionGrace
+              state.createdAt.duration(to: now) <= Self.handoffSupersessionGrace
         else { return true }
         let siblingActivationClicked = optimisticStates.contains { key, sibling in
             guard key != windowID, sibling.status == .active else { return false }
@@ -206,7 +223,7 @@ extension OptimisticWindowState {
         snapshot: DockSnapshot
     ) -> Bool {
         guard let record = snapshot.windows[WindowID(rawValue: windowID)] else { return false }
-        let ownActivationCreatedAt: Date? = {
+        let ownActivationCreatedAt: ContinuousClock.Instant? = {
             guard let own = optimisticStates[windowID], own.status == .active else { return nil }
             return own.createdAt
         }()

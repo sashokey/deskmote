@@ -57,13 +57,19 @@ test('new version is accepted only when the tag lookup returns 404', async () =>
     { env: { RELEASE_VERSION: 'v1' } }), /already has a tag/);
 });
 
-function fixture({ draft = true, corrupt = false, failUpload = false, notes, conflictingTag = false, moveAfterUpload = false, existingAsset, sourceSHA = context.sha, metadataTarget = sourceSHA, encodedLookupBroken = false, missingTag = false, existingPublished = false } = {}) {
+function fixture({
+  draft = true, corrupt = false, failUpload = false, notes, conflictingTag = false, moveAfterUpload = false,
+  existingAsset, sourceSHA = context.sha, metadataTarget = sourceSHA, encodedLookupBroken = false,
+  missingTag = false, existingPublished = false, resume = false, refChange, publishedTag
+} = {}) {
   const names = ['DeskMote-v1.zip'];
   const files = new Map(names.map((name, i) => ['dist/' + name, Buffer.from('archive-' + i)]));
   const checksum = createHash('sha256').update(files.get('dist/' + names[0])).digest('hex');
   if (corrupt) files.set('dist/' + names[0], Buffer.from('changed'));
   const calls = [];
-  let tagExists = existingAsset !== undefined && !missingTag;
+  let tagExists = (existingAsset !== undefined || resume) && !missingTag;
+  let tagMoved = conflictingTag;
+  let summarized = false;
   let uploaded = 0;
   let release = existingAsset === undefined ? null : {
     id: 7, tag_name: 'v1', name: 'v1', target_commitish: metadataTarget,
@@ -77,8 +83,15 @@ function fixture({ draft = true, corrupt = false, failUpload = false, notes, con
     }]
   };
   const readTag = async () => {
-    if (!tagExists && !conflictingTag) throw Object.assign(new Error('missing'), { status: 404 });
-    return { data: { object: { type: 'commit', sha: conflictingTag || (moveAfterUpload && uploaded > 0) ? 'b'.repeat(40) : sourceSHA } } };
+    if (!tagExists && !tagMoved) throw Object.assign(new Error('missing'), { status: 404 });
+    return { data: { object: { type: 'commit', sha: tagMoved || (moveAfterUpload && uploaded > 0) ? 'b'.repeat(40) : sourceSHA } } };
+  };
+  const recordReleaseMutation = (action, request) => {
+    calls.push([action, request]);
+    if (refChange?.during === action) {
+      tagExists = refChange.state !== 'missing';
+      tagMoved = refChange.state === 'moved';
+    }
   };
   const github = { rest: { git: {
     getRef: async () => {
@@ -95,7 +108,7 @@ function fixture({ draft = true, corrupt = false, failUpload = false, notes, con
     listReleases: async () => ({ data: release ? [release] : [] }),
     createRelease: async request => {
       if (release) throw Object.assign(new Error('release already exists'), { status: 422 });
-      calls.push(['create', request]);
+      recordReleaseMutation('create', request);
       release = { ...request, id: 7, assets: [], html_url: 'https://example.test/release' };
       return { data: release };
     },
@@ -105,7 +118,12 @@ function fixture({ draft = true, corrupt = false, failUpload = false, notes, con
       if (failUpload && request.name === 'DeskMote-v1.zip') throw new Error('upload failed');
     },
     deleteReleaseAsset: async request => { calls.push(['delete-starter', request]); },
-    updateRelease: async request => { calls.push(['publish', request]); release.draft = request.draft; return { data: release }; }
+    updateRelease: async request => {
+      recordReleaseMutation('publish', request);
+      release.draft = request.draft;
+      if (publishedTag) release.tag_name = publishedTag;
+      return { data: release };
+    }
   } } };
   github.request = async (route, request) => {
     assert.equal(route, 'GET /repos/{owner}/{repo}/git/ref/tags/{tag}');
@@ -113,7 +131,7 @@ function fixture({ draft = true, corrupt = false, failUpload = false, notes, con
     return readTag();
   };
   github.paginate = async (method, request) => (await method(request)).data;
-  const core = { summary: { addLink() {}, async write() {} } };
+  const core = { summary: { addLink() {}, async write() { summarized = true; } } };
   const require = name => {
     if (name === 'node:crypto') return { createHash };
     assert.equal(name, 'node:fs/promises');
@@ -124,9 +142,10 @@ function fixture({ draft = true, corrupt = false, failUpload = false, notes, con
   };
   const process = { env: {
     RELEASE_VERSION: 'v1', RELEASE_DRAFT: String(draft), RELEASE_PRERELEASE: 'true', RELEASE_NOTES: notes,
-    RELEASE_SOURCE_SHA: sourceSHA, RELEASE_ZIP_SHA256: checksum
+    RELEASE_SOURCE_SHA: sourceSHA, RELEASE_ZIP_SHA256: checksum, RELEASE_RESUME: String(resume)
   } };
-  return { calls, hasTag: () => tagExists, run: () => publish(github, context, core, require, process) };
+  return { calls, hasTag: () => tagExists, summarized: () => summarized,
+    run: () => publish(github, context, core, require, process) };
 }
 
 test('draft upload attaches only the verified application archive to the exact commit', async () => {
@@ -137,7 +156,7 @@ test('draft upload attaches only the verified application archive to the exact c
   assert.equal(f.calls[0][1].prerelease, true);
   assert.equal(f.calls[0][1].tag_name, 'v1');
   assert.equal(f.calls[0][1].name, 'v1');
-  assert.equal(Object.hasOwn(f.calls[0][1], 'target_commitish'), false);
+  assert.equal(f.calls[0][1].target_commitish, context.sha);
   assert.deepEqual(f.calls.slice(1).map(call => call[1].name),
     ['DeskMote-v1.zip']);
   assert.deepEqual(f.calls[1][1].data, Buffer.from('archive-0'));
@@ -148,6 +167,7 @@ test('publication happens only after all uploads succeed', async () => {
   await f.run();
   assert.deepEqual(f.calls.map(call => call[0]), ['create', 'upload', 'publish']);
   assert.equal(f.calls.at(-1)[1].draft, false);
+  assert.equal(f.calls.at(-1)[1].target_commitish, context.sha);
 });
 
 test('checksum mismatch prevents release creation', async () => {
@@ -346,15 +366,68 @@ test('publication uses the documented tag namespace path instead of an encoded s
 });
 
 test('resumed publication keeps the original tested source SHA instead of the workflow repair SHA', async () => {
-  const f = fixture({ draft: false, existingAsset: 'valid', sourceSHA: 'c'.repeat(40) });
+  const f = fixture({ draft: false, existingAsset: 'valid', sourceSHA: 'c'.repeat(40), resume: true });
   await f.run();
   assert.deepEqual(f.calls.map(call => call[0]), ['publish']);
 });
 
 test('resume uses the verified tag even when release metadata names the default branch', async () => {
-  const f = fixture({ draft: false, existingAsset: 'valid', sourceSHA: 'c'.repeat(40), metadataTarget: 'master' });
+  const f = fixture({ draft: false, existingAsset: 'valid', sourceSHA: 'c'.repeat(40), metadataTarget: 'master', resume: true });
   await f.run();
   assert.deepEqual(f.calls.map(call => call[0]), ['publish']);
+});
+
+test('resume stops without creating a tag or release if the original tag disappeared after validation', async () => {
+  const f = fixture({ draft: false, sourceSHA: 'c'.repeat(40), missingTag: true, resume: true });
+  await assert.rejects(f.run(), /original tag/);
+  assert.equal(f.hasTag(), false);
+  assert.deepEqual(f.calls, []);
+});
+
+test('resume stops without creating a release if the original tag moved after validation', async () => {
+  const f = fixture({ draft: false, sourceSHA: 'c'.repeat(40), conflictingTag: true, resume: true });
+  await assert.rejects(f.run(), /tag points to a different commit/);
+  assert.deepEqual(f.calls, []);
+});
+
+test('resume creates the expected draft and attaches the verified ZIP when the original tag exists', async () => {
+  const sourceSHA = 'c'.repeat(40);
+  const f = fixture({ draft: false, sourceSHA, resume: true });
+  await f.run();
+  assert.deepEqual(f.calls.map(call => call[0]), ['create', 'upload', 'publish']);
+  assert.equal(f.calls[0][1].tag_name, 'v1');
+  assert.equal(f.calls[0][1].name, 'v1');
+  assert.equal(f.calls[0][1].target_commitish, sourceSHA);
+  assert.equal(f.calls[1][1].name, 'DeskMote-v1.zip');
+  assert.deepEqual(f.calls[1][1].data, Buffer.from('archive-0'));
+  assert.equal(f.calls[2][1].target_commitish, sourceSHA);
+});
+
+test('resume stops after draft creation if the original tag disappeared or moved during the request', async () => {
+  for (const [state, expected] of [['missing', { status: 404 }], ['moved', /different commit/]]) {
+    const f = fixture({ draft: false, sourceSHA: 'c'.repeat(40), resume: true,
+      refChange: { during: 'create', state } });
+    await assert.rejects(f.run(), expected);
+    assert.deepEqual(f.calls.map(call => call[0]), ['create']);
+    assert.equal(f.summarized(), false);
+  }
+});
+
+test('resume does not report success if the original tag disappeared or moved during publication', async () => {
+  for (const [state, expected] of [['missing', { status: 404 }], ['moved', /different commit/]]) {
+    const f = fixture({ draft: false, existingAsset: 'valid', sourceSHA: 'c'.repeat(40), resume: true,
+      refChange: { during: 'publish', state } });
+    await assert.rejects(f.run(), expected);
+    assert.deepEqual(f.calls.map(call => call[0]), ['publish']);
+    assert.equal(f.summarized(), false);
+  }
+});
+
+test('resume does not report success if publication returns a different release tag', async () => {
+  const f = fixture({ draft: false, existingAsset: 'valid', sourceSHA: 'c'.repeat(40), resume: true,
+    publishedTag: 'v2' });
+  await assert.rejects(f.run(), /unexpected release metadata/);
+  assert.equal(f.summarized(), false);
 });
 
 function releaseJobs(validate, build, publish, uploadMinute = '20') {

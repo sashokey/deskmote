@@ -7,12 +7,14 @@ final class WindowOrderingTests: XCTestCase {
     private var defaults: UserDefaults!
     private var suite: String!
     private var clock = Date(timeIntervalSince1970: 100)
+    private var wallClockOffset: TimeInterval = 0
 
     @MainActor
     override func setUp() async throws {
         suite = "deskmote-order-tests-" + UUID().uuidString
         defaults = UserDefaults(suiteName: suite)!
         clock = Date(timeIntervalSince1970: 100)
+        wallClockOffset = 0
     }
 
     @MainActor
@@ -20,9 +22,11 @@ final class WindowOrderingTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
     }
 
-    private func makeStore(boot: Int = 1) -> StripOrderStore {
-        StripOrderStore(defaults: defaults, now: { [unowned self] in self.clock },
-                        bootTimeProvider: { boot })
+    private func makeStore(boot: Int = 1, legacyBoot: Int? = nil, hasBootSession: Bool = true) -> StripOrderStore {
+        let session = UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", boot))
+        return StripOrderStore(defaults: defaults, now: { [unowned self] in self.clock.addingTimeInterval(self.wallClockOffset) },
+                               bootTimeProvider: { legacyBoot ?? boot }, bootSessionProvider: { hasBootSession ? session : nil },
+                               elapsed: { [unowned self] in self.clock.timeIntervalSince1970 })
     }
 
     func testManualReorderSurvivesSnapshotOrderChanges() {
@@ -95,6 +99,72 @@ final class WindowOrderingTests: XCTestCase {
         XCTAssertEqual(makeStore(boot: 2).reconciled(current: ids), ids)
     }
 
+    func testSavedOrderUsesTheBootSessionWhenTheCalendarChanges() {
+        let seats = ["tabgrp-100-s1", "tabgrp-200-s2"]
+        let saved = Array(seats.reversed())
+        makeStore(boot: 1, legacyBoot: 50).sync(current: saved)
+        wallClockOffset = 3_600
+        XCTAssertEqual(makeStore(boot: 1, legacyBoot: 3_650).reconciled(current: seats), saved)
+        XCTAssertEqual(makeStore(boot: 2, legacyBoot: 50).reconciled(current: seats), seats)
+
+        let withoutIdentity = makeStore(boot: 1, legacyBoot: 50, hasBootSession: false)
+        XCTAssertEqual(withoutIdentity.reconciled(current: seats), seats)
+        withoutIdentity.sync(current: seats)
+        XCTAssertEqual(makeStore(boot: 1, legacyBoot: 3_650).reconciled(current: seats), saved)
+    }
+
+    func testCorroboratedLegacyOrderMigratesToTheStableBootSession() {
+        let seats = ["tabgrp-100-s1", "tabgrp-200-s2"]
+        let saved = Array(seats.reversed())
+        defaults.set(saved, forKey: "deskmote.windowOrder")
+        defaults.set(50, forKey: "deskmote.windowOrderBootTime")
+
+        XCTAssertEqual(makeStore(boot: 1, legacyBoot: 51).reconciled(current: seats), seats)
+        XCTAssertEqual(makeStore(boot: 1, legacyBoot: 50).reconciled(current: seats), saved)
+        wallClockOffset = -3_600
+        XCTAssertEqual(makeStore(boot: 1, legacyBoot: -3_550).reconciled(current: seats), saved)
+        XCTAssertEqual(makeStore(boot: 2, legacyBoot: 50).reconciled(current: seats), seats)
+    }
+
+    func testNativeBootSessionIdentityIsUsedByDefaultStore() throws {
+        var buffer = [CChar](repeating: 0, count: 37)
+        var size = buffer.count
+        let status = buffer.withUnsafeMutableBytes { sysctlbyname("kern.bootsessionuuid", $0.baseAddress, &size, nil, 0) }
+        let queryError = errno
+        try XCTSkipIf(status != 0, "Native boot-session sysctl unavailable (errno \(queryError)).")
+        let decoded = String(decoding: buffer.prefix(36).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        let bootSession = UUID(uuidString: decoded)
+        XCTAssertTrue(bootSession != nil)
+        let seats = ["tabgrp-100-s1", "tabgrp-200-s2"]
+        let saved = Array(seats.reversed())
+        StripOrderStore(defaults: defaults).sync(current: saved)
+        let writtenSession = defaults.string(forKey: "deskmote.windowOrderBootSession").flatMap(UUID.init(uuidString:))
+        XCTAssertTrue(writtenSession != nil && writtenSession == bootSession)
+        XCTAssertEqual(StripOrderStore(defaults: defaults).reconciled(current: seats), saved)
+    }
+
+    func testDefaultStorePersistsDisplacedRankWithNativeElapsedClock() throws {
+        let seats = ["tabgrp-100-s1", "tabgrp-200-s2"]
+        let reusedSeat = seats[0]
+        let stableSeat = seats[1]
+        let displacedApp = "bundle:/Applications/A.app"
+        let stableApp = "bundle:/Applications/C.app"
+        StripOrderStore(defaults: defaults).sync(current: seats, appKeyOf: [reusedSeat: displacedApp, stableSeat: stableApp])
+        let store = StripOrderStore(defaults: defaults)
+
+        let before = Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1_000_000_000
+        store.sync(current: seats, appKeyOf: [reusedSeat: "bundle:/Applications/B.app", stableSeat: stableApp])
+        let after = Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1_000_000_000
+
+        let ranks = try XCTUnwrap(defaults.dictionary(forKey: "deskmote.windowOrderApplications") as? [String: String])
+        let retiredSeat = try XCTUnwrap(ranks.first(where: { $0.value == displacedApp })?.key)
+        XCTAssertNotEqual(retiredSeat, reusedSeat)
+        let markers = try XCTUnwrap(defaults.dictionary(forKey: "deskmote.windowOrderRetiredElapsed") as? [String: TimeInterval])
+        let marker = try XCTUnwrap(markers[retiredSeat])
+        XCTAssertGreaterThan(before, 0)
+        XCTAssertTrue(marker >= before && marker <= after, "Persisted marker falls outside the native elapsed clock bracket")
+    }
+
     func testApplicationOrderSurvivesTrackerRelaunchWithDifferentSeatAllocation() throws {
         let firstTracker = AppTracker(onScreenWindowIDsProvider: { [] })
         let secondTracker = AppTracker(onScreenWindowIDsProvider: { [] })
@@ -157,6 +227,105 @@ final class WindowOrderingTests: XCTestCase {
         restored.sync(current: [current[0]], appKeyOf: keys)
         restored.sync(current: current, appKeyOf: keys)
         XCTAssertEqual(restored.reconciled(current: current, appKeyOf: keys), current)
+    }
+
+    func testReusedStartupSeatDoesNotStealTheSavedApplicationRank() {
+        let oldA = "tabgrp-100-s1"
+        let newA = "tabgrp-300-s3"
+        let c = "tabgrp-200-s2"
+        let keyA = "bundle:/Applications/A.app"
+        let keyB = "bundle:/Applications/B.app"
+        let keyC = "bundle:/Applications/C.app"
+        makeStore().sync(current: [oldA, c], appKeyOf: [oldA: keyA, c: keyC])
+
+        let restored = makeStore()
+        let partial = [oldA, c]
+        let partialKeys = [oldA: keyB, c: keyC]
+        XCTAssertEqual(restored.reconciled(current: partial, appKeyOf: partialKeys), [c, oldA])
+        restored.sync(current: partial, appKeyOf: partialKeys)
+        XCTAssertEqual(restored.reconciled(current: partial, appKeyOf: partialKeys), [c, oldA])
+
+        clock.addTimeInterval(4)
+        let current = [oldA, c, newA]
+        let keys = [oldA: keyB, c: keyC, newA: keyA]
+        let expected = [newA, c, oldA]
+        XCTAssertEqual(makeStore().reconciled(current: current, appKeyOf: keys), expected)
+        XCTAssertEqual(restored.reconciled(current: current, appKeyOf: keys), expected)
+        restored.sync(current: current, appKeyOf: keys)
+        XCTAssertEqual(restored.reconciled(current: current, appKeyOf: keys), expected)
+        XCTAssertEqual(makeStore().reconciled(current: current, appKeyOf: keys), expected)
+        XCTAssertEqual(makeStore(boot: 2).reconciled(current: current, appKeyOf: keys), current)
+    }
+
+    func testDisplacedSavedRankExpiresAtItsOriginalDeadlineAcrossStoreRestarts() {
+        let b = "tabgrp-100-s1"
+        let c = "tabgrp-200-s2"
+        let a = "tabgrp-300-s3"
+        let keyA = "bundle:/Applications/A.app"
+        let keyB = "bundle:/Applications/B.app"
+        let keyC = "bundle:/Applications/C.app"
+        makeStore().sync(current: [b, c], appKeyOf: [b: keyA, c: keyC])
+        let partial = [b, c]
+        let partialKeys = [b: keyB, c: keyC]
+        makeStore().sync(current: partial, appKeyOf: partialKeys)
+        let current = [b, c, a]
+        let keys = [b: keyB, c: keyC, a: keyA]
+
+        clock.addTimeInterval(4)
+        let beforeExpiry = makeStore()
+        XCTAssertEqual(beforeExpiry.reconciled(current: current, appKeyOf: keys), [a, c, b])
+        beforeExpiry.sync(current: partial, appKeyOf: partialKeys)
+
+        clock.addTimeInterval(2)
+        XCTAssertEqual(beforeExpiry.reconciled(current: current, appKeyOf: keys), [c, b, a])
+        let afterExpiry = makeStore()
+        XCTAssertEqual(afterExpiry.reconciled(current: current, appKeyOf: keys), [c, b, a])
+        afterExpiry.sync(current: current, appKeyOf: keys)
+        XCTAssertEqual(afterExpiry.reconciled(current: current, appKeyOf: keys), [c, b, a])
+        XCTAssertEqual(makeStore().reconciled(current: current, appKeyOf: keys), [c, b, a])
+    }
+
+    func testDisplacedRankGraceUsesElapsedTimeAcrossClockCorrectionsAndRestarts() {
+        let b = "tabgrp-100-s1"
+        let c = "tabgrp-200-s2"
+        let a = "tabgrp-300-s3"
+        let partial = [b, c]
+        let current = [b, c, a]
+        let keys = [b: "browser", c: "calendar", a: "editor"]
+        makeStore().sync(current: partial, appKeyOf: [b: "editor", c: "calendar"])
+        let displaced = makeStore()
+        displaced.sync(current: partial, appKeyOf: keys)
+
+        clock.addTimeInterval(4)
+        wallClockOffset = 3_600
+        XCTAssertEqual(displaced.reconciled(current: current, appKeyOf: keys), [a, c, b])
+        XCTAssertEqual(makeStore(legacyBoot: 3_601).reconciled(current: current, appKeyOf: keys), [a, c, b])
+
+        clock.addTimeInterval(2)
+        wallClockOffset = -3_600
+        XCTAssertEqual(displaced.reconciled(current: current, appKeyOf: keys), [c, b, a])
+        let restored = makeStore(legacyBoot: -3_599)
+        XCTAssertEqual(restored.reconciled(current: current, appKeyOf: keys), [c, b, a])
+        restored.sync(current: current, appKeyOf: keys)
+        XCTAssertEqual(makeStore(legacyBoot: -3_599).reconciled(current: current, appKeyOf: keys), [c, b, a])
+    }
+
+    func testCorroboratedLegacyRetirementMigratesWithoutRenewingItsGrace() {
+        let retired = "tabgrp-retired-legacy"
+        let b = "tabgrp-100-s1"
+        let c = "tabgrp-200-s2"
+        let a = "tabgrp-300-s3"
+        let current = [b, c, a]
+        let keys = [b: "browser", c: "calendar", a: "editor"]
+        defaults.set([retired, c, b], forKey: "deskmote.windowOrder")
+        defaults.set([retired: "editor", c: "calendar", b: "browser"], forKey: "deskmote.windowOrderApplications")
+        defaults.set([retired: clock.addingTimeInterval(-4)], forKey: "deskmote.windowOrderRetiredAbsence")
+        defaults.set(50, forKey: "deskmote.windowOrderBootTime")
+
+        XCTAssertEqual(makeStore(legacyBoot: 50).reconciled(current: current, appKeyOf: keys), [a, c, b])
+        clock.addTimeInterval(2)
+        wallClockOffset = -3_600
+        XCTAssertEqual(makeStore(legacyBoot: 50).reconciled(current: current, appKeyOf: keys), [c, b, a])
     }
 
     func testLearningApplicationKeysPersistsWithoutAnOrderChange() {

@@ -233,6 +233,99 @@ struct CheckAQI {
         precondition(currentAirQuality(in: elseRegex + html)?.city == "London")
         let unicodeComment = "<script>// skip\u{2028}const currentLocation = {\"localizedName\":\"London\"};</script>"
         precondition(currentAirQuality(in: unicodeComment + html)?.city == "London")
+        var failures = 0
+        func check(_ success: Bool, _ name: String) {
+            if !success {
+                print("FAILED: \(name)")
+                failures += 1
+            }
+        }
+        let classDeclarations = [
+            #"class Box{}"#,
+            #"class Box extends Base{run(){return {}}}"#,
+            #"class Box extends (mix(class {})){}"#,
+            #"if(ready){class Box{}}"#,
+        ]
+        for declaration in classDeclarations {
+            let regex = #"/var currentLocation={"localizedName":"Fixture"};/.test(text);"#
+            let genuine = #"const currentLocation={"localizedName":"London"};"#
+            check(currentAirQuality(in: "<script>\(declaration)\(regex)\(genuine)</script>" + html)?.city == "London",
+                  "regex after class declaration: \(declaration)")
+        }
+        let exportedClass = #"<script type="module">export default class{} /var currentLocation={"localizedName":"Fixture"};/.test(text); const currentLocation={"localizedName":"London"};</script>"#
+        check(currentAirQuality(in: exportedClass + html)?.city == "London", "regex after exported anonymous class")
+        let classDivision = #"<script>const n=class extends (Base){} / 2; const currentLocation={"localizedName":"London"}; const m=6 / 2;</script>"#
+        check(currentAirQuality(in: classDivision + html)?.city == "London", "division after class expression")
+        let caseLabels = ["case 0:", "default:", "case ready ? 0 : 1:"]
+        for label in caseLabels {
+            let script = #"<script>switch(mode) { \#(label) class Box{}/var currentLocation={"localizedName":"Fixture"};/.test(text); } const currentLocation={"localizedName":"London"};</script>"#
+            check(currentAirQuality(in: script + html)?.city == "London", "regex after class declaration in \(label)")
+        }
+        let newClassDivision = #"""
+        <script>const n=new
+        class {} / 2; const currentLocation={"localizedName":"London"}; const m=6 / 2;</script>
+        """#
+        check(currentAirQuality(in: newClassDivision + html)?.city == "London", "division after new and a class expression on the next line")
+        let ternaryClassDivision = #"<script>const n=ready ? 0 : class {} / 2; const currentLocation={"localizedName":"London"}; const m=6 / 2;</script>"#
+        check(currentAirQuality(in: ternaryClassDivision + html)?.city == "London", "a ternary colon does not start a class declaration")
+        let privateDefaultInCase = #"""
+        <script>
+        class Parser {
+            #default = 1;
+            parse(value) {
+                switch (value) {
+                case ready ? this.#default : class {} / 2: const currentLocation={"localizedName":"London"}; const m=6 / 2;
+                }
+            }
+        }
+        </script>
+        """#
+        check(currentAirQuality(in: privateDefaultInCase + html)?.city == "London",
+              "a private default member does not end a ternary case selector")
+        for member in ["new", "inner\u{200C}new"] {
+            let privateNewBeforeClass = #"""
+            <script>
+            class Parser {
+                #\#(member) = 0;
+                parse(value) {
+                    switch (value) {
+                    default:
+                        this.#\#(member)
+                        class Box {}
+                        /var currentLocation={"localizedName":"Fixture"};/.test(text);
+                        const currentLocation={"localizedName":"London"};
+                    }
+                }
+            }
+            </script>
+            """#
+            check(currentAirQuality(in: privateNewBeforeClass + html)?.city == "London",
+                  "a private \(member) member ends before a class declaration")
+        }
+        let unparenthesizedBlock = #"<script>class Box{} /var currentLocation={"localizedName":"Fixture"};/.test(text);</script>"#
+        check(currentAirQuality(in: unparenthesizedBlock + html)?.city == nil, "inert class-following regex cannot add a city")
+        for separator in ["\n", "\r", "\r\n", "\u{2028}", "\u{2029}"] {
+            let preview = #"<script>const text = `${1 // ignored ` }"# + separator
+                + #"} const currentLocation={"localizedName":"Fixture"};`; const currentLocation={"localizedName":"London"};</script>"#
+            check(currentAirQuality(in: preview + html)?.city == "London",
+                  "template interpolation line comment ends at \(separator.debugDescription)")
+        }
+
+        let responsePage = #"<script>const currentLocation={"localizedName":"Квебек"};</script>"# + html
+        let legacyBody = responsePage.data(using: .windowsCP1251)!
+        let utf8Body = Data(responsePage.utf8)
+        check(currentAirQuality(in: legacyBody, textEncodingName: "windows-1251")?.city == "Квебек",
+              "the response charset decodes a compatible HTML page")
+        check(currentAirQuality(in: utf8Body, textEncodingName: "x-deskmote-unknown")?.city == "Квебек",
+              "an unavailable charset falls back to UTF-8")
+        check(currentAirQuality(in: utf8Body, textEncodingName: nil)?.city == "Квебек",
+              "an omitted charset falls back to UTF-8")
+        let malformedBody = Data([0xFF]) + utf8Body
+        check(currentAirQuality(in: malformedBody, textEncodingName: "utf-8") == nil,
+              "invalid bytes with a supported charset yield no reading")
+        check(currentAirQuality(in: malformedBody, textEncodingName: nil) == nil,
+              "invalid UTF-8 fallback bytes yield no reading")
+        if failures > 0 { exit(1) }
         let duplicateName = #"<script>const currentLocation = {"localizedName":"London","localizedName":"Paris"};</script>"#
         precondition(currentAirQuality(in: duplicateName + html)?.city == nil)
 

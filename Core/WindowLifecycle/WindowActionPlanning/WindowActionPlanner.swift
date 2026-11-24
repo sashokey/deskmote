@@ -53,11 +53,9 @@ final class LifecycleActionPlanner {
             guard let record = snapshot.windows[id] else {
                 return PlatformActionRequest(kind: .activateWindow, windowID: id)
             }
-            let optimistic = optimisticStates[id.rawValue]
-            let status = optimistic?.status ?? record.status
             let appIsFrontmost = isAppFrontmost(record.pid)
                 || record.owningApplication.map { isAppFrontmost($0.pid) } == true
-            if status == .active && appIsFrontmost {
+            if appIsFrontmost, OptimisticWindowState.activeWindowID(in: snapshot, states: optimisticStates) == id {
                 if Self.staleActiveGuardEnabled,
                    OptimisticWindowState.siblingActivationInFlight(
                        windowID: id.rawValue, optimisticStates: optimisticStates, snapshot: snapshot

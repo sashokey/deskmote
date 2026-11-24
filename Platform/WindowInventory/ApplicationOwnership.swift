@@ -23,7 +23,8 @@ struct ApplicationOwnership: Sendable {
         return owner(for: pid, applications: applications())
     }
 
-    private func owner(for pid: pid_t, applications: [ApplicationOwnerRead]) -> ApplicationOwnerRead? {
+    private func owner(for pid: pid_t, applications: [ApplicationOwnerRead],
+                       cancellation: OperationCancellation? = nil) -> ApplicationOwnerRead? {
         guard let helper = applications.first(where: { $0.identity.pid == pid }),
               helper.application.activationPolicy == .accessory, let helperBundle = bundleComponents(helper.application),
               helperBundle.last?.lowercased().hasSuffix(".app") == true,
@@ -39,8 +40,11 @@ struct ApplicationOwnership: Sendable {
         }
         guard candidates.count == 1, let candidate = candidates.first,
               let candidateID = candidate.application.bundleIdentifier,
+              cancellation?.isCancelled != true,
               let helperTeam = signingTeam(pid, helperID), !helperTeam.isEmpty,
+              cancellation?.isCancelled != true,
               let parentTeam = signingTeam(candidate.identity.pid, candidateID), parentTeam == helperTeam,
+              cancellation?.isCancelled != true,
               isCurrent(helper), isCurrent(candidate) else { return nil }
         return candidate
     }
@@ -52,7 +56,7 @@ struct ApplicationOwnership: Sendable {
         var result: [pid_t: ApplicationOwnerRead] = [:]
         for pid in pids {
             guard !cancellation.isCancelled else { break }
-            result[pid] = owner(for: pid, applications: applications)
+            result[pid] = owner(for: pid, applications: applications, cancellation: cancellation)
         }
         return result
     }

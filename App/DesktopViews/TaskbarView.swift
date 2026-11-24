@@ -38,6 +38,17 @@ final class TaskbarView: NSGlassEffectView {
 
 @MainActor
 final class TaskbarContentView: NSView {
+    private enum PointerAnchor: Equatable {
+        case mouse(String)
+        case fileDrag(String)
+
+        var buttonID: String {
+            switch self {
+            case let .mouse(id), let .fileDrag(id): id
+            }
+        }
+    }
+
     var actions = TaskbarViewActions()
     var iconProvider: (TaskbarWindowPresentation) -> NSImage? = { _ in nil }
     var canUseWindowActions: () -> Bool = { true }
@@ -53,10 +64,12 @@ final class TaskbarContentView: NSView {
     private weak var windowList: TaskbarWindowListView?
     private var listOpenedByClick = false
     var hasClickedWindowList: Bool { listOpenedByClick && popup.isPresented }
+    private var pointerAnchor: PointerAnchor?
     private var hoverTask: Task<Void, Never>?
     private var dismissTask: Task<Void, Never>?
     private let delay: TaskbarDelayedAction.Delay
     private let fileHover: TaskbarDelayedAction
+    private var fileDragLocation: CGPoint?
     private var draggedGroupID: String?
     private var dragMembers: [String] = []
     private var dragButtonIDs = Set<String>()
@@ -89,6 +102,7 @@ final class TaskbarContentView: NSView {
         contextMenu.visibilityChanged = { [weak self] visible in self?.actions.contextMenuVisibilityChanged(visible) }
         popup.onPresent = { [weak self] panel in self?.actions.popupPresented(panel) }
         popup.onDismiss = { [weak self] in
+            self?.cancelDismiss()
             self?.listGroupID = nil
             self?.listSignature = []
             self?.windowList = nil
@@ -155,18 +169,6 @@ final class TaskbarContentView: NSView {
         }
         let changed = result != layoutResult
         layoutResult = result
-        if let listGroupID {
-            let liveList: [TaskbarWindowPresentation]?
-            if listGroupID == "overflow" {
-                liveList = groups.filter { result.overflowGroups.contains($0.id) }.flatMap(\.windows)
-            } else if result.buttons.contains(where: { $0.groupID == listGroupID && $0.isCombined }) {
-                liveList = groupLookup[listGroupID]?.windows
-            } else {
-                liveList = nil
-            }
-            if let liveList, listMatches(liveList) { windowList?.updateTitles(windows: liveList) }
-            else { dismissPopups() }
-        }
         let animateLayout = animateNextLayout || (changed && draggedGroupID != nil)
         animateNextLayout = false
         let dragFrames = dragFrames(in: result)
@@ -228,7 +230,30 @@ final class TaskbarContentView: NSView {
             view.title = String(localized: "More windows")
             view.onClick = { [weak self] in self?.showOverflow(openedByClick: true) }
             view.onContextMenu = { [weak self] event in self?.rightMouseDown(with: event) }
+            view.onHover = { [weak self] entered in self?.hover(buttonID: "overflow", entered: entered) }
         } else { overflowButton?.removeFromSuperview(); overflowButton = nil }
+        updateOpenList(using: groupLookup)
+    }
+
+    private func updateOpenList(using groupLookup: [String: TaskbarGroupPresentation]) {
+        guard let listGroupID, let windowList else { return }
+        let anchor: CGRect?
+        let liveWindows: [TaskbarWindowPresentation]?
+        if listGroupID == "overflow" {
+            anchor = layoutResult.overflowFrame
+            liveWindows = groups.filter { layoutResult.overflowGroups.contains($0.id) }.flatMap(\.windows)
+        } else {
+            anchor = layoutResult.buttons.first { $0.groupID == listGroupID && $0.isCombined }?.frame
+            liveWindows = groupLookup[listGroupID]?.windows
+        }
+        guard let anchor, let liveWindows, listMatches(liveWindows) else {
+            popup.dismiss()
+            return
+        }
+        windowList.updateTitles(windows: liveWindows)
+        if let screen = window?.screen ?? NSScreen.main {
+            popup.updateFrame(listFrame(anchor: anchor, contentSize: windowList.frame.size, screen: screen))
+        }
     }
 
     private func updateActionTargets(_ targets: TaskbarButtonView.ActionTargets, for view: TaskbarButtonView,
@@ -254,41 +279,58 @@ final class TaskbarContentView: NSView {
 
     private func hover(buttonID: String, entered: Bool) {
         guard canUseWindowActions(), draggedGroupID == nil, !listOpenedByClick else { return }
+        let anchor = PointerAnchor.mouse(buttonID)
+        if entered { pointerAnchor = anchor }
+        else {
+            guard pointerAnchor == anchor else { return }
+            pointerAnchor = nil
+        }
         hoverTask?.cancel()
-        if entered {
-            guard layoutResult.buttons.first(where: { $0.id == buttonID })?.isCombined == true else {
-                scheduleDismiss()
-                return
-            }
-            dismissTask?.cancel()
-            let delay = delay
-            hoverTask = Task { @MainActor [weak self] in
-                await delay(.milliseconds(400))
-                guard !Task.isCancelled, let self,
-                      let layout = self.layoutResult.buttons.first(where: { $0.id == buttonID }), layout.isCombined,
-                      let group = self.groups.first(where: { $0.id == layout.groupID }) else { return }
-                self.showWindowList(group: group, anchor: layout.frame)
-            }
-        } else {
-            scheduleDismiss()
+        updateListDismissal()
+        guard entered, let button = buttonViews[buttonID], button.isCombined else { return }
+        let delay = delay
+        hoverTask = Task { @MainActor [weak self, weak button] in
+            await delay(.milliseconds(400))
+            guard !Task.isCancelled, let self, self.pointerAnchor == anchor,
+                  let button, self.buttonViews[buttonID] === button, button.containsCurrentMouse != false,
+                  let layout = self.layoutResult.buttons.first(where: { $0.id == buttonID }), layout.isCombined,
+                  let group = self.groups.first(where: { $0.id == layout.groupID }) else { return }
+            self.showWindowList(group: group, anchor: layout.frame)
         }
     }
 
-    private func scheduleDismiss() {
-        dismissTask?.cancel()
-        guard !listOpenedByClick else { return }
-        let delay = delay
-        dismissTask = Task { @MainActor [weak self] in
-            await delay(.milliseconds(250))
-            guard !Task.isCancelled, let self, !self.listOpenedByClick else { return }
-            if self.windowList?.isPointerInside == true { return }
-            self.dismissPopups()
+    private func keepsListOpen(_ list: TaskbarWindowListView) -> Bool {
+        if listOpenedByClick || list.isPointerInside { return true }
+        guard let listGroupID else { return false }
+        let anchorID = listGroupID == "overflow" ? "overflow" : "group:" + listGroupID
+        return pointerAnchor?.buttonID == anchorID
+    }
+
+    private func updateListDismissal() {
+        guard let list = windowList else { return }
+        if keepsListOpen(list) {
+            cancelDismiss()
+            return
         }
+        guard dismissTask == nil else { return }
+        let delay = delay
+        dismissTask = Task { @MainActor [weak self, weak list] in
+            await delay(.milliseconds(250))
+            guard !Task.isCancelled, let self, let list, self.windowList === list else { return }
+            self.dismissTask = nil
+            if !self.keepsListOpen(list) { self.popup.dismiss() }
+        }
+    }
+
+    private func cancelDismiss() {
+        dismissTask?.cancel()
+        dismissTask = nil
     }
 
     func dismissPopups() {
+        pointerAnchor = nil
         hoverTask?.cancel()
-        dismissTask?.cancel()
+        cancelDismiss()
         popup.dismiss()
         contextMenu.dismiss()
     }
@@ -301,9 +343,9 @@ final class TaskbarContentView: NSView {
         endGroupDrag(event: nil, cancelled: true)
     }
 
-    private func screenAnchor(_ rect: CGRect) -> CGRect {
-        guard let window else { return rect }
-        return window.convertToScreen(convert(rect, to: nil))
+    private func listFrame(anchor: CGRect, contentSize: CGSize, screen: NSScreen) -> CGRect {
+        let screenAnchor = window.map { $0.convertToScreen(convert(anchor, to: nil)) } ?? anchor
+        return TaskbarPopupGeometry.frame(anchor: screenAnchor, contentSize: contentSize, screen: screen.frame)
     }
 
     private func listMatches(_ windows: [TaskbarWindowPresentation]) -> Bool {
@@ -314,7 +356,7 @@ final class TaskbarContentView: NSView {
         guard canUseWindowActions(), openedByClick || !listOpenedByClick,
               let screen = window?.screen ?? NSScreen.main,
               admitWindowList(openedByClick) else { return }
-        dismissTask?.cancel()
+        cancelDismiss()
         if openedByClick {
             hoverTask?.cancel()
             cancelFileHover()
@@ -333,16 +375,20 @@ final class TaskbarContentView: NSView {
                                       activate: { [weak self] item in self?.activateIfLive(item, dismiss: true) },
                                       close: { [weak self] item in self?.closeIfLive(item) },
                                       fileHover: { [weak self] item in self?.activateIfLive(item, dismiss: false) })
-        let frame = TaskbarPopupGeometry.frame(anchor: screenAnchor(anchor), contentSize: view.frame.size, screen: screen.frame)
+        view.canPerformActions = { [weak self, weak view] in
+            guard let self, let view else { return false }
+            return self.windowList === view && self.popup.isPresented
+        }
+        let frame = listFrame(anchor: anchor, contentSize: view.frame.size, screen: screen)
         popup.present(content: view, frame: frame, anchorWindow: window)
         listOpenedByClick = openedByClick
         if openedByClick { popup.makeKey() }
         windowList = view
         listGroupID = group.id
         listSignature = group.windows.map(\.item)
-        view.onHover = { [weak self] entered in
-            if entered { self?.dismissTask?.cancel() }
-            else { self?.scheduleDismiss() }
+        view.onHover = { [weak self, weak view] _ in
+            guard let self, let view, self.windowList === view else { return }
+            self.updateListDismissal()
         }
     }
 
@@ -457,45 +503,65 @@ final class TaskbarContentView: NSView {
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation { draggingUpdated(sender) }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        guard canUseWindowActions() else { cancelFileHover(); return [] }
-        let point = convert(sender.draggingLocation, from: nil)
-        if sender.draggingPasteboard.availableType(from: [.fileURL]) != nil,
-           let frame = overflowButton?.frame, frame.contains(point) {
-            fileHover.schedule(target: "overflow", after: .milliseconds(600)) { [weak self] in self?.showOverflow() }
-            return .generic
-        }
-        guard sender.draggingPasteboard.availableType(from: [.fileURL]) != nil,
-              let button = layoutResult.buttons.first(where: { buttonViews[$0.id]?.frame.contains(point) == true }),
-              groups.contains(where: { $0.id == button.groupID }) else {
-            cancelFileHover()
+        guard canUseWindowActions(), sender.draggingPasteboard.availableType(from: [.fileURL]) != nil,
+              let buttonID = fileHoverButtonID(at: sender.draggingLocation) else {
+            pointerAnchor = nil
+            finishFileHover()
             return []
         }
-        scheduleFileHover(buttonID: button.id)
-
+        pointerAnchor = .fileDrag(buttonID)
+        updateListDismissal()
+        scheduleFileHover(buttonID: buttonID, at: sender.draggingLocation)
         return .generic
     }
 
+    private func fileHoverButtonID(at location: CGPoint) -> String? {
+        let point = convert(location, from: nil)
+        if overflowButton?.frame.contains(point) == true { return "overflow" }
+        return layoutResult.buttons.first(where: { buttonViews[$0.id]?.frame.contains(point) == true })?.id
+    }
+
     override func draggingExited(_ sender: (any NSDraggingInfo)?) {
-        cancelFileHover()
-        if listGroupID != nil { scheduleDismiss() }
+        finishFileHover()
         groupDrag.cancel()
         needsLayout = true
     }
 
+    override func draggingEnded(_ sender: any NSDraggingInfo) { finishFileHover() }
+
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        cancelFileHover()
+        finishFileHover()
         return false
     }
 
-    func scheduleFileHover(buttonID: String) {
-        guard canUseWindowActions(), let button = layoutResult.buttons.first(where: { $0.id == buttonID }),
-              let group = groups.first(where: { $0.id == button.groupID }) else {
+    private func finishFileHover() {
+        cancelFileHover()
+        if case .fileDrag = pointerAnchor { pointerAnchor = nil }
+        updateListDismissal()
+    }
+
+    func scheduleFileHover(buttonID: String, at location: CGPoint? = nil) {
+        let button = layoutResult.buttons.first(where: { $0.id == buttonID })
+        let group = button.flatMap { button in groups.first(where: { $0.id == button.groupID }) }
+        guard canUseWindowActions(), buttonID == "overflow" || group != nil else {
             cancelFileHover()
             return
         }
-        let expectedWindow = group.windows.first(where: { button.windowIDs.contains($0.id) })
+        fileDragLocation = location
+        let expectedWindow = button.flatMap { button in group?.windows.first(where: { button.windowIDs.contains($0.id) }) }
         fileHover.schedule(target: buttonID, after: .milliseconds(600)) { [weak self] in
             guard let self else { return }
+            if let location = self.fileDragLocation {
+                self.layoutSubtreeIfNeeded()
+                guard self.fileHover.target == buttonID, self.fileHoverButtonID(at: location) == buttonID else {
+                    self.finishFileHover()
+                    return
+                }
+            }
+            if buttonID == "overflow" {
+                self.showOverflow()
+                return
+            }
             guard let button = self.layoutResult.buttons.first(where: { $0.id == buttonID }),
                   let group = self.groups.first(where: { $0.id == button.groupID }) else {
                 self.cancelFileHover()
@@ -529,5 +595,6 @@ final class TaskbarContentView: NSView {
 
     private func cancelFileHover() {
         fileHover.cancel()
+        fileDragLocation = nil
     }
 }

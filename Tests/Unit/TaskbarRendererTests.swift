@@ -83,21 +83,22 @@ final class TaskbarRendererTests: XCTestCase {
 
     @MainActor
     private final class FileDrag: NSObject, NSDraggingInfo {
-        var draggingDestinationWindow: NSWindow? { nil }
+        weak var draggingDestinationWindow: NSWindow?
         var draggingSourceOperationMask: NSDragOperation { .copy }
         var draggingLocation = CGPoint.zero
         var draggedImageLocation: NSPoint { draggingLocation }
         nonisolated var draggedImage: NSImage? { nil }
         let draggingPasteboard = NSPasteboard.withUniqueName()
         var draggingSource: Any? { nil }
-        var draggingSequenceNumber: Int { 1 }
+        let draggingSequenceNumber: Int
         var draggingFormation: NSDraggingFormation = .none
         var animatesToDestination = false
         var numberOfValidItemsForDrop = 0
         var springLoadingHighlight: NSSpringLoadingHighlight { .none }
 
-        init(location: NSPoint = .zero) {
+        init(location: NSPoint = .zero, sequence: Int = 1) {
             draggingLocation = location
+            draggingSequenceNumber = sequence
             super.init()
             draggingPasteboard.declareTypes([.fileURL], owner: nil)
         }
@@ -110,9 +111,18 @@ final class TaskbarRendererTests: XCTestCase {
                                     using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
     }
 
-    private final class RecordingPopupPanel: NSPanel {
+    private func sendTerminalDrag(_ drag: FileDrag, to destination: NSView) {
+        let callback = #selector(NSDraggingDestination.draggingEnded(_:))
+        guard let method = class_getInstanceMethod(type(of: destination), callback),
+              method != class_getInstanceMethod(NSView.self, callback) else { return }
+        (destination as any NSDraggingDestination).draggingEnded?(drag)
+    }
+
+    private final class RecordingPopupPanel: NonConstrainingPanel {
         var frontRequests = 0
         var keyRequests = 0
+        var pointer = CGPoint.zero
+        override var mouseLocationOutsideOfEventStream: NSPoint { pointer }
         override var canBecomeKey: Bool { true }
         override func orderFrontRegardless() { frontRequests += 1 }
         override func makeKey() { keyRequests += 1 }
@@ -120,19 +130,22 @@ final class TaskbarRendererTests: XCTestCase {
 
     @MainActor
     private final class Clock {
-        var waiters: [CheckedContinuation<Void, Never>] = []
+        var waiters: [(duration: Duration?, continuation: CheckedContinuation<Void, Never>)] = []
+        var requestedDelays: [Duration] = []
         var completed = 0
         func sleep(_ duration: Duration) async {
-            await withCheckedContinuation { waiters.append($0) }
+            requestedDelays.append(duration)
+            await withCheckedContinuation { waiters.append((duration, $0)) }
             completed += 1
         }
-        func advance(allowIdle: Bool = false) async {
+        func advance(_ duration: Duration? = nil, allowIdle: Bool = false) async {
+            func matches(_ wait: Duration?) -> Bool { duration == nil || wait == duration }
             var pulse: Task<Void, Never>?
             if allowIdle {
                 await withCheckedContinuation { ready in
                     pulse = Task {
                         await withCheckedContinuation { waiter in
-                            waiters.append(waiter)
+                            waiters.append((duration, waiter))
                             ready.resume()
                         }
                         completed += 1
@@ -140,12 +153,14 @@ final class TaskbarRendererTests: XCTestCase {
                 }
             }
             let deadline = ContinuousClock.now + .seconds(1)
-            while waiters.isEmpty, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(1)) }
-            XCTAssertFalse(waiters.isEmpty)
-            let pending = waiters
+            while !waiters.contains(where: { matches($0.duration) }), ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+            let pending = waiters.filter { matches($0.duration) }
+            XCTAssertFalse(pending.isEmpty)
             let completionCount = completed + pending.count
-            waiters.removeAll()
-            for continuation in pending { continuation.resume() }
+            waiters.removeAll { matches($0.duration) }
+            for waiter in pending { waiter.continuation.resume() }
             while completed < completionCount, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(1)) }
             XCTAssertEqual(completed, completionCount)
             await pulse?.value
@@ -196,7 +211,7 @@ final class TaskbarRendererTests: XCTestCase {
         let item = StripItem(record: record)
         let presentation = TaskbarPresentation.groups(items: [item], order: [item.id],
             filter: StripDisplayFilter(scope: "left", connectedUUIDs: ["left"], primaryUUID: "left"),
-            optimisticStates: [:], appName: { _ in "Chrome" })
+            activeItemID: item.id, appName: { _ in "Chrome" })
         let view = makeView()
         view.taskbarContent.update(groups: presentation)
         let button = try XCTUnwrap(view.taskbarContent.buttonViews["window:multiline"])
@@ -273,7 +288,7 @@ final class TaskbarRendererTests: XCTestCase {
                                          delay: { await clock.sleep($0) })
         content.update(groups: groups())
         content.buttonViews["window:window-0"]?.onHover?(true)
-        await clock.advance()
+        await clock.advance(allowIdle: true)
         XCTAssertEqual(popup.presentations, 0)
         XCTAssertNil(content.buttonViews["window:window-0"]?.toolTip)
     }
@@ -318,6 +333,47 @@ final class TaskbarRendererTests: XCTestCase {
                 try reopened.clickRowForTesting(at: 0)
                 XCTAssertEqual(activated, [replaceProcess ? "window-0" : "replacement-tab"])
             }
+        }
+    }
+
+    func testDismissedListCannotDispatchActionsForItsSurvivingWindow() async throws {
+        for width: CGFloat in [60, 200] {
+            let popup = Popup()
+            let clock = Clock()
+            let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: width, height: 32), popup: popup,
+                                             delay: { await clock.sleep($0) })
+            let editor = groups()[0]
+            var activated: [String] = []
+            var closed: [String] = []
+            content.actions.activate = { activated.append($0.windowID.rawValue) }
+            content.actions.close = { closed.append($0.windowID.rawValue) }
+            content.update(groups: [editor])
+            let button = try XCTUnwrap(width == 60 ? content.overflowButton : content.buttonViews["group:test.editor"])
+            button.clickForTesting()
+            let dismissed = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+            let oldRow = try XCTUnwrap(dismissed.nativeRow(at: 0))
+            let replacement = WindowRecord(id: WindowID(rawValue: "replacement"), appID: AppID(rawValue: "editor"),
+                pid: 100, bundleIdentifier: "test.editor", title: "Replacement", bounds: nil,
+                status: .inactive, cgWindowID: 99, groupID: "window-1", displayUUID: "left")
+            let newWindow = TaskbarWindowPresentation(item: StripItem(record: replacement), title: replacement.title, isActive: false)
+            content.update(groups: [TaskbarGroupPresentation(id: editor.id, name: editor.name,
+                windows: [editor.windows[0], newWindow, editor.windows[2]])])
+            XCTAssertFalse(popup.isPresented)
+
+            button.clickForTesting()
+            let current = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+            try dismissed.clickRowForTesting(at: 0)
+            oldRow.close()
+            oldRow.scheduleFileHover()
+            await clock.advance()
+            XCTAssertTrue(activated.isEmpty)
+            XCTAssertTrue(closed.isEmpty)
+            XCTAssertTrue(popup.content === current)
+
+            try XCTUnwrap(current.nativeRow(at: 0)).close()
+            try current.clickRowForTesting(at: 0)
+            XCTAssertEqual(closed, ["window-0"])
+            XCTAssertEqual(activated, ["window-0"])
         }
     }
 
@@ -565,7 +621,7 @@ final class TaskbarRendererTests: XCTestCase {
         list.mouseEntered(with: enter)
         XCTAssertTrue(list.isPointerInside)
         button.onHover?(false)
-        await clock.advance()
+        await clock.advance(allowIdle: true)
         XCTAssertTrue(popup.isPresented)
         let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
             modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
@@ -589,6 +645,7 @@ final class TaskbarRendererTests: XCTestCase {
         await clock.advance()
         let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
         let row = try XCTUnwrap(list.nativeRow(at: 0))
+        drag.draggingLocation = row.convert(CGPoint(x: row.bounds.midX, y: row.bounds.midY), to: nil)
         XCTAssertEqual(row.draggingEntered(drag), .generic)
         XCTAssertTrue(list.isPointerInside)
         button.onHover?(false)
@@ -770,8 +827,8 @@ final class TaskbarRendererTests: XCTestCase {
     }
 
     func testBottomScreenPixelRoutesHoverAndClickToTheExactWindowAtBothScales() throws {
-        let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 1600, height: 64),
-                            styleMask: .borderless, backing: .buffered, defer: true)
+        let panel = RecordingPopupPanel(contentRect: CGRect(x: 0, y: 0, width: 1600, height: 64),
+                                        styleMask: .borderless, backing: .buffered, defer: true)
         defer { panel.close() }
         let container = NSView(frame: CGRect(x: 0, y: 0, width: 1600, height: 64))
         panel.contentView = container
@@ -797,8 +854,9 @@ final class TaskbarRendererTests: XCTestCase {
             XCTAssertFalse(trackingRect.contains(button.convert(CGPoint(x: button.frame.maxX + 1, y: point.y), from: content)))
             XCTAssertFalse(trackingRect.contains(button.convert(CGPoint(x: point.x, y: 32.25), from: content)))
             XCTAssertTrue(area.options.contains(.activeAlways))
+            panel.pointer = content.convert(point, to: nil)
             let entered = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered,
-                location: content.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                location: panel.pointer, modifierFlags: [], timestamp: 0,
                 windowNumber: panel.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil))
             (area.owner as? NSResponder)?.mouseEntered(with: entered)
             XCTAssertGreaterThan(button.selectionView.alphaValue, 0)
@@ -895,6 +953,328 @@ final class TaskbarRendererTests: XCTestCase {
             XCTAssertEqual(content.draggingUpdated(drag), [])
             content.prepareForHiding()
         }
+    }
+
+    func testPendingNativeFileHoverRechecksTheButtonUnderThePointerAfterLayout() async throws {
+        let clock = Clock()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 800, height: 32), popup: Popup(),
+                                         delay: { await clock.sleep($0) })
+        let initial = twoGroups()
+        var activated: [String] = []
+        content.actions.activate = { activated.append($0.windowID.rawValue) }
+        content.update(groups: initial)
+        let button = try XCTUnwrap(content.buttonViews["window:window-0"])
+        let point = CGPoint(x: button.frame.minX + 15, y: button.frame.midY)
+        let drag = FileDrag(location: content.convert(point, to: nil))
+        defer { drag.draggingPasteboard.releaseGlobally() }
+        XCTAssertEqual(content.draggingEntered(drag), .generic)
+
+        content.update(groups: Array(initial.reversed()))
+        XCTAssertFalse(button.frame.contains(point))
+        XCTAssertTrue(try XCTUnwrap(content.buttonViews["window:browser-window"]).frame.contains(point))
+        await clock.advance()
+        XCTAssertTrue(activated.isEmpty)
+
+        XCTAssertEqual(content.draggingUpdated(drag), .generic)
+        await clock.advance()
+        XCTAssertEqual(activated, ["browser-window"])
+    }
+
+    func testNativeTerminalDragCancelsPendingTaskbarFileHover() async throws {
+        let clock = Clock()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 800, height: 32), popup: Popup(),
+                                         delay: { await clock.sleep($0) })
+        var activated: [String] = []
+        content.actions.activate = { activated.append($0.windowID.rawValue) }
+        content.update(groups: groups())
+        let button = try XCTUnwrap(content.buttonViews["window:window-0"])
+        let drag = FileDrag(location: content.convert(CGPoint(x: button.frame.midX, y: button.frame.midY), to: nil))
+        defer { drag.draggingPasteboard.releaseGlobally() }
+        XCTAssertEqual(content.draggingEntered(drag), .generic)
+        await Task.yield()
+        sendTerminalDrag(drag, to: content)
+        await clock.advance()
+        XCTAssertTrue(activated.isEmpty)
+    }
+
+    func testNativeTerminalDragCancelsPendingListRowFileHover() async throws {
+        let clock = Clock()
+        let popup = Popup()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        var activated: [String] = []
+        content.actions.activate = { activated.append($0.windowID.rawValue) }
+        content.update(groups: groups())
+        try XCTUnwrap(content.buttonViews["group:test.editor"]).clickForTesting()
+        let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+        let row = try XCTUnwrap(list.nativeRow(at: 0))
+        let drag = FileDrag(location: row.convert(CGPoint(x: row.bounds.midX, y: row.bounds.midY), to: nil))
+        defer { drag.draggingPasteboard.releaseGlobally() }
+        XCTAssertEqual(row.draggingEntered(drag), .generic)
+        XCTAssertTrue(list.isPointerInside)
+        await Task.yield()
+        sendTerminalDrag(drag, to: row)
+        await clock.advance()
+        XCTAssertTrue(activated.isEmpty)
+        XCTAssertFalse(list.isPointerInside)
+    }
+
+    func testPendingNativeListFileHoverRechecksTheRowUnderThePointerAfterScrolling() async throws {
+        let clock = Clock()
+        var hovered: [String] = []
+        let list = TaskbarWindowListView(windows: groups(count: 5)[0].windows, availableHeight: 80,
+                                        delay: { await clock.sleep($0) }, icon: { _ in nil },
+                                        activate: { _ in }, close: { _ in }, fileHover: { hovered.append($0.id) })
+        let panel = NSPanel(contentRect: list.bounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.contentView = list
+        defer { panel.contentView = nil; panel.close() }
+        panel.layoutIfNeeded()
+        let first = try XCTUnwrap(list.nativeRow(at: 0))
+        let drag = FileDrag(location: first.convert(CGPoint(x: 60, y: 30), to: nil))
+        defer { drag.draggingPasteboard.releaseGlobally() }
+        XCTAssertEqual(first.draggingEntered(drag), .generic)
+
+        let clip = list.scrollView.contentView
+        clip.scroll(to: CGPoint(x: 0, y: 20))
+        list.scrollView.reflectScrolledClipView(clip)
+        list.layoutSubtreeIfNeeded()
+        XCTAssertFalse(first.visibleRect.isEmpty)
+        XCTAssertEqual(list.tableView.row(at: list.tableView.convert(drag.draggingLocation, from: nil)), 1)
+        await clock.advance()
+        XCTAssertTrue(hovered.isEmpty)
+        XCTAssertFalse(list.isPointerInside)
+    }
+
+    func testNativeFileDragGapUsesOneDismissalGraceForTheOpenList() async throws {
+        for width: CGFloat in [60, 200] {
+            let clock = Clock()
+            let popup = Popup()
+            let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: width, height: 32), popup: popup,
+                                             delay: { await clock.sleep($0) })
+            content.update(groups: groups())
+            let button = try XCTUnwrap(width == 60 ? content.overflowButton : content.buttonViews["group:test.editor"])
+            let drag = FileDrag(location: content.convert(CGPoint(x: button.frame.midX, y: button.frame.midY), to: nil))
+            defer { drag.draggingPasteboard.releaseGlobally() }
+            XCTAssertEqual(content.draggingEntered(drag), .generic)
+            await clock.advance()
+            XCTAssertTrue(popup.isPresented)
+
+            drag.draggingLocation = content.convert(CGPoint(x: 4, y: 16), to: nil)
+            for _ in 0..<3 {
+                XCTAssertEqual(content.draggingUpdated(drag), [])
+                XCTAssertTrue(popup.isPresented)
+                await Task.yield()
+            }
+            await clock.advance(allowIdle: true)
+            XCTAssertEqual(clock.requestedDelays, [.milliseconds(600), .milliseconds(250)])
+            XCTAssertFalse(popup.isPresented)
+        }
+    }
+
+    func testNativeFileDragBetweenButtonsRetiresOnlyThePreviousList() async throws {
+        for width: CGFloat in [150, 200] {
+            let clock = Clock()
+            let popup = Popup()
+            let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: width, height: 32), popup: popup,
+                                             delay: { await clock.sleep($0) })
+            let input = unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"])
+            content.update(groups: input)
+            let a = try XCTUnwrap(width == 150 ? content.overflowButton : content.buttonViews["group:test.narrow"])
+            let b = try XCTUnwrap(content.buttonViews[width == 150 ? "group:test.narrow" : "group:test.wide"])
+            func location(_ button: TaskbarButtonView) -> CGPoint {
+                content.convert(CGPoint(x: button.frame.midX, y: button.frame.midY), to: nil)
+            }
+            let drag = FileDrag(location: location(a))
+            defer { drag.draggingPasteboard.releaseGlobally() }
+            XCTAssertEqual(content.draggingEntered(drag), .generic)
+            await clock.advance(.milliseconds(600))
+            let original = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+
+            drag.draggingLocation = content.convert(CGPoint(x: 4, y: 16), to: nil)
+            XCTAssertEqual(content.draggingUpdated(drag), [])
+            drag.draggingLocation = location(a)
+            XCTAssertEqual(content.draggingUpdated(drag), .generic)
+            await clock.advance(.milliseconds(250), allowIdle: true)
+            XCTAssertTrue(popup.content === original)
+
+            drag.draggingLocation = location(b)
+            XCTAssertEqual(content.draggingUpdated(drag), .generic)
+            await clock.advance(.milliseconds(250), allowIdle: true)
+            XCTAssertFalse(popup.isPresented)
+            await clock.advance(.milliseconds(600))
+            let replacement = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+            XCTAssertEqual(replacement.nativeRows.map(\.item.id), width == 150 ? ["narrow-0", "narrow-1"] : ["wide-0", "wide-1"])
+        }
+    }
+
+    func testLatePopupExitRetiresOnlyTheListAndRespectsTheHoveredAnchor() async throws {
+        let enter = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            trackingNumber: 0, userData: nil))
+        let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            trackingNumber: 0, userData: nil))
+        for returnsToAnchor in [true, false] {
+            let popup = Popup()
+            let clock = Clock()
+            let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                             delay: { await clock.sleep($0) })
+            let input = unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"])
+            content.update(groups: input)
+            let a = try XCTUnwrap(content.buttonViews["group:test.narrow"])
+            let button = try XCTUnwrap(content.buttonViews[returnsToAnchor ? "group:test.narrow" : "group:test.wide"])
+            a.onHover?(true)
+            await clock.advance(.milliseconds(400))
+            let original = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+
+            a.onHover?(false)
+            original.mouseEntered(with: enter)
+            button.onHover?(true)
+            original.mouseExited(with: exit)
+            await clock.advance(.milliseconds(250), allowIdle: true)
+            if returnsToAnchor { XCTAssertTrue(popup.content === original) }
+            else { XCTAssertFalse(popup.isPresented) }
+            await clock.advance(.milliseconds(400))
+            if returnsToAnchor { XCTAssertTrue(popup.content === original) }
+            else {
+                let replacement = popup.content as? TaskbarWindowListView
+                XCTAssertEqual(replacement?.nativeRows.map(\.item.id), ["wide-0", "wide-1"])
+            }
+
+            button.onHover?(false)
+            await clock.advance(.milliseconds(250), allowIdle: true)
+            XCTAssertFalse(popup.isPresented)
+        }
+    }
+
+    func testTerminalNativeFileDragDismissesOnlyTransientLists() async throws {
+        for width: CGFloat in [60, 200] {
+            for useDrop in [false, true] {
+                let clock = Clock()
+                let popup = Popup()
+                let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: width, height: 32), popup: popup,
+                                                 delay: { await clock.sleep($0) })
+                content.update(groups: groups())
+                let button = try XCTUnwrap(width == 60 ? content.overflowButton : content.buttonViews["group:test.editor"])
+                let drag = FileDrag(location: content.convert(CGPoint(x: button.frame.midX, y: button.frame.midY), to: nil))
+                defer { drag.draggingPasteboard.releaseGlobally() }
+                XCTAssertEqual(content.draggingEntered(drag), .generic)
+                await clock.advance()
+                XCTAssertTrue(popup.isPresented)
+
+                if useDrop { XCTAssertFalse(content.performDragOperation(drag)) }
+                else { sendTerminalDrag(drag, to: content) }
+                XCTAssertTrue(popup.isPresented)
+                await clock.advance(allowIdle: true)
+                XCTAssertFalse(popup.isPresented)
+
+                button.clickForTesting()
+                let clickedList = try XCTUnwrap(popup.content)
+                XCTAssertEqual(content.draggingEntered(drag), .generic)
+                if useDrop { XCTAssertFalse(content.performDragOperation(drag)) }
+                else { sendTerminalDrag(drag, to: content) }
+                await clock.advance(allowIdle: true)
+                XCTAssertTrue(popup.content === clickedList)
+            }
+        }
+    }
+
+    func testRebindingAFileDragRowEndsItsOldPresenceAndAcceptsANewDrag() async throws {
+        let clock = Clock()
+        let popup = Popup()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        let windows = groups()[0].windows
+        content.update(groups: groups())
+        try XCTUnwrap(content.buttonViews["group:test.editor"]).clickForTesting()
+        let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+        let row = try XCTUnwrap(list.nativeRow(at: 0))
+        let point = row.convert(CGPoint(x: 60, y: 20), to: nil)
+        let old = FileDrag(location: point, sequence: 1)
+        let current = FileDrag(location: point, sequence: 2)
+        defer { old.draggingPasteboard.releaseGlobally(); current.draggingPasteboard.releaseGlobally() }
+        XCTAssertEqual(row.draggingEntered(old), .generic)
+        XCTAssertTrue(list.isPointerInside)
+
+        var activated: [String] = []
+        row.configure(window: windows[1], icon: nil, close: {}, fileHover: { activated.append(windows[1].id) })
+        XCTAssertFalse(list.isPointerInside)
+        XCTAssertEqual(row.draggingEntered(current), .generic)
+        XCTAssertTrue(list.isPointerInside)
+        sendTerminalDrag(old, to: row)
+        XCTAssertTrue(list.isPointerInside)
+        await clock.advance()
+        XCTAssertEqual(activated, ["window-1"])
+        sendTerminalDrag(current, to: row)
+        XCTAssertFalse(list.isPointerInside)
+    }
+
+    func testRemovingAFileDragRowClearsItsPresence() async throws {
+        let clock = Clock()
+        let windows = groups()[0].windows
+        var activated: [String] = []
+        let list = TaskbarWindowListView(windows: windows, availableHeight: 80,
+                                        delay: { await clock.sleep($0) }, icon: { _ in nil },
+                                        activate: { _ in }, close: { _ in }, fileHover: { activated.append($0.id) })
+        let row = try XCTUnwrap(list.nativeRow(at: 0))
+        let rowView = try XCTUnwrap(list.tableView.rowView(atRow: 0, makeIfNecessary: false))
+        let drag = FileDrag(location: row.convert(CGPoint(x: 60, y: 20), to: nil))
+        defer { drag.draggingPasteboard.releaseGlobally() }
+        XCTAssertEqual(row.draggingEntered(drag), .generic)
+        XCTAssertTrue(list.isPointerInside)
+
+        list.tableView(list.tableView, didRemove: rowView, forRow: 0)
+        XCTAssertFalse(list.isPointerInside)
+        await clock.advance()
+        XCTAssertTrue(activated.isEmpty)
+    }
+
+    func testOldRowExitAndFileDragEndPreserveCurrentPointerPresence() async throws {
+        let clock = Clock()
+        let popup = Popup()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        var activated: [String] = []
+        content.actions.activate = { activated.append($0.windowID.rawValue) }
+        content.update(groups: groups())
+        let button = try XCTUnwrap(content.buttonViews["group:test.editor"])
+        let drag = FileDrag(location: content.convert(CGPoint(x: button.frame.midX, y: button.frame.midY), to: nil))
+        defer { drag.draggingPasteboard.releaseGlobally() }
+        XCTAssertEqual(content.draggingEntered(drag), .generic)
+        await clock.advance()
+        let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+        let first = try XCTUnwrap(list.nativeRow(at: 0))
+        let second = try XCTUnwrap(list.nativeRow(at: 1))
+        content.draggingExited(drag)
+        drag.draggingLocation = first.convert(CGPoint(x: 60, y: 20), to: nil)
+        XCTAssertEqual(first.draggingEntered(drag), .generic)
+        drag.draggingLocation = second.convert(CGPoint(x: 60, y: 20), to: nil)
+        XCTAssertEqual(second.draggingEntered(drag), .generic)
+        await clock.advance(.milliseconds(600))
+        XCTAssertEqual(activated, ["window-1"])
+        first.draggingExited(drag)
+        XCTAssertTrue(list.isPointerInside)
+        await clock.advance(.milliseconds(250), allowIdle: true)
+        XCTAssertTrue(popup.content === list)
+
+        let enter = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            trackingNumber: 0, userData: nil))
+        let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            trackingNumber: 0, userData: nil))
+        list.mouseEntered(with: enter)
+        list.mouseExited(with: exit)
+        XCTAssertTrue(list.isPointerInside)
+        list.mouseEntered(with: enter)
+        sendTerminalDrag(drag, to: second)
+        XCTAssertTrue(list.isPointerInside)
+        await clock.advance(allowIdle: true)
+        XCTAssertTrue(popup.content === list)
+        list.mouseExited(with: exit)
+        await clock.advance()
+        XCTAssertFalse(popup.isPresented)
     }
 
     func testDraggingOutsideCannotLiftAnyGroupButtonOutOfTheBarOrActivateAWindow() {
@@ -1791,6 +2171,330 @@ extension TaskbarRendererTests {
 
 @MainActor
 extension TaskbarRendererTests {
+    func testReplacingOpenListPreservesPendingNeighborHover() async throws {
+        let popup = Popup()
+        let clock = Clock()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        let groups = unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"])
+        content.update(groups: groups)
+        let first = try XCTUnwrap(content.buttonViews["group:test.narrow"])
+        let second = try XCTUnwrap(content.buttonViews["group:test.wide"])
+        var actions: [WindowActionIdentity] = []
+        content.actions.activate = { actions.append($0) }
+        content.actions.close = { actions.append($0) }
+        first.onHover?(true)
+        await clock.advance(.milliseconds(400))
+        let oldList = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+        let retainedRow = try XCTUnwrap(oldList.nativeRow(at: 0))
+        retainedRow.scheduleFileHover()
+        second.onHover?(true)
+
+        let record = WindowRecord(id: WindowID(rawValue: "narrow-replacement"), appID: AppID(rawValue: "narrow"),
+            pid: 300, bundleIdentifier: "test.narrow", title: "Narrow window 2", bounds: .zero,
+            status: .inactive, cgWindowID: 300, groupID: "narrow-replacement", displayUUID: "left")
+        let replacement = TaskbarWindowPresentation(item: StripItem(record: record), title: record.title, isActive: false)
+        let updated = TaskbarGroupPresentation(id: groups[0].id, name: groups[0].name,
+                                               windows: [groups[0].windows[0], replacement])
+        content.update(groups: [updated, groups[1]])
+        XCTAssertFalse(popup.isPresented)
+        XCTAssertTrue(content.buttonViews["group:test.wide"] === second)
+        retainedRow.close()
+        try oldList.clickRowForTesting(at: 0)
+        await clock.advance(.milliseconds(600))
+        XCTAssertTrue(actions.isEmpty)
+        await clock.advance(.milliseconds(400))
+        let newList = popup.content as? TaskbarWindowListView
+        XCTAssertEqual(newList?.nativeRows.map(\.item.id), ["wide-0", "wide-1"])
+        XCTAssertEqual(popup.keyRequests, 0)
+        content.prepareForHiding()
+        await clock.advance(.milliseconds(250), allowIdle: true)
+        XCTAssertFalse(popup.isPresented)
+    }
+
+    func testPendingMouseHoverCannotOpenAfterItsButtonMovesAwayFromThePointer() async throws {
+        let popup = Popup()
+        let clock = Clock()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        let panel = RecordingPopupPanel(contentRect: content.frame, styleMask: .borderless, backing: .buffered, defer: true)
+        panel.contentView = content
+        defer { panel.close() }
+        let groups = unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"])
+        content.update(groups: groups)
+        let button = try XCTUnwrap(content.buttonViews["group:test.wide"])
+        panel.pointer = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: button)
+
+        content.update(groups: Array(groups.reversed()))
+        XCTAssertTrue(content.buttonViews["group:test.wide"] === button)
+        XCTAssertFalse(button.visibleRect.contains(button.convert(panel.pointer, from: nil)))
+        await clock.advance(.milliseconds(400))
+        XCTAssertFalse(popup.isPresented)
+    }
+
+    func testLateExitFromTheReturnedButtonPreservesCombinedHoverAndFeedback() async throws {
+        let popup = Popup()
+        let clock = Clock()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        let panel = RecordingPopupPanel(contentRect: content.frame, styleMask: .borderless, backing: .buffered, defer: true)
+        panel.contentView = content
+        defer { panel.close() }
+        content.update(groups: unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"]))
+        let first = try XCTUnwrap(content.buttonViews["group:test.narrow"])
+        let second = try XCTUnwrap(content.buttonViews["group:test.wide"])
+        first.reduceMotion = { true }
+        let firstPoint = first.convert(CGPoint(x: first.bounds.midX, y: first.bounds.midY), to: nil)
+        let secondPoint = second.convert(CGPoint(x: second.bounds.midX, y: second.bounds.midY), to: nil)
+
+        panel.pointer = firstPoint
+        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first)
+        panel.pointer = secondPoint
+        try sendTrackingEvent(.mouseEntered, at: secondPoint, to: second)
+        panel.pointer = firstPoint
+        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first)
+        try sendTrackingEvent(.mouseExited, at: secondPoint, to: first)
+        XCTAssertGreaterThan(first.selectionView.alphaValue, 0)
+        await clock.advance(.milliseconds(400))
+        XCTAssertEqual((popup.content as? TaskbarWindowListView)?.nativeRows.map(\.item.id), ["narrow-0", "narrow-1"])
+
+        panel.pointer = CGPoint(x: -1, y: -1)
+        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: first)
+        XCTAssertEqual(first.selectionView.alphaValue, 0)
+        XCTAssertNotNil(popup.content)
+        await clock.advance(.milliseconds(250), allowIdle: true)
+        XCTAssertFalse(popup.isPresented)
+    }
+
+    func testLateEnterFromANeighborKeepsTheCurrentCombinedHover() async throws {
+        let popup = Popup()
+        let clock = Clock()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        let panel = RecordingPopupPanel(contentRect: content.frame, styleMask: .borderless, backing: .buffered, defer: true)
+        panel.contentView = content
+        defer { panel.close() }
+        content.update(groups: unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"]))
+        let first = try XCTUnwrap(content.buttonViews["group:test.narrow"])
+        let second = try XCTUnwrap(content.buttonViews["group:test.wide"])
+        first.reduceMotion = { true }
+        second.reduceMotion = { true }
+        let firstPoint = first.convert(CGPoint(x: first.bounds.midX, y: first.bounds.midY), to: nil)
+        panel.pointer = second.convert(CGPoint(x: second.bounds.midX, y: second.bounds.midY), to: nil)
+
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: second)
+        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first)
+        XCTAssertEqual(first.selectionView.alphaValue, 0)
+        XCTAssertGreaterThan(second.selectionView.alphaValue, 0)
+        await clock.advance(.milliseconds(400))
+        XCTAssertEqual((popup.content as? TaskbarWindowListView)?.nativeRows.map(\.item.id), ["wide-0", "wide-1"])
+    }
+
+    func testLateEnterAfterLeavingAButtonCannotRestoreItsFeedback() throws {
+        let button = TaskbarButtonView(frame: CGRect(x: 0, y: 0, width: 140, height: 28))
+        let panel = RecordingPopupPanel(contentRect: button.frame, styleMask: .borderless, backing: .buffered, defer: true)
+        panel.contentView = button
+        defer { panel.close() }
+        button.reduceMotion = { true }
+        var hovering: [Bool] = []
+        button.onHover = { hovering.append($0) }
+        let inside = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        panel.pointer = inside
+        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
+        XCTAssertGreaterThan(button.selectionView.alphaValue, 0)
+        panel.pointer = CGPoint(x: -1, y: -1)
+        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: button)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
+        XCTAssertEqual(button.selectionView.alphaValue, 0)
+        XCTAssertEqual(hovering, [true, false])
+    }
+
+    func testLatePopupExitCannotDismissAfterThePointerReturns() async throws {
+        let clock = Clock()
+        let popup = TaskbarPopupController { frame in
+            RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: true)
+        }
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        defer { popup.dismiss() }
+        content.update(groups: groups())
+        let button = try XCTUnwrap(content.buttonViews["group:test.editor"])
+        button.onHover?(true)
+        await clock.advance(.milliseconds(400))
+        let panel = try XCTUnwrap(popup.panel as? RecordingPopupPanel)
+        let list = try XCTUnwrap(panel.contentView as? TaskbarWindowListView)
+        let inside = list.convert(CGPoint(x: list.bounds.midX, y: list.bounds.midY), to: nil)
+        let outside = CGPoint(x: -1, y: -1)
+        panel.pointer = inside
+        try sendTrackingEvent(.mouseEntered, at: inside, to: list)
+        button.onHover?(false)
+        panel.pointer = outside
+        try sendTrackingEvent(.mouseExited, at: outside, to: list)
+        XCTAssertFalse(list.isPointerInside)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: list)
+        XCTAssertFalse(list.isPointerInside)
+        panel.pointer = inside
+        try sendTrackingEvent(.mouseEntered, at: inside, to: list)
+        try sendTrackingEvent(.mouseExited, at: outside, to: list)
+        XCTAssertTrue(list.isPointerInside)
+        await clock.advance(.milliseconds(250), allowIdle: true)
+        XCTAssertTrue(popup.panel === panel)
+
+        panel.pointer = outside
+        try sendTrackingEvent(.mouseExited, at: outside, to: list)
+        XCTAssertFalse(list.isPointerInside)
+        await clock.advance(.milliseconds(250), allowIdle: true)
+        XCTAssertFalse(popup.isPresented)
+    }
+
+    func testPopupTrackingIncludesTopEdgeAndExcludesBottomEdge() async throws {
+        let clock = Clock()
+        let popup = TaskbarPopupController { frame in
+            RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: true)
+        }
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        defer { popup.dismiss() }
+        content.update(groups: groups())
+        let button = try XCTUnwrap(content.buttonViews["group:test.editor"])
+        button.onHover?(true)
+        await clock.advance(.milliseconds(400))
+        let panel = try XCTUnwrap(popup.panel as? RecordingPopupPanel)
+        let list = try XCTUnwrap(panel.contentView as? TaskbarWindowListView)
+        XCTAssertFalse(list.isFlipped)
+        let rect = list.visibleRect
+        XCTAssertFalse(rect.isEmpty)
+
+        panel.pointer = list.convert(CGPoint(x: rect.midX, y: rect.maxY), to: nil)
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: list)
+        XCTAssertTrue(list.isPointerInside)
+
+        panel.pointer = list.convert(CGPoint(x: rect.midX, y: rect.midY), to: nil)
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: list)
+        XCTAssertTrue(list.isPointerInside)
+        button.onHover?(false)
+        panel.pointer = list.convert(CGPoint(x: rect.midX, y: rect.minY), to: nil)
+        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: list)
+        XCTAssertFalse(list.isPointerInside)
+        XCTAssertTrue(popup.isPresented)
+        await clock.advance(.milliseconds(250), allowIdle: true)
+        XCTAssertFalse(popup.isPresented)
+    }
+
+    func testPendingNativeRowDragUsesTheCurrentPopupFrameBeforeActivating() async throws {
+        let screen = try XCTUnwrap(NSScreen.main)
+        for remainsOnRow in [false, true] {
+            let clock = Clock()
+            let dock = RecordingPopupPanel(contentRect: CGRect(x: screen.frame.minX + 300, y: screen.frame.minY, width: 200, height: 32),
+                                           styleMask: .borderless, backing: .buffered, defer: true)
+            let popup = TaskbarPopupController { frame in
+                RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: true)
+            }
+            let content = TaskbarContentView(frame: CGRect(origin: .zero, size: dock.frame.size), popup: popup,
+                                             delay: { await clock.sleep($0) })
+            dock.contentView = content
+            defer { popup.dismiss(); dock.close() }
+            let groups = unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"])
+            content.update(groups: groups)
+            var activated: [String] = []
+            content.actions.activate = { activated.append($0.windowID.rawValue) }
+            try XCTUnwrap(content.buttonViews["group:test.wide"]).clickForTesting()
+            let panel = try XCTUnwrap(popup.panel)
+            let list = try XCTUnwrap(panel.contentView as? TaskbarWindowListView)
+            let row = try XCTUnwrap(list.nativeRow(at: 0))
+            let x = remainsOnRow ? row.bounds.minX + 20 : row.bounds.maxX - 20
+            let drag = FileDrag(location: row.convert(CGPoint(x: x, y: row.bounds.midY), to: nil))
+            drag.draggingDestinationWindow = panel
+            defer { drag.draggingPasteboard.releaseGlobally() }
+            let screenLocation = panel.convertPoint(toScreen: drag.draggingLocation)
+            XCTAssertEqual(row.draggingEntered(drag), .generic)
+            XCTAssertTrue(list.isPointerInside)
+
+            let originalFrame = panel.frame
+            content.update(groups: Array(groups.reversed()))
+            XCTAssertLessThan(panel.frame.minX, originalFrame.minX)
+            XCTAssertTrue(popup.panel === panel)
+            XCTAssertTrue(list.nativeRow(at: 0) === row)
+            let newLocation = row.convert(panel.convertPoint(fromScreen: screenLocation), from: nil)
+            XCTAssertEqual(row.visibleRect.contains(newLocation), remainsOnRow)
+            await clock.advance(.milliseconds(600))
+            XCTAssertEqual(activated, remainsOnRow ? ["wide-0"] : [])
+            XCTAssertEqual(list.isPointerInside, remainsOnRow)
+            sendTerminalDrag(drag, to: row)
+            XCTAssertFalse(list.isPointerInside)
+        }
+    }
+
+    func testOpenCombinedListFollowsMovedAnchorWithoutReopening() throws {
+        let screen = try XCTUnwrap(NSScreen.main)
+        let dock = RecordingPopupPanel(contentRect: CGRect(x: screen.frame.minX + 300, y: screen.frame.minY, width: 200, height: 32),
+                                       styleMask: .borderless, backing: .buffered, defer: true)
+        let popup = TaskbarPopupController { frame in
+            RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: true)
+        }
+        let content = TaskbarContentView(frame: CGRect(origin: .zero, size: dock.frame.size), popup: popup)
+        dock.contentView = content
+        defer { popup.dismiss(); dock.close() }
+        let groups = unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"])
+        content.update(groups: groups)
+        let button = try XCTUnwrap(content.buttonViews["group:test.wide"])
+        button.clickForTesting()
+        let panel = try XCTUnwrap(popup.panel as? RecordingPopupPanel)
+        let list = try XCTUnwrap(panel.contentView as? TaskbarWindowListView)
+        let row = try XCTUnwrap(list.nativeRow(at: 1))
+        list.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        panel.pointer = list.convert(CGPoint(x: list.bounds.midX, y: list.bounds.midY), to: nil)
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: list)
+        let start = panel.frame
+        let startingAnchor = dock.convertToScreen(button.convert(button.bounds, to: nil))
+        XCTAssertEqual(start.midX, startingAnchor.midX, accuracy: 0.01)
+
+        content.update(groups: Array(groups.reversed()))
+        let endingAnchor = dock.convertToScreen(button.convert(button.bounds, to: nil))
+        XCTAssertLessThan(endingAnchor.midX, startingAnchor.midX)
+        XCTAssertEqual(panel.frame.midX, endingAnchor.midX, accuracy: 0.01)
+        XCTAssertEqual(panel.frame.minY, start.minY)
+        XCTAssertEqual(panel.frame.size, start.size)
+        XCTAssertTrue(popup.panel === panel)
+        XCTAssertTrue(panel.contentView === list)
+        XCTAssertTrue(list.nativeRow(at: 1) === row)
+        XCTAssertTrue(list.isPointerInside)
+        XCTAssertEqual(list.tableView.selectedRow, 1)
+        XCTAssertEqual(panel.keyRequests, 1)
+        XCTAssertEqual(panel.frontRequests, 1)
+        XCTAssertFalse(panel.isVisible)
+    }
+
+    private func sendTrackingEvent(_ type: NSEvent.EventType, at point: CGPoint, to view: NSView) throws {
+        let event = try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [],
+            timestamp: 0, windowNumber: view.window?.windowNumber ?? 0, context: nil,
+            eventNumber: 0, trackingNumber: 0, userData: nil))
+        if type == .mouseEntered { view.mouseEntered(with: event) }
+        else { view.mouseExited(with: event) }
+    }
+
+    func testLateExitFromANeighborDoesNotCancelTheCurrentCombinedHover() async throws {
+        let popup = Popup()
+        let clock = Clock()
+        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32), popup: popup,
+                                         delay: { await clock.sleep($0) })
+        let combinedGroups = unequalGroups(shortFirst: true, shortTitles: ["Narrow window 1", "Narrow window 2"])
+        content.update(groups: combinedGroups)
+        let first = try XCTUnwrap(content.buttonViews["group:test.narrow"])
+        let second = try XCTUnwrap(content.buttonViews["group:test.wide"])
+        first.onHover?(true)
+        second.onHover?(true)
+        first.onHover?(false)
+        await clock.advance()
+        let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
+        XCTAssertEqual(list.nativeRows.map(\.item.id), combinedGroups[1].windows.map(\.id))
+
+        second.onHover?(false)
+        await clock.advance()
+        XCTAssertFalse(popup.isPresented)
+    }
+
     func testPendingHoverCannotReplaceAnotherGroupOpenedByClick() async throws {
         for (fileHover, hoverBeforeClick) in [(false, true), (false, false), (true, true), (true, false)] {
             let popup = Popup()

@@ -24,6 +24,7 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
         var originOverride: ApplicationOrigin?
         var beforeRead: (@Sendable (String) -> Void)?
         var beforeWindowIDRead: (@Sendable (CGWindowID) -> Void)?
+        var beforeOwnerRead: (@Sendable (CGWindowID) -> Void)?
         var beforeFrameBatchRead: (@Sendable () -> Void)?
         var nativeWindowIDOverrides: [CGWindowID: CGWindowID] = [:]
         var unreadNativeWindowIDs = Set<CGWindowID>()
@@ -34,16 +35,20 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
         var hiddenApplications = Set<pid_t>()
         var unhideAttempts: [pid_t] = []
         var beforeSettable: (@Sendable (String) -> Void)?
+        var unreadSettableAttributes = Set<String>()
         var beforeAttributeWrite: (@Sendable (CGWindowID, String) -> AXError?)?
         var beforeSizeWrite: (@Sendable (CGWindowID, CGSize) -> AXError?)?
         var afterAttributeWrite: (@Sendable (CGWindowID, String) -> Void)?
         var rejectMinimizedAttribute = false
         var transientMinimizeReads = 0
+        var malformedMinimizeButton = false
         var minimizeButtonReads = 0
         var allowFocusOfMinimized = false
         var frontmostPIDOverride: pid_t?
         var exposesSystemFocus = false
         var generationsByPID: [pid_t: ProcessGeneration] = [:]
+        var unreadGenerations = Set<pid_t>()
+        var afterGenerationRead: (@Sendable (pid_t, ProcessGeneration?) -> Void)?
         var subroles: [CGWindowID: String] = [:]
         var modalWindows: [CGWindowID: Bool] = [:]
         var topLevelWindows = Set<CGWindowID>()
@@ -130,12 +135,15 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
     }
     func pid(_ element: AXUIElement) -> pid_t? {
         guard let id = number(element) else { return applications.first { CFEqual($0.value, element) }?.key }
+        state.withLock { $0.beforeOwnerRead }?(id)
         return state.withLock { $0.unreadOwners.contains(id) ? nil : $0.windows[id]?.pid }
     }
     func setTimeout(_ element: AXUIElement, _ timeout: Float) -> AXError { .success }
     func isSettable(_ element: AXUIElement, _ attribute: CFString) -> (AXError, Bool) {
         state.withLock { $0.beforeSettable }?(attribute as String)
-        return (.success, true)
+        return state.withLock {
+            $0.unreadSettableAttributes.contains(attribute as String) ? (.cannotComplete, false) : (.success, true)
+        }
     }
 
     func copyAttributes(_ element: AXUIElement, _ attributes: [String]) -> (AXError, [CFTypeRef]?) {
@@ -217,7 +225,9 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
                     if storage.transientMinimizeReads > 0 { storage.transientMinimizeReads -= 1; return true }
                     return false
                 }
-                return unavailable ? (.cannotComplete, nil) : (.success, minimizeButtons[id])
+                if unavailable { return (.cannotComplete, nil) }
+                if value.malformedMinimizeButton { return (.success, "Not an AX element" as CFString) }
+                return (.success, minimizeButtons[id])
             default: return (.attributeUnsupported, nil)
             }
     }
@@ -228,7 +238,7 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
         let size: CGSize?
         if attribute as String == kAXSizeAttribute as String {
             var requestedSize = CGSize.zero
-            guard CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetValue(unsafeBitCast(value, to: AXValue.self), .cgSize, &requestedSize) else { return .illegalArgument }
+            guard CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetValue(unsafeDowncast(value, to: AXValue.self), .cgSize, &requestedSize) else { return .illegalArgument }
             if let failure = state.withLock({ $0.beforeSizeWrite })?(id, requestedSize) { return failure }
             size = requestedSize
         } else {
@@ -246,7 +256,7 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
                 window.bounds?.size = size
             } else if attribute as String == kAXPositionAttribute as String {
                 var point = CGPoint.zero
-                guard CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetValue(unsafeBitCast(value, to: AXValue.self), .cgPoint, &point) else { return .illegalArgument }
+                guard CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetValue(unsafeDowncast(value, to: AXValue.self), .cgPoint, &point) else { return .illegalArgument }
                 window.bounds?.origin = point
             }
             storage.windows[id] = window
@@ -277,7 +287,13 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
         return result
     }
 
-    func generation(_ pid: pid_t) -> ProcessGeneration? { state.withLock { $0.generationsByPID[pid] ?? $0.generation } }
+    func generation(_ pid: pid_t) -> ProcessGeneration? {
+        let (generation, afterRead) = state.withLock {
+            ($0.unreadGenerations.contains(pid) ? nil : ($0.generationsByPID[pid] ?? $0.generation), $0.afterGenerationRead)
+        }
+        afterRead?(pid, generation)
+        return generation
+    }
     func app(_ pid: pid_t) -> WindowApplicationState? {
         state.withLock { value in
             guard applications[pid] != nil else { return nil }
@@ -1432,6 +1448,71 @@ final class TaskbarBehaviorTests: XCTestCase {
         XCTAssertTrue(fixture.runtime.optimisticStatesByWindowID.isEmpty)
     }
 
+    func testCancelledNativeCaptureKeepsItsStagesOutOfTheReplacementClickTrace() async throws {
+        let desktop = BehaviorDesktop()
+        let reader = AXWindowReader(accessibility: desktop)
+        let switches = ActionExecutionSwitches(environment: [
+            DebugSwitch.clickTrace.rawValue: "1",
+            DebugSwitch.axElementCache.rawValue: "0",
+            DebugSwitch.fastWindowHandle.rawValue: "0"
+        ])
+        let runtime = AppRuntime(tracker: BehaviorInventory(desktop),
+            actionExecutor: PlatformActionExecutor(switches: switches, reader: reader,
+                                                  system: desktop, focusBackend: desktop),
+            isAppFrontmost: { desktop.app($0)?.isActive == true })
+        let lines = Mutex<[Data]>([])
+        let trace = ClickLatencyTrace.Runtime(writeLine: { line in lines.withLock { $0.append(line) } })
+        runtime.clickLatencyTrace = trace
+        runtime.start()
+        let gate = BehaviorReadGate(attribute: kAXWindowsAttribute as String)
+        defer { gate.release.signal(); runtime.stop() }
+        let id = WindowID(rawValue: "editor-b")
+        await wait { runtime.snapshot.windows[id] != nil }
+        let record = try XCTUnwrap(runtime.snapshot.windows[id])
+        let invalidations = PassthroughSubject<Void, Never>()
+        desktop.state.withLock { $0.beforeRead = { gate.read($0) } }
+        runtime.trigger(.activate(id), expected: record.actionIdentity,
+                        projectionInvalidations: invalidations.eraseToAnyPublisher(), isProjectionCurrent: { true })
+        await wait { gate.entered.withLock { $0 } }
+
+        invalidations.send()
+        runtime.close(windowID: id.rawValue)
+        desktop.state.withLock { $0.generationsByPID[record.pid] = .init(timeval(tv_sec: 99, tv_usec: 0)) }
+        gate.release.signal()
+        for action in runtime.pendingActionsForTesting { await action.value }
+        XCTAssertFalse(gate.timedOut.withLock { $0 })
+
+        func records() throws -> [[String: Any]] {
+            trace.flush()
+            return try lines.withLock { $0 }.map { line in
+                try XCTUnwrap(JSONSerialization.jsonObject(with: line) as? [String: Any])
+            }
+        }
+        let interrupted = try records()
+        XCTAssertEqual(interrupted.count, 2)
+        let cancelled = try XCTUnwrap(interrupted.first)
+        let replacement = try XCTUnwrap(interrupted.dropFirst().first)
+        XCTAssertEqual(cancelled["kind"] as? String, "activateWindow")
+        XCTAssertEqual(cancelled["success"] as? Bool, false)
+        XCTAssertEqual(replacement["kind"] as? String, "closeWindow")
+        XCTAssertEqual(replacement["success"] as? Bool, false)
+        XCTAssertNotNil(replacement["execStartMs"])
+        XCTAssertNil(replacement["handleMs"])
+        XCTAssertNil(replacement["handleDetail"])
+        XCTAssertNil(replacement["earlyFocusMs"])
+
+        desktop.state.withLock { _ = $0.generationsByPID.removeValue(forKey: record.pid) }
+        runtime.activate(windowID: id.rawValue)
+        for action in runtime.pendingActionsForTesting { await action.value }
+        let finished = try records()
+        XCTAssertEqual(finished.count, 3)
+        let completed = try XCTUnwrap(finished.last)
+        XCTAssertEqual(completed["kind"] as? String, "activateWindow")
+        XCTAssertEqual(completed["success"] as? Bool, true)
+        XCTAssertEqual(completed["handleDetail"] as? String, "fallback")
+        XCTAssertEqual(desktop.state.withLock { $0.focused }, 1002)
+    }
+
     func testFinderActivationStopsCaptureRetriesWhenItsFirstInventoryReadCancels() throws {
         let desktop = BehaviorDesktop(editorBundleIdentifier: "com.apple.finder")
         let cancellation = OperationCancellation()
@@ -1499,6 +1580,153 @@ final class TaskbarBehaviorTests: XCTestCase {
         XCTAssertNil(desktop.state.withLock { $0.focused })
         XCTAssertEqual(desktop.state.withLock { $0.activationAttempts }, [])
         XCTAssertEqual(predictions.withLock { $0 }, [])
+    }
+
+    func testCloseRevalidatesTheOriginalWindowAfterTheHandoffCandidateRead() async throws {
+        for replaceOriginal in [false, true] {
+            let desktop = BehaviorDesktop()
+            desktop.state.withLock { $0.windows[1002]?.status = .minimized }
+            desktop.publish()
+            let original = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
+            let candidate = try XCTUnwrap(desktop.state.withLock { $0.windows[2001] })
+            let candidateElement = try XCTUnwrap(desktop.elements[2001])
+            var records = desktop.values.value.windows
+            records[candidate.id] = WindowRecord(id: candidate.id, appID: candidate.appID, pid: candidate.pid,
+                bundleIdentifier: candidate.bundleIdentifier, title: candidate.title, bounds: candidate.bounds,
+                status: candidate.status, cgWindowID: candidate.cgWindowID, processGeneration: candidate.processGeneration,
+                actionTarget: WindowActionTarget(element: AXElementKey(e: candidateElement)))
+            let snapshot = DockSnapshot(windows: records, orderedWindowIDs: desktop.values.value.orderedWindowIDs)
+            let gate = BehaviorReadGate(attribute: kAXWindowsAttribute as String)
+            let predictions = Mutex<[WindowID]>([])
+            desktop.state.withLock {
+                $0.beforeInventoryRead = { pid in
+                    if pid == candidate.pid { gate.read(kAXWindowsAttribute as String) }
+                }
+            }
+            let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+                reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
+            let action = Task.detached {
+                executor.execute(.init(kind: .closeWindow, windowID: original.id), snapshot: snapshot,
+                    forcedMinimizedPrior: false, cancellation: OperationCancellation(),
+                    onHandoffActivePrediction: { id in predictions.withLock { $0.append(id) } })
+            }
+            await wait { gate.entered.withLock { $0 } }
+            if replaceOriginal { desktop.replaceElement(for: 1001) }
+            gate.release.signal()
+            let succeeded = await action.value
+
+            XCTAssertEqual(succeeded, !replaceOriginal)
+            XCTAssertFalse(gate.timedOut.withLock { $0 })
+            XCTAssertEqual(predictions.withLock { $0 }, replaceOriginal ? [] : [candidate.id])
+            XCTAssertEqual(desktop.state.withLock { $0.focused }, replaceOriginal ? 1001 : 2001)
+            if replaceOriginal { XCTAssertEqual(desktop.state.withLock { $0.activationAttempts }, []) }
+            XCTAssertEqual(desktop.state.withLock { $0.writes }, replaceOriginal ? [] : ["1001:close"])
+        }
+    }
+
+    func testCloseRejectsHandoffCandidateReplacedDuringFinalSourceValidation() async throws {
+        let desktop = BehaviorDesktop()
+        desktop.state.withLock { $0.windows[1002]?.status = .minimized }
+        desktop.publish()
+        let original = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
+        let candidate = try XCTUnwrap(desktop.state.withLock { $0.windows[2001] })
+        let candidateElement = try XCTUnwrap(desktop.elements[2001])
+        var records = desktop.values.value.windows
+        records[candidate.id] = WindowRecord(id: candidate.id, appID: candidate.appID, pid: candidate.pid,
+            bundleIdentifier: candidate.bundleIdentifier, title: candidate.title, bounds: candidate.bounds,
+            status: candidate.status, cgWindowID: candidate.cgWindowID, processGeneration: candidate.processGeneration,
+            actionTarget: WindowActionTarget(element: AXElementKey(e: candidateElement)))
+        let snapshot = DockSnapshot(windows: records, orderedWindowIDs: desktop.values.value.orderedWindowIDs)
+        let gate = BehaviorReadGate(attribute: "original-window-id")
+        let predictionSent = Mutex(false)
+        let candidateChecked = Mutex(false)
+        desktop.state.withLock {
+            $0.beforeWindowIDRead = { id in
+                guard predictionSent.withLock({ $0 }) else { return }
+                if id == 2001 { candidateChecked.withLock { $0 = true } }
+                if id == 1001 { gate.read("original-window-id") }
+            }
+        }
+        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+            reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
+        let action = Task.detached {
+            executor.execute(.init(kind: .closeWindow, windowID: original.id), snapshot: snapshot,
+                forcedMinimizedPrior: false, cancellation: OperationCancellation(),
+                onHandoffActivePrediction: { _ in predictionSent.withLock { $0 = true } })
+        }
+        await wait { gate.entered.withLock { $0 } }
+        XCTAssertTrue(candidateChecked.withLock { $0 })
+        desktop.replaceElement(for: 2001)
+        gate.release.signal()
+
+        let succeeded = await action.value
+        XCTAssertTrue(succeeded)
+        XCTAssertFalse(gate.timedOut.withLock { $0 })
+        XCTAssertEqual(desktop.state.withLock { $0.focused }, 1001)
+        XCTAssertEqual(desktop.state.withLock { $0.activationAttempts }, [])
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:close"])
+    }
+
+    func testCloseCannotStartHandoffWhenFinalSourceWindowNumberIsUnread() async throws {
+        try await assertCloseHandoffRechecksFinalEvidence(sourceNumberBecomesUnread: true)
+    }
+
+    func testCloseCannotStartHandoffWhenCGOnlyCandidateDisappearsDuringFinalSourceRead() async throws {
+        try await assertCloseHandoffRechecksFinalEvidence(sourceNumberBecomesUnread: false)
+    }
+
+    private func assertCloseHandoffRechecksFinalEvidence(sourceNumberBecomesUnread: Bool) async throws {
+        let desktop = BehaviorDesktop()
+        desktop.state.withLock { $0.windows[1002]?.status = .minimized }
+        desktop.publish()
+        let snapshot = desktop.values.value
+        let original = try XCTUnwrap(snapshot.windows[WindowID(rawValue: "editor-a")])
+        XCTAssertNil(snapshot.windows[WindowID(rawValue: "browser-c")]?.actionTarget)
+        let gate = BehaviorReadGate(attribute: "final-source-window-id")
+        let predictionSent = Mutex(false)
+        let sourceReads = Mutex(0)
+        desktop.state.withLock {
+            $0.beforeWindowIDRead = { id in
+                guard id == 1001, predictionSent.withLock({ $0 }) else { return }
+                let read = sourceReads.withLock { count in count += 1; return count }
+                if read == 2 { gate.read("final-source-window-id") }
+            }
+        }
+        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+            reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
+        let action = Task.detached {
+            executor.execute(.init(kind: .closeWindow, windowID: original.id), snapshot: snapshot,
+                forcedMinimizedPrior: false, cancellation: OperationCancellation(),
+                onHandoffActivePrediction: { _ in predictionSent.withLock { $0 = true } })
+        }
+        await wait { gate.entered.withLock { $0 } }
+        desktop.state.withLock {
+            if sourceNumberBecomesUnread { $0.unreadNativeWindowIDs.insert(1001) }
+            else { $0.omittedCG.insert(2001) }
+        }
+        gate.release.signal()
+
+        let succeeded = await action.value
+        XCTAssertEqual(succeeded, !sourceNumberBecomesUnread)
+        XCTAssertFalse(gate.timedOut.withLock { $0 })
+        XCTAssertEqual(desktop.state.withLock { $0.focused }, 1001)
+        XCTAssertEqual(desktop.state.withLock { $0.activationAttempts }, [])
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, sourceNumberBecomesUnread ? [] : ["1001:close"])
+    }
+
+    func testMinimizeFallbackRejectsANonElementButton() throws {
+        let desktop = BehaviorDesktop()
+        desktop.state.withLock {
+            $0.rejectMinimizedAttribute = true
+            $0.malformedMinimizeButton = true
+        }
+        let executor = AccessibilityWindowActionExecutor(reader: AXWindowReader(accessibility: desktop),
+            focusBackend: desktop, system: desktop)
+        let handle = try XCTUnwrap(executor.captureHandleByCGWindowID(1001, pid: -41000, title: nil, bounds: nil))
+        let result = executor.minimize(handle)
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.mechanism, "missing-minimize-button")
+        XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
     }
 
     func testAXOnlyCloseCannotUseASeparateTrackedWindowWithTheSameTitleAndFrame() throws {
@@ -1689,7 +1917,9 @@ final class BehaviorLiftProbeGate: WindowLiftWindowProbing, Sendable {
     struct State: Sendable {
         var holdNext = false
         var entered = false
+        var timedOut = false
         var providesFrames = true
+        var frameOverrides: [WindowLiftAvoidance.WindowKey: CGRect] = [:]
     }
     let state = Mutex(State())
     let release = DispatchSemaphore(value: 0)
@@ -1706,11 +1936,15 @@ final class BehaviorLiftProbeGate: WindowLiftWindowProbing, Sendable {
             value.entered = true
             return true
         }
-        if hold { _ = release.wait(timeout: .now() + 3) }
+        if hold, release.wait(timeout: .now() + 3) == .timedOut {
+            state.withLock { $0.timedOut = true }
+        }
         return result
     }
     func frames(for keys: Set<WindowLiftAvoidance.WindowKey>) -> [WindowLiftAvoidance.WindowKey: CGRect] {
-        state.withLock { $0.providesFrames } ? live.frames(for: keys) : [:]
+        let sample = state.withLock { $0 }
+        guard sample.providesFrames else { return [:] }
+        return live.frames(for: keys).merging(sample.frameOverrides.filter { keys.contains($0.key) }) { _, override in override }
     }
 }
 
@@ -1742,7 +1976,7 @@ final class BehaviorLiftExecutorGate: Sendable {
         }
         guard first else { return }
         let progress = DispatchSemaphore(value: 0)
-        Task.detached { progress.signal() }
+        Task.detached(priority: .high) { progress.signal() }
         progressedBeforeRelease.withLock { $0 = progress.wait(timeout: .now() + 0.5) == .success }
     }
 }
@@ -1889,6 +2123,340 @@ final class WindowLiftBehaviorTests: XCTestCase {
         XCTAssertEqual(result, .complete)
         XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, manuallyResized)
         XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
+    }
+
+    func testInactiveFrontWindowDoesNotBlockActiveLiftCandidate() async {
+        let desktop = BehaviorDesktop()
+        let native = CGRect(x: 0, y: 30, width: 2560, height: 1410)
+        let adjusted = CGRect(x: 0, y: 30, width: 2560, height: 1376)
+        desktop.state.withLock {
+            $0.windows[1001]?.bounds = native
+            $0.windows[2001]?.bounds = native
+            $0.omittedCG.insert(1002)
+            $0.frontmostPIDOverride = -42000
+        }
+        let (controller, host) = makeController(desktop, width: 2560, height: 1440,
+            workspaceNotificationCenter: NotificationCenter())
+        defer { withExtendedLifetime(host) {} }
+        let target = WindowLiftAvoidance.WindowKey(pid: -42000, cgWindowID: 2001)
+
+        controller.poll()
+        await controller.scanTask?.value
+        await controller.writeTasks[target]?.value
+
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, native)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[2001]?.bounds }, adjusted)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["2001:AXSize"])
+        await controller.stopAndRestore()
+    }
+
+    func testFloatingFrontWindowDoesNotBlockSameApplicationsLiftCandidate() async {
+        let desktop = BehaviorDesktop(additionalWindows: 1)
+        let floating = CGRect(x: 90, y: 200, width: 2300, height: 950)
+        let native = CGRect(x: 0, y: 30, width: 2560, height: 1410)
+        let adjusted = CGRect(x: 0, y: 30, width: 2560, height: 1376)
+        desktop.state.withLock {
+            $0.windows[1001]?.bounds = floating
+            $0.windows[1002]?.bounds = native
+            $0.windows[3000]?.bounds = native
+            $0.omittedCG.insert(2001)
+        }
+        let (controller, host) = makeController(desktop, width: 2560, height: 1440,
+            workspaceNotificationCenter: NotificationCenter())
+        defer { withExtendedLifetime(host) {} }
+        let target = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1002)
+
+        controller.poll()
+        await controller.scanTask?.value
+        await controller.writeTasks[target]?.value
+
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, floating)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, adjusted)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[3000]?.bounds }, native)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1002:AXSize"])
+        await controller.stopAndRestore()
+    }
+
+    func testTrackedReliftDefersInitialLiftOnlyOnItsOwnDisplay() async {
+        for secondDisplay in [false, true] {
+            let desktop = BehaviorDesktop(additionalWindows: 1)
+            let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+            let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+            let floating = CGRect(x: 90, y: 150, width: 1700, height: 800)
+            let initialFrame = native.offsetBy(dx: secondDisplay ? 1920 : 0, dy: 0)
+            desktop.state.withLock {
+                $0.focused = 3000
+                $0.omittedCG = [1001, 1002, 2001]
+            }
+            let clock = Mutex<TimeInterval>(10)
+            let (controller, host) = makeController(desktop, uptime: { clock.withLock { $0 } },
+                workspaceNotificationCenter: NotificationCenter())
+            defer { withExtendedLifetime(host) {} }
+            if secondDisplay {
+                let screen = CGRect(x: 1920, y: 0, width: 1920, height: 1080)
+                host.contexts.append(.init(geometry: .init(screenFrame: screen, visibleFrame: screen,
+                    taskbarTopEdge: 32, topReservedHeight: 30), displayWindowServerFrame: screen,
+                    usableWindowServerFrame: screen, primaryDisplayHeight: 1080))
+            }
+            let managed = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 3000)
+            let initial = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1002)
+
+            controller.poll()
+            await controller.scanTask?.value
+            await controller.writeTasks[managed]?.value
+            XCTAssertEqual(desktop.state.withLock { $0.windows[3000]?.bounds }, adjusted)
+
+            clock.withLock { $0 += 2 }
+            desktop.state.withLock {
+                $0.focused = 1001
+                $0.omittedCG = [2001]
+                $0.windows[1001]?.bounds = floating
+                $0.windows[1002]?.bounds = initialFrame
+                $0.windows[3000]?.bounds = native
+                $0.writes.removeAll()
+            }
+            controller.poll()
+            controller.isEnabled = false
+            controller.updatePollTimerLifecycle()
+            controller.updateTrackedProbeLifecycle()
+            await controller.scanTask?.value
+            await controller.writeTasks[managed]?.value
+            await controller.writeTasks[initial]?.value
+
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, floating)
+            XCTAssertEqual(desktop.state.withLock { $0.windows[3000]?.bounds }, adjusted)
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds },
+                secondDisplay ? CGRect(x: 1920, y: 30, width: 1920, height: 1016) : initialFrame)
+            XCTAssertEqual(desktop.state.withLock { $0.writes.sorted() },
+                secondDisplay ? ["1002:AXSize", "3000:AXSize"] : ["3000:AXSize"])
+            await controller.stopAndRestore()
+        }
+    }
+
+    func testOlderScanRespectsTheNewerTrackedWindowsDisplayReservation() async throws {
+        for retiresWindow in [false, true] {
+            let desktop = BehaviorDesktop()
+            let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+            let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+            let floating = CGRect(x: 90, y: 150, width: 1700, height: 800)
+            desktop.state.withLock { $0.omittedCG = [1002, 2001] }
+            let probe = BehaviorLiftProbeGate(desktop)
+            let (controller, host) = makeController(desktop, probe: probe, uptime: { 10 },
+                workspaceNotificationCenter: NotificationCenter())
+            defer { probe.release.signal(); withExtendedLifetime(host) {} }
+            let managed = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+            let initial = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1002)
+            controller.poll()
+            await controller.scanTask?.value
+            await controller.writeTasks[managed]?.value
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+            controller.trackedProbeTimer?.invalidate()
+            if let prior = controller.trackedProbeTask { await prior.value }
+
+            desktop.state.withLock {
+                $0.omittedCG = [2001]
+                $0.writes.removeAll()
+            }
+            probe.state.withLock { $0.holdNext = true }
+            controller.poll()
+            let captured = try XCTUnwrap(controller.scanTask)
+            await wait { probe.state.withLock { $0.entered } }
+            if retiresWindow { desktop.state.withLock { $0.windows[1001]?.bounds = floating } }
+            controller.probeTrackedFrames()
+            let newer = try XCTUnwrap(controller.trackedProbeTask)
+            await newer.value
+            XCTAssertEqual(controller.states[managed] == nil, retiresWindow)
+            controller.isEnabled = false
+            controller.updatePollTimerLifecycle()
+            controller.updateTrackedProbeLifecycle()
+            probe.release.signal()
+            await captured.value
+            await controller.writeTasks[initial]?.value
+
+            XCTAssertFalse(probe.state.withLock { $0.timedOut })
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, retiresWindow ? floating : adjusted)
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, retiresWindow ? adjusted : native)
+            XCTAssertEqual(desktop.state.withLock { $0.writes }, retiresWindow ? ["1002:AXSize"] : [])
+            await controller.stopAndRestore()
+        }
+    }
+
+    func testClearedFrontWindowCannotReserveDisplayWhileSuppressed() async {
+        let desktop = BehaviorDesktop()
+        let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+        let moved = native.offsetBy(dx: 6, dy: 0)
+        desktop.state.withLock { $0.omittedCG = [1002, 2001] }
+        let clock = Mutex<TimeInterval>(10)
+        let (controller, host) = makeController(desktop, uptime: { clock.withLock { $0 } },
+            workspaceNotificationCenter: NotificationCenter())
+        defer { withExtendedLifetime(host) {} }
+        let managed = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        let initial = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1002)
+        controller.poll()
+        await controller.scanTask?.value
+        await controller.writeTasks[managed]?.value
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+
+        clock.withLock { $0 += 2 }
+        desktop.state.withLock {
+            $0.omittedCG = [2001]
+            $0.windows[1001]?.bounds = moved
+            $0.writes.removeAll()
+        }
+        controller.poll()
+        controller.isEnabled = false
+        controller.updatePollTimerLifecycle()
+        controller.updateTrackedProbeLifecycle()
+        await controller.scanTask?.value
+        await controller.writeTasks[initial]?.value
+
+        XCTAssertNil(controller.states[managed])
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, moved)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, adjusted)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1002:AXSize"])
+        await controller.stopAndRestore()
+    }
+
+    func testExhaustedFrontWindowDoesNotBlockAnEligibleInitialLift() async {
+        for showsWindowOnExhaustion in [false, true] {
+            let desktop = BehaviorDesktop()
+            let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+            let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+            let floating = CGRect(x: 90, y: 150, width: 1700, height: 800)
+            desktop.state.withLock { $0.omittedCG = [1002, 2001] }
+            let (controller, host) = makeController(desktop, uptime: { 10 },
+                workspaceNotificationCenter: NotificationCenter())
+            defer { withExtendedLifetime(host) {} }
+            let managed = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+            let initial = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1002)
+
+            func completeScan() async {
+                controller.isEnabled = true
+                controller.poll()
+                controller.isEnabled = false
+                controller.updatePollTimerLifecycle()
+                controller.updateTrackedProbeLifecycle()
+                await controller.scanTask?.value
+                await controller.writeTasks[managed]?.value
+                await controller.writeTasks[initial]?.value
+            }
+
+            await completeScan()
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+            for round in 1...2 {
+                desktop.state.withLock { $0.windows[1001]?.bounds = floating }
+                await completeScan()
+                XCTAssertNil(controller.states[managed])
+                desktop.state.withLock {
+                    $0.windows[1001]?.bounds = native
+                    if round == 2, showsWindowOnExhaustion { $0.omittedCG = [2001] }
+                }
+                await completeScan()
+            }
+            if !showsWindowOnExhaustion {
+                desktop.state.withLock { $0.omittedCG = [2001] }
+                await completeScan()
+            }
+
+            if case let .abandoned(session) = controller.states[managed] {
+                XCTAssertEqual(session.reason, .reliftLimitReached)
+                XCTAssertEqual(session.applicationResponseRounds, 2)
+            } else {
+                XCTFail("Expected the front window to retain its exhausted response budget")
+            }
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, native)
+            XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, adjusted)
+            XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize", "1001:AXSize", "1002:AXSize"])
+            await controller.stopAndRestore()
+        }
+    }
+
+    private func completeCandidateScan(_ controller: WindowLiftAvoidanceController) async {
+        controller.isEnabled = true
+        controller.poll()
+        controller.isEnabled = false
+        controller.updatePollTimerLifecycle()
+        controller.updateTrackedProbeLifecycle()
+        await controller.scanTask?.value
+        for writer in Array(controller.writeTasks.values) { await writer.value }
+    }
+
+    func testTrackedWindowThatExhaustsImmediateReliftsDoesNotBlockTheNextCandidate() async {
+        let desktop = BehaviorDesktop()
+        let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+        let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        desktop.state.withLock { $0.omittedCG = [1002, 2001] }
+        let (controller, host) = makeController(desktop, uptime: { 10 },
+            workspaceNotificationCenter: NotificationCenter())
+        defer { withExtendedLifetime(host) {} }
+
+        await completeCandidateScan(controller)
+        desktop.state.withLock { $0.windows[1001]?.bounds = native }
+        await completeCandidateScan(controller)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+        desktop.state.withLock {
+            $0.windows[1001]?.bounds = native
+            $0.omittedCG = [2001]
+        }
+        await completeCandidateScan(controller)
+
+        if case let .abandoned(session) = controller.states[key] {
+            XCTAssertEqual(session.reason, .reliftLimitReached)
+            XCTAssertEqual(session.liftRetryCount, 1)
+            XCTAssertEqual(session.applicationResponseRounds, 0)
+        } else {
+            XCTFail("Expected the immediate relift budget to remain exhausted")
+        }
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, native)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, adjusted)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize", "1001:AXSize", "1002:AXSize"])
+        await controller.stopAndRestore()
+    }
+
+    func testClearedWindowCannotReserveDisplayForAnExhaustedDetour() async {
+        let desktop = BehaviorDesktop()
+        let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+        let floating = CGRect(x: 90, y: 150, width: 1700, height: 800)
+        let moved = native.offsetBy(dx: 6, dy: 0)
+        let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        desktop.state.withLock { $0.omittedCG = [1002, 2001] }
+        let (controller, host) = makeController(desktop, uptime: { 10 },
+            workspaceNotificationCenter: NotificationCenter())
+        defer { withExtendedLifetime(host) {} }
+
+        await completeCandidateScan(controller)
+        desktop.state.withLock { $0.windows[1001]?.bounds = floating }
+        await completeCandidateScan(controller)
+        desktop.state.withLock { $0.windows[1001]?.bounds = native }
+        await completeCandidateScan(controller)
+        if case let .lifted(session) = controller.states[key] {
+            XCTAssertEqual(session.applicationResponseRounds, 1)
+        } else {
+            XCTFail("Expected one detour response before testing exhaustion")
+        }
+        desktop.state.withLock {
+            $0.windows[1001]?.bounds = moved
+            $0.omittedCG = [2001]
+        }
+        await completeCandidateScan(controller)
+
+        XCTAssertNil(controller.states[key])
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, moved)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1002]?.bounds }, adjusted)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize", "1001:AXSize", "1002:AXSize"])
+
+        await completeCandidateScan(controller)
+        if case let .abandoned(session) = controller.states[key] {
+            XCTAssertEqual(session.reason, .reliftLimitReached)
+            XCTAssertEqual(session.applicationResponseRounds, 2)
+        } else {
+            XCTFail("Expected the ordinary scan to retain the exhausted detour budget")
+        }
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize", "1001:AXSize", "1002:AXSize"])
+        await controller.stopAndRestore()
     }
 
     func testInactiveManagedWindowRegainsBottomClearanceWithoutReactivation() async {
@@ -2309,6 +2877,305 @@ final class WindowLiftBehaviorTests: XCTestCase {
         let stopped = await controller.stopAndRestore()
         XCTAssertEqual(stopped, .complete)
         XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, native)
+    }
+
+    func testPermissionUnfreezeKeepsConfirmedLiftAfterCancellingMaintenanceValidation() async {
+        await checkRestorationAfterMaintenanceInterruption(.permissionFreeze)
+    }
+
+    func testPersistentCGAndAXMismatchKeepsConfirmedLift() async {
+        await checkRestorationAfterMaintenanceInterruption(.frameMismatch)
+    }
+
+    func testUnreadProcessGenerationBeforeMaintenanceKeepsConfirmedLift() async {
+        await checkRestorationAfterMaintenanceInterruption(.unreadProcessAtStart)
+    }
+
+    func testUnreadProcessGenerationAtMaintenanceAdmissionKeepsConfirmedLift() async {
+        await checkRestorationAfterMaintenanceInterruption(.unreadProcessAtAdmission)
+    }
+
+    func testConfirmedManualGeometryDuringMaintenanceDiscardsRestorationAuthority() async {
+        await checkRestorationAfterMaintenanceInterruption(.manualGeometry)
+    }
+
+    func testUnreadProcessGenerationAtFirstNativeMaintenanceWriteKeepsPreviousLift() async {
+        await checkRestorationAfterFirstNativeWriteRejection(.unreadProcess)
+    }
+
+    func testReplacedProcessAtFirstNativeMaintenanceWriteDiscardsPreviousLift() async {
+        await checkRestorationAfterFirstNativeWriteRejection(.replacedProcess)
+    }
+
+    func testMissingWindowNumberInFinalNativeMaintenanceSampleKeepsPreviousLift() async {
+        await checkRestorationAfterFirstNativeWriteRejection(.unreadWindowNumber)
+    }
+
+    func testDifferentWindowNumberInFinalNativeMaintenanceSampleDiscardsPreviousLift() async {
+        await checkRestorationAfterFirstNativeWriteRejection(.replacedWindowNumber)
+    }
+
+    private enum FirstWriteRejection {
+        case unreadProcess, replacedProcess, unreadWindowNumber, replacedWindowNumber
+
+        var finalSample: Bool { self == .unreadWindowNumber || self == .replacedWindowNumber }
+        var replacedIdentity: Bool { self == .replacedProcess || self == .replacedWindowNumber }
+    }
+
+    private func checkRestorationAfterFirstNativeWriteRejection(_ rejection: FirstWriteRejection) async {
+        let desktop = BehaviorDesktop()
+        let gate = BehaviorReadGate()
+        let frameSamples = Mutex(0)
+        let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+        desktop.state.withLock { $0.windows[2001]?.bounds = CGRect(x: 200, y: 140, width: 900, height: 600) }
+        let (controller, host) = makeController(desktop, workspaceNotificationCenter: NotificationCenter())
+        defer { gate.release.signal(); withExtendedLifetime(host) {} }
+        controller.poll()
+        await controller.scanTask?.value
+        await controller.writeTasks[key]?.value
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+        XCTAssertTrue(desktop.setFrontmost(pid: -42000, windowID: 2001, mode: 0))
+
+        desktop.state.withLock {
+            $0.writes.removeAll()
+            $0.windows[1001]?.bounds = native
+            $0.windowIDAttributes[1001] = 1001
+            $0.beforeFrameBatchRead = {
+                let sample = frameSamples.withLock {
+                    $0 += 1
+                    return $0
+                }
+                if sample == (rejection.finalSample ? 2 : 1) { gate.read(gate.attribute) }
+            }
+        }
+        controller.poll()
+        await controller.scanTask?.value
+        await wait { gate.entered.withLock { $0 } }
+        let writer = controller.writeTasks[key]
+        XCTAssertNotNil(writer)
+        desktop.state.withLock {
+            switch rejection {
+            case .replacedProcess:
+                $0.generationsByPID[key.pid] = ProcessGeneration(timeval(tv_sec: 11, tv_usec: 1))
+            case .unreadProcess:
+                $0.unreadGenerations.insert(key.pid)
+            case .unreadWindowNumber:
+                $0.windowIDAttributes.removeValue(forKey: 1001)
+            case .replacedWindowNumber:
+                $0.windowIDAttributes[1001] = 1002
+            }
+        }
+        gate.release.signal()
+        await writer?.value
+        XCTAssertFalse(gate.timedOut.withLock { $0 })
+        XCTAssertEqual(frameSamples.withLock { $0 }, 2)
+        desktop.state.withLock {
+            $0.unreadGenerations.remove(key.pid)
+            $0.windowIDAttributes[1001] = 1001
+            $0.windows[1001]?.bounds = adjusted
+        }
+
+        if rejection.replacedIdentity {
+            XCTAssertNil(controller.managedFrames[key])
+        } else {
+            XCTAssertEqual(controller.managedFrames[key]?.settledQuartz, adjusted)
+        }
+        XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
+        let stopped = await controller.stopAndRestore()
+        XCTAssertEqual(stopped, .complete)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, rejection.replacedIdentity ? adjusted : native)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, rejection.replacedIdentity ? [] : ["1001:AXSize"])
+    }
+
+    func testPermissionFreezeDoesNotReviveLiftAfterConfirmedProcessReplacement() async {
+        let desktop = BehaviorDesktop()
+        let gate = BehaviorReadGate()
+        let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+        let replacement = ProcessGeneration(timeval(tv_sec: 11, tv_usec: 1))
+        desktop.state.withLock { $0.windows[2001]?.bounds = CGRect(x: 200, y: 140, width: 900, height: 600) }
+        let (controller, host) = makeController(desktop, workspaceNotificationCenter: NotificationCenter())
+        defer { gate.release.signal(); withExtendedLifetime(host) {} }
+        controller.poll()
+        await controller.scanTask?.value
+        await controller.writeTasks[key]?.value
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+        XCTAssertTrue(desktop.setFrontmost(pid: -42000, windowID: 2001, mode: 0))
+
+        desktop.state.withLock {
+            $0.writes.removeAll()
+            $0.windows[1001]?.bounds = native
+            $0.beforeRead = { gate.read($0) }
+        }
+        controller.poll()
+        await controller.scanTask?.value
+        await wait { gate.entered.withLock { $0 } }
+        let writer = controller.writeTasks[key]
+        XCTAssertNotNil(writer)
+        desktop.state.withLock {
+            $0.generationsByPID[key.pid] = replacement
+            $0.afterGenerationRead = { [weak controller] pid, observed in
+                guard pid == key.pid, observed == replacement else { return }
+                MainActor.assumeIsolated {
+                    controller?.beginPermissionUncertainty()
+                    desktop.state.withLock {
+                        $0.afterGenerationRead = nil
+                        $0.unreadGenerations.insert(key.pid)
+                        $0.windows[1001]?.bounds = adjusted
+                    }
+                }
+            }
+        }
+        gate.release.signal()
+        await writer?.value
+        XCTAssertFalse(gate.timedOut.withLock { $0 })
+        XCTAssertFalse(controller.isEnabled)
+        controller.endPermissionUncertainty()
+        await wait { controller.isEnabled }
+        await controller.scanTask?.value
+
+        XCTAssertNil(controller.managedFrames[key])
+        let stopped = await controller.stopAndRestore()
+        XCTAssertEqual(stopped, .complete)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+        XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
+    }
+
+    func testManualGeometryDiscardsRestorationAuthorityWhenSizeCapabilityIsUnread() async {
+        await checkRestorationAfterMaintenanceInterruption(.manualGeometryWithUnreadCapability)
+    }
+
+    private enum MaintenanceInterruption {
+        case permissionFreeze, frameMismatch, unreadProcessAtStart, unreadProcessAtAdmission
+        case manualGeometry, manualGeometryWithUnreadCapability
+    }
+
+    private func checkRestorationAfterMaintenanceInterruption(_ interruption: MaintenanceInterruption) async {
+        let desktop = BehaviorDesktop()
+        let probe = BehaviorLiftProbeGate(desktop)
+        let gate = BehaviorReadGate()
+        let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
+        let manual = CGRect(x: 0, y: 30, width: 1920, height: 1030)
+        desktop.state.withLock { $0.windows[2001]?.bounds = CGRect(x: 200, y: 140, width: 900, height: 600) }
+        let (controller, host) = makeController(desktop, probe: probe, workspaceNotificationCenter: NotificationCenter())
+        defer { gate.release.signal(); withExtendedLifetime(host) {} }
+        controller.poll()
+        await controller.scanTask?.value
+        await controller.writeTasks[key]?.value
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, adjusted)
+        XCTAssertTrue(desktop.setFrontmost(pid: -42000, windowID: 2001, mode: 0))
+
+        if interruption == .frameMismatch { probe.state.withLock { $0.frameOverrides[key] = native } }
+        desktop.state.withLock {
+            $0.writes.removeAll()
+            $0.windows[1001]?.bounds = native
+            if interruption == .unreadProcessAtStart {
+                $0.unreadGenerations.insert(key.pid)
+            } else {
+                $0.beforeRead = { gate.read($0) }
+            }
+        }
+        controller.poll()
+        await controller.scanTask?.value
+        if interruption == .unreadProcessAtStart {
+            desktop.state.withLock {
+                $0.unreadGenerations.remove(key.pid)
+                $0.windows[1001]?.bounds = adjusted
+            }
+        } else {
+            await wait { gate.entered.withLock { $0 } }
+            let writer = controller.writeTasks[key]
+            XCTAssertNotNil(writer)
+            if interruption == .permissionFreeze { controller.beginPermissionUncertainty() }
+            desktop.state.withLock {
+                switch interruption {
+                case .unreadProcessAtAdmission:
+                    $0.unreadGenerations.insert(key.pid)
+                case .manualGeometry, .manualGeometryWithUnreadCapability:
+                    $0.windows[1001]?.bounds = manual
+                    if interruption == .manualGeometryWithUnreadCapability {
+                        $0.unreadSettableAttributes.insert(kAXSizeAttribute as String)
+                    }
+                default:
+                    $0.windows[1001]?.bounds = adjusted
+                }
+            }
+            gate.release.signal()
+            await writer?.value
+            XCTAssertFalse(gate.timedOut.withLock { $0 })
+            if interruption == .unreadProcessAtAdmission {
+                desktop.state.withLock {
+                    $0.unreadGenerations.remove(key.pid)
+                    $0.windows[1001]?.bounds = adjusted
+                }
+            }
+            if interruption == .permissionFreeze {
+                controller.endPermissionUncertainty()
+                await wait { controller.isEnabled }
+                await controller.scanTask?.value
+            }
+        }
+
+        let shouldRestore = interruption != .manualGeometry && interruption != .manualGeometryWithUnreadCapability
+        XCTAssertEqual(controller.managedFrames[key]?.settledQuartz, shouldRestore ? adjusted : nil)
+        XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
+        let frameBeforeStop = interruption == .manualGeometry ? manual : adjusted
+        if interruption == .manualGeometryWithUnreadCapability {
+            desktop.state.withLock {
+                $0.unreadSettableAttributes.removeAll()
+                $0.windows[1001]?.bounds = frameBeforeStop
+            }
+        }
+        let stopped = await controller.stopAndRestore()
+        XCTAssertEqual(stopped, .complete)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, shouldRestore ? native : frameBeforeStop)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, shouldRestore ? ["1001:AXSize"] : [])
+    }
+
+    func testAnimatedLiftPreservesAnUnacknowledgedHeightBetweenNativeAndTarget() async {
+        let desktop = BehaviorDesktop()
+        let manual = CGRect(x: 0, y: 30, width: 1920, height: 1030)
+        let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        let progression = Mutex((firstWrite: CGRect?.none, positionReads: 0))
+        desktop.state.withLock {
+            $0.afterAttributeWrite = { id, attribute in
+                guard id == key.cgWindowID, attribute == kAXSizeAttribute as String else { return }
+                let current = desktop.state.withLock { $0.windows[id]?.bounds }
+                progression.withLock { if $0.firstWrite == nil { $0.firstWrite = current } }
+            }
+            $0.beforeRead = { attribute in
+                guard attribute == kAXPositionAttribute as String else { return }
+                let replace = progression.withLock {
+                    guard $0.firstWrite != nil else { return false }
+                    $0.positionReads += 1
+                    return $0.positionReads == 2
+                }
+                if replace { desktop.state.withLock { $0.windows[key.cgWindowID]?.bounds = manual } }
+            }
+        }
+        let (controller, host) = makeController(desktop, workspaceNotificationCenter: NotificationCenter())
+        defer { withExtendedLifetime(host) {} }
+        controller.isEnabled = false
+        controller.start(environment: ["DOCK_WINDOW_LIFT_ANIM": "1"])
+        await controller.scanTask?.value
+        let writer = controller.writeTasks[key]
+        XCTAssertNotNil(writer)
+        await writer?.value
+
+        let firstWrite = progression.withLock { $0.firstWrite?.height }
+        XCTAssertGreaterThan(firstWrite ?? 0, 1032)
+        XCTAssertLessThan(firstWrite ?? 0, 1050)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[key.cgWindowID]?.bounds }, manual)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize"])
+        let stopped = await controller.stopAndRestore()
+        XCTAssertEqual(stopped, .complete)
+        XCTAssertEqual(desktop.state.withLock { $0.windows[key.cgWindowID]?.bounds }, manual)
+        XCTAssertEqual(desktop.state.withLock { $0.writes }, ["1001:AXSize"])
     }
 
     func testNativeValidationDoesNotBlockIndependentAsyncProgress() async {
@@ -4100,7 +4967,7 @@ final class ApplicationBehaviorTests: XCTestCase {
             }
             configureEnvironment(&environment, defaults)
             delegate = AppDelegate(environment: environment, runtime: runtime, displayTopologyStore: topology,
-                settingsStore: AppSettingsStore(defaults: defaults), stripOrderStore: StripOrderStore(defaults: defaults))
+                stripOrderStore: StripOrderStore(defaults: defaults))
         }
 
         func seedUnrestorableWindow(in lift: WindowLiftAvoidanceController,

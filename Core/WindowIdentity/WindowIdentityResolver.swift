@@ -16,30 +16,62 @@ final class WindowIdentityEngine {
                 kind: .ambiguous,
                 windowID: WindowID(rawValue: "unconfirmed-ax-\(observation.pid)"),
                 confidence: .low,
-                reason: "insufficient-window-evidence"
+                reason: "insufficient-window-evidence",
+                isConfirmed: false
             )
         }
         let id = resolution.windowID
         if observation.kind == .disappeared, let snapshot {
             guard let window = snapshot.windows[id], window.pid == observation.pid,
                   observation.cgWindowID == nil || window.cgWindowID == observation.cgWindowID else {
-                return IdentityDecision(kind: .ambiguous, windowID: id, confidence: .low, reason: "unmatched-disappearance")
+                return IdentityDecision(kind: .ambiguous, windowID: id, confidence: .low,
+                                        reason: "unmatched-disappearance", isConfirmed: false)
             }
         }
-        let isKnown = memory.seenWindowIDs.contains(id) || snapshot?.windows[id] != nil
+        let priorConfirmation = memory.confirmationByWindowID[id]
+        let hasNativeNumber = observation.cgWindowID != nil
+        if priorConfirmation == false, hasNativeNumber,
+           !confirmsProvisionalIdentity(resolution, observation: observation, snapshot: snapshot) {
+            return IdentityDecision(kind: .ambiguous, windowID: id, confidence: .low,
+                                    reason: "unconfirmed-native-identity", isConfirmed: false)
+        }
+        let isKnown = priorConfirmation != nil || snapshot?.windows[id] != nil
+        let isConfirmed = resolution.isConfirmed && (priorConfirmation != false || hasNativeNumber)
         let kind: DecisionKind = isKnown ? .knownWindow : .newWindow
-        memory.seenWindowIDs.insert(id)
+        memory.confirmationByWindowID[id] = isConfirmed
         memory.record(observation: observation, canonicalWindowTitle: title, resolvedID: id)
         return IdentityDecision(
             kind: kind,
             windowID: id,
             confidence: resolution.confidence,
-            reason: resolution.reason
+            reason: resolution.reason,
+            isConfirmed: isConfirmed
         )
     }
 
     func retire(windowID: WindowID) {
         memory.retire(windowID: windowID)
+    }
+
+    private func confirmsProvisionalIdentity(_ resolution: IdentityResolution, observation: SystemObservation,
+                                            snapshot: DockSnapshot?) -> Bool {
+        guard let number = observation.cgWindowID, number != 0, !observation.isMinimized,
+              observation.kind != .disappeared, observation.kind != .minimized, observation.kind != .hidden else {
+            return false
+        }
+        if resolution.hasExactBridge { return true }
+        let key = CGWindowOwnerKey(pid: observation.pid, cgWindowID: number)
+        if memory.windowIDByCGWindow[key] == resolution.windowID { return true }
+        guard let window = snapshot?.windows[resolution.windowID] else { return false }
+        return window.pid == observation.pid && window.cgWindowID == number && window.status != .closedPending
+    }
+
+    func bindConfirmedRestoration(observation: SystemObservation, of record: WindowRecord) -> Bool {
+        guard observation.source == .coreGraphics, observation.kind != .disappeared,
+              !observation.isMinimized, observation.pid == record.pid,
+              let original = record.cgWindowID, let restored = observation.cgWindowID,
+              original != restored, restored != 0 else { return false }
+        return memory.rebindConfirmedCGWindow(record.id, pid: record.pid, original: original, restored: restored)
     }
 
     private func resolvedWindow(
@@ -57,16 +89,25 @@ final class WindowIdentityEngine {
                 )
             }
 
+            if let snapshot, let bound = snapshot.windows.values.first(where: {
+                $0.pid == observation.pid && $0.cgWindowID == cgWindowID && $0.status != .closedPending
+                    && memory.permitsCGBinding($0.id, to: observation, snapshot: snapshot)
+            }) {
+                return IdentityResolution(windowID: bound.id, confidence: .high, reason: "cg-window-id-bound")
+            }
+
             if let bridged = memory.lookupPendingBridge(
                 for: observation,
                 canonicalWindowTitle: canonicalWindowTitle,
                 now: observation.timestamp,
-                ttl: bridgeTTL
+                ttl: bridgeTTL,
+                snapshot: snapshot
             ) {
                 return IdentityResolution(
-                    windowID: bridged,
+                    windowID: bridged.windowID,
                     confidence: .medium,
-                    reason: "restored-via-bridge"
+                    reason: "restored-via-bridge",
+                    hasExactBridge: bridged.hasExactFrame
                 )
             }
 
@@ -75,7 +116,8 @@ final class WindowIdentityEngine {
                 canonicalWindowTitle: canonicalWindowTitle,
                 now: observation.timestamp,
                 ttl: inventoryBindingTTL,
-                frameTolerance: inventoryCGFrameTolerance
+                frameTolerance: inventoryCGFrameTolerance,
+                snapshot: snapshot
             ) {
                 return IdentityResolution(
                     windowID: inventoryBound,
@@ -102,11 +144,11 @@ final class WindowIdentityEngine {
 
             let legacyID = WindowID(rawValue: "cg-\(cgWindowID)")
             let priorOwner = snapshot?.windows[legacyID]?.pid ?? memory.firstOwnerByCGWindowID[cgWindowID]
-            let windowID = priorOwner == nil || priorOwner == observation.pid
+            let preferredID = priorOwner == nil || priorOwner == observation.pid
                 ? legacyID
                 : WindowID(rawValue: "cg-\(cgWindowID)-pid-\(observation.pid)")
             return IdentityResolution(
-                windowID: windowID,
+                windowID: memory.availableCGWindowID(preferredID, snapshot: snapshot),
                 confidence: .high,
                 reason: "cg-window-id"
             )
@@ -154,7 +196,8 @@ final class WindowIdentityEngine {
             return IdentityResolution(
                 windowID: memory.makeTransientAXWindowID(pid: observation.pid),
                 confidence: .low,
-                reason: "conflicting-coarse-signature"
+                reason: "conflicting-coarse-signature",
+                isConfirmed: false
             )
         case .none:
             if let retained = retainedWindowResolution(
@@ -235,7 +278,7 @@ final class WindowIdentityEngine {
             guard record.id.rawValue.hasPrefix("app-") == false else { return false }
             guard record.pid == observation.pid else { return false }
             guard matchesApplication(observation: observation, record: record) else { return false }
-            return true
+            return memory.permitsCGBinding(record.id, to: observation, snapshot: snapshot)
         }
         let frameCandidates: [WindowRecord]
         if let observationBounds = observation.bounds {
@@ -345,23 +388,54 @@ private struct CGWindowOwnerKey: Hashable {
     let cgWindowID: UInt32
 }
 
+private struct CoarseWindowSignature: Hashable {
+    let pid: pid_t
+    let title: String?
+}
+
+private enum WindowSignature: Hashable {
+    case exact(CoarseWindowSignature, [Int]?)
+    case coarse(CoarseWindowSignature)
+    case frame(pid: pid_t, components: [Int]?)
+}
+
 private struct IdentityMemory {
-    var seenWindowIDs: Set<WindowID> = []
-    var rememberedExactIDBySignature: [String: TimedWindowID] = [:]
-    var rememberedExactCandidatesBySignature: [String: [WindowID: Date]] = [:]
-    var rememberedExactIDsByCoarseSignature: [String: [String: TimedWindowID]] = [:]
-    var rememberedCoarseCandidatesBySignature: [String: [WindowID: Date]] = [:]
-    var rememberedFrameCandidatesBySignature: [String: [WindowID: Date]] = [:]
-    var rememberedFramesByCoarseSignature: [String: [WindowID: TimedFrame]] = [:]
-    var recentInventoryCandidatesByCoarseSignature: [String: [WindowID: TimedOptionalFrame]] = [:]
+    var confirmationByWindowID: [WindowID: Bool] = [:]
+    var rememberedExactIDBySignature: [WindowSignature: TimedWindowID] = [:]
+    var rememberedExactCandidatesBySignature: [WindowSignature: [WindowID: Date]] = [:]
+    var rememberedExactIDsByCoarseSignature: [CoarseWindowSignature: [WindowSignature: TimedWindowID]] = [:]
+    var rememberedCoarseCandidatesBySignature: [CoarseWindowSignature: [WindowID: Date]] = [:]
+    var rememberedFrameCandidatesBySignature: [WindowSignature: [WindowID: Date]] = [:]
+    var rememberedFramesByCoarseSignature: [CoarseWindowSignature: [WindowID: TimedFrame]] = [:]
+    var recentInventoryCandidatesByCoarseSignature: [CoarseWindowSignature: [WindowID: TimedOptionalFrame]] = [:]
     var windowIDByCGWindow: [CGWindowOwnerKey: WindowID] = [:]
     var firstOwnerByCGWindowID: [UInt32: pid_t] = [:]
-    var recentDisappearanceIDBySignature: [String: TimedWindowID] = [:]
-    var pendingMinimizedIDBySignature: [String: TimedWindowID] = [:]
-    var recentObservationEvidenceBySignature: [String: TimedObservationEvidence] = [:]
+    private var cgWindowByWindowID: [WindowID: CGWindowOwnerKey] = [:]
+    private var pendingBridges: [WindowID: PendingBridge] = [:]
+    var recentObservationEvidenceBySignature: [WindowSignature: TimedObservationEvidence] = [:]
     var nextTransientAXSequence: UInt64 = 1
+    private var nextCGSequence: UInt64 = 1
+
+    private struct PendingBridge {
+        let coarseSignature: CoarseWindowSignature
+        let bounds: CGRect?
+        let timestamp: Date
+        let canConfirmIdentity: Bool
+    }
 
     private let observationStreakDefaultWindow: TimeInterval = 3.0
+
+    mutating func rebindConfirmedCGWindow(_ windowID: WindowID, pid: pid_t, original: UInt32, restored: UInt32) -> Bool {
+        let originalKey = CGWindowOwnerKey(pid: pid, cgWindowID: original)
+        let restoredKey = CGWindowOwnerKey(pid: pid, cgWindowID: restored)
+        guard cgWindowByWindowID[windowID] == originalKey, windowIDByCGWindow[originalKey] == windowID,
+              windowIDByCGWindow[restoredKey] == nil else { return false }
+        windowIDByCGWindow.removeValue(forKey: originalKey)
+        windowIDByCGWindow[restoredKey] = windowID
+        cgWindowByWindowID[windowID] = restoredKey
+        pendingBridges.removeValue(forKey: windowID)
+        return true
+    }
 
     mutating func record(observation: SystemObservation, canonicalWindowTitle: String?, resolvedID: WindowID) {
         let exactSignature = observation.exactSignature(canonicalWindowTitle: canonicalWindowTitle)
@@ -400,13 +474,17 @@ private struct IdentityMemory {
             recentInventoryCandidatesByCoarseSignature[coarseSignature] = inventoryEntries
         }
         if let cgWindowID = observation.cgWindowID {
-            windowIDByCGWindow[CGWindowOwnerKey(pid: observation.pid, cgWindowID: cgWindowID)] = resolvedID
+            let cgWindow = CGWindowOwnerKey(pid: observation.pid, cgWindowID: cgWindowID)
+            if let previous = cgWindowByWindowID.updateValue(cgWindow, forKey: resolvedID), previous != cgWindow {
+                windowIDByCGWindow.removeValue(forKey: previous)
+            }
+            windowIDByCGWindow[cgWindow] = resolvedID
             if firstOwnerByCGWindowID[cgWindowID] == nil {
                 firstOwnerByCGWindowID[cgWindowID] = observation.pid
             }
         }
 
-        for signature in [exactSignature, coarseSignature] {
+        for signature in [exactSignature, .coarse(coarseSignature)] {
             recentObservationEvidenceBySignature[signature] = nextObservationEvidence(
                 previous: recentObservationEvidenceBySignature[signature],
                 timestamp: observation.timestamp
@@ -414,21 +492,14 @@ private struct IdentityMemory {
         }
 
         switch observation.kind {
-        case .disappeared:
-            for signature in [exactSignature, coarseSignature] {
-                recentDisappearanceIDBySignature[signature] = timed
-            }
-        case .minimized, .hidden:
-            for signature in [exactSignature, coarseSignature] {
-                pendingMinimizedIDBySignature[signature] = timed
-                recentDisappearanceIDBySignature[signature] = timed
-            }
+        case .disappeared, .minimized, .hidden:
+            pendingBridges[resolvedID] = PendingBridge(coarseSignature: coarseSignature, bounds: observation.bounds,
+                                                       timestamp: observation.timestamp,
+                                                       canConfirmIdentity: observation.kind != .disappeared)
         case .restored, .appeared, .unchanged, .titleChanged, .unhidden:
-            if !observation.isMinimized {
-                for signature in [exactSignature, coarseSignature] {
-                    pendingMinimizedIDBySignature.removeValue(forKey: signature)
-                    recentDisappearanceIDBySignature.removeValue(forKey: signature)
-                }
+            let isEarlyAXVisibility = observation.source == .accessibility && observation.kind == .unchanged
+            if !observation.isMinimized, !isEarlyAXVisibility {
+                pendingBridges.removeValue(forKey: resolvedID)
             }
         }
     }
@@ -499,15 +570,17 @@ private struct IdentityMemory {
         canonicalWindowTitle: String?,
         now: Date,
         ttl: TimeInterval,
-        frameTolerance: CGFloat
+        frameTolerance: CGFloat,
+        snapshot: DockSnapshot?
     ) -> WindowID? {
         let coarseSignature = observation.coarseSignature(canonicalWindowTitle: canonicalWindowTitle)
         guard let candidates = recentInventoryCandidatesByCoarseSignature[coarseSignature] else {
             return nil
         }
 
-        let freshCandidates = candidates.filter { _, candidate in
+        let freshCandidates = candidates.filter { windowID, candidate in
             now.timeIntervalSince(candidate.timestamp) <= ttl
+                && permitsCGBinding(windowID, to: observation, snapshot: snapshot)
         }
         guard freshCandidates.isEmpty == false else { return nil }
 
@@ -535,18 +608,35 @@ private struct IdentityMemory {
         return nil
     }
 
-    func lookupPendingBridge(for observation: SystemObservation, canonicalWindowTitle: String?, now: Date, ttl: TimeInterval) -> WindowID? {
-        for signature in observation.candidateSignatures(canonicalWindowTitle: canonicalWindowTitle) {
-            if let minimized = pendingMinimizedIDBySignature[signature],
-               now.timeIntervalSince(minimized.timestamp) <= ttl {
-                return minimized.id
+    func permitsCGBinding(_ windowID: WindowID, to observation: SystemObservation, snapshot: DockSnapshot?) -> Bool {
+        guard let incomingNumber = observation.cgWindowID else { return true }
+        if let lastNumber = cgWindowByWindowID[windowID]?.cgWindowID, lastNumber != incomingNumber { return false }
+        if let currentNumber = snapshot?.windows[windowID]?.cgWindowID, currentNumber != incomingNumber { return false }
+        return true
+    }
+
+    func lookupPendingBridge(for observation: SystemObservation, canonicalWindowTitle: String?, now: Date,
+                             ttl: TimeInterval, snapshot: DockSnapshot?)
+        -> (windowID: WindowID, hasExactFrame: Bool)? {
+        guard !observation.isMinimized, observation.kind != .disappeared,
+              observation.kind != .hidden, observation.kind != .minimized else { return nil }
+        let explicitlyReturned = observation.kind == .restored || observation.kind == .unhidden
+        let signature = observation.coarseSignature(canonicalWindowTitle: canonicalWindowTitle)
+        let candidates = pendingBridges.filter { id, bridge in
+            guard bridge.coarseSignature == signature, now.timeIntervalSince(bridge.timestamp) <= ttl,
+                  snapshot?.windows[id]?.status != .closedPending else { return false }
+            let compatibleNumber = permitsCGBinding(id, to: observation, snapshot: snapshot)
+            guard compatibleNumber || explicitlyReturned else { return false }
+            if let bounds = observation.bounds, let previous = bridge.bounds {
+                return WindowFrameMatchPolicy.areClose(bounds, previous)
             }
-            if let disappeared = recentDisappearanceIDBySignature[signature],
-               now.timeIntervalSince(disappeared.timestamp) <= ttl {
-                return disappeared.id
-            }
+            return compatibleNumber
         }
-        return nil
+        guard candidates.count == 1, let (id, bridge) = candidates.first else { return nil }
+        let hasExactFrame = observation.bounds.map {
+            WindowFrameMatchPolicy.isValid($0) && $0 == bridge.bounds
+        } ?? false
+        return (id, bridge.canConfirmIdentity && hasExactFrame)
     }
 
     func recentObservationCount(
@@ -568,7 +658,7 @@ private struct IdentityMemory {
         }
 
         return freshObservationEvidenceCount(
-            for: observation.coarseSignature(canonicalWindowTitle: canonicalWindowTitle),
+            for: .coarse(observation.coarseSignature(canonicalWindowTitle: canonicalWindowTitle)),
             now: now,
             window: window
         )
@@ -578,6 +668,15 @@ private struct IdentityMemory {
         let id = WindowID(rawValue: "ax-\(pid)-transient-\(nextTransientAXSequence)")
         nextTransientAXSequence += 1
         return id
+    }
+
+    mutating func availableCGWindowID(_ preferred: WindowID, snapshot: DockSnapshot?) -> WindowID {
+        var candidate = preferred
+        while confirmationByWindowID[candidate] != nil || snapshot?.windows[candidate] != nil {
+            candidate = WindowID(rawValue: "\(preferred.rawValue)-instance-\(nextCGSequence)")
+            nextCGSequence += 1
+        }
+        return candidate
     }
 
     mutating func retire(windowID: WindowID) {
@@ -591,7 +690,7 @@ private struct IdentityMemory {
             entries.keys.contains(windowID) ? signature : nil
         }
 
-        seenWindowIDs.remove(windowID)
+        confirmationByWindowID.removeValue(forKey: windowID)
         rememberedExactIDBySignature = rememberedExactIDBySignature.filter { $0.value.id != windowID }
         rememberedExactCandidatesBySignature = rememberedExactCandidatesBySignature.compactMapValues { entries in
             let filtered = entries.filter { $0.key != windowID }
@@ -614,13 +713,13 @@ private struct IdentityMemory {
             return filtered.isEmpty ? nil : filtered
         }
         windowIDByCGWindow = windowIDByCGWindow.filter { $0.value != windowID }
+        cgWindowByWindowID.removeValue(forKey: windowID)
         rememberedFrameCandidatesBySignature = rememberedFrameCandidatesBySignature.compactMapValues { entries in
             let filtered = entries.filter { $0.key != windowID }
             return filtered.isEmpty ? nil : filtered
         }
-        recentDisappearanceIDBySignature = recentDisappearanceIDBySignature.filter { $0.value.id != windowID }
-        pendingMinimizedIDBySignature = pendingMinimizedIDBySignature.filter { $0.value.id != windowID }
-        for signature in Set(exactSignatures + coarseSignatures + frameSignatures) {
+        pendingBridges.removeValue(forKey: windowID)
+        for signature in Set(exactSignatures + coarseSignatures.map(WindowSignature.coarse) + frameSignatures) {
             recentObservationEvidenceBySignature.removeValue(forKey: signature)
         }
     }
@@ -638,7 +737,7 @@ private struct IdentityMemory {
     }
 
     private func freshExactMatch(
-        for signature: String,
+        for signature: WindowSignature,
         now: Date,
         ttl: TimeInterval
     ) -> WindowID? {
@@ -650,7 +749,7 @@ private struct IdentityMemory {
     }
 
     private func freshExactCandidates(
-        for signature: String,
+        for signature: WindowSignature,
         now: Date,
         ttl: TimeInterval
     ) -> [WindowID] {
@@ -667,8 +766,8 @@ private struct IdentityMemory {
     }
 
     private func hasConflictingFreshExactSignature(
-        for coarseSignature: String,
-        excluding exactSignature: String,
+        for coarseSignature: CoarseWindowSignature,
+        excluding exactSignature: WindowSignature,
         now: Date,
         ttl: TimeInterval
     ) -> Bool {
@@ -687,7 +786,7 @@ private struct IdentityMemory {
     }
 
     private func freshCoarseCandidates(
-        for coarseSignature: String,
+        for coarseSignature: CoarseWindowSignature,
         now: Date,
         ttl: TimeInterval
     ) -> [WindowID] {
@@ -701,7 +800,7 @@ private struct IdentityMemory {
     }
 
     private func freshFrameCandidates(
-        for frameSignature: String,
+        for frameSignature: WindowSignature,
         now: Date,
         ttl: TimeInterval
     ) -> [WindowID] {
@@ -716,7 +815,7 @@ private struct IdentityMemory {
 
     private func freshTolerantFrameCandidates(
         for observation: SystemObservation,
-        coarseSignature: String,
+        coarseSignature: CoarseWindowSignature,
         now: Date,
         ttl: TimeInterval
     ) -> [WindowID]? {
@@ -732,7 +831,7 @@ private struct IdentityMemory {
     }
 
     private func freshObservationEvidenceCount(
-        for signature: String,
+        for signature: WindowSignature,
         now: Date,
         window: TimeInterval
     ) -> Int {
@@ -748,6 +847,8 @@ private struct IdentityResolution {
     let windowID: WindowID
     let confidence: Confidence
     let reason: String
+    var isConfirmed = true
+    var hasExactBridge = false
 }
 
 private enum RememberedIdentityLookup {
@@ -782,28 +883,18 @@ private struct TimedObservationEvidence {
 }
 
 private extension SystemObservation {
-    func exactSignature(canonicalWindowTitle: String?) -> String {
-        let canonicalWindowTitle = canonicalWindowTitle ?? title?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "untitled"
-        let boundsPart: String
-        boundsPart = WindowFrameMatchPolicy.signature(for: bounds)
-
-        return "\(pid)|\(canonicalWindowTitle)|\(boundsPart)"
+    func exactSignature(canonicalWindowTitle: String?) -> WindowSignature {
+        .exact(coarseSignature(canonicalWindowTitle: canonicalWindowTitle),
+               bounds.flatMap(WindowFrameMatchPolicy.integralComponents(for:)))
     }
 
-    func coarseSignature(canonicalWindowTitle: String?) -> String {
-        let canonicalWindowTitle = canonicalWindowTitle ?? title?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "untitled"
-        return "\(pid)|\(canonicalWindowTitle)"
+    func coarseSignature(canonicalWindowTitle: String?) -> CoarseWindowSignature {
+        CoarseWindowSignature(pid: pid,
+            title: canonicalWindowTitle ?? title?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
-    func frameSignature() -> String? {
+    func frameSignature() -> WindowSignature? {
         guard let bounds else { return nil }
-        return "\(pid)|frame-only|\(WindowFrameMatchPolicy.signature(for: bounds))"
-    }
-
-    func candidateSignatures(canonicalWindowTitle: String?) -> [String] {
-        if bounds != nil {
-            return [exactSignature(canonicalWindowTitle: canonicalWindowTitle), coarseSignature(canonicalWindowTitle: canonicalWindowTitle)]
-        }
-        return [coarseSignature(canonicalWindowTitle: canonicalWindowTitle)]
+        return .frame(pid: pid, components: WindowFrameMatchPolicy.integralComponents(for: bounds))
     }
 }

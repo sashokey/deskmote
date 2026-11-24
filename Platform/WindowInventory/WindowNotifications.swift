@@ -35,10 +35,12 @@ final class AppWindowObserver {
     private var applicationItems: [String: WindowSubscriptionItemState] = [:]
     private var applicationRetryAt: TimeInterval = 0
     private var applicationRetryStep = 0
+    private var movementAttempts = 0
     private var waitingWindows: [CGWindowID: AXElementKey] = [:]
     private struct RegistrationWork {
         let id = UUID()
         let cancellation = OperationCancellation()
+        var task: Task<Void, Never>?
     }
     private var inFlight: [AXElementKey: RegistrationWork] = [:]
     private var subscriptions = WindowSubscriptionLedger<AXElementKey>(instanceIDs: AppWindowObserver.instanceIDs)
@@ -48,12 +50,17 @@ final class AppWindowObserver {
     var isActive: Bool {
         session != nil && Self.applicationNotifications.allSatisfy { applicationItems[$0] == .done }
     }
-    var onWindowCreated: ((pid_t) -> Void)?
+    private var canReceiveWindowCreated: Bool {
+        session != nil && applicationItems[kAXWindowCreatedNotification] == .done
+    }
+    var onWindowCreationReady: ((pid_t) -> Void)?
+    var onWindowCreated: ((pid_t, AXElementKey) -> Void)?
     var onWindowDestroyed: ((pid_t, CGWindowID, AXUIElement) -> Void)?
     var onWindowMinimized: ((pid_t, CGWindowID) -> Void)?
     var onWindowDeminiaturized: ((pid_t, CGWindowID) -> Void)?
     var onFocusedWindowChanged: ((pid_t) -> Void)?
     var onTitleChanged: ((pid_t, CGWindowID) -> Void)?
+    var onWindowMoved: ((pid_t, CGWindowID, AXElementKey) -> Void)?
     #if DEBUG
     var onSubscriptionDestroyNotified: ((pid_t, CGWindowID, UInt64?) -> Void)?
     var onSubscriptionAttempt: ((WindowSubscriptionAttemptReport) -> Void)?
@@ -87,6 +94,12 @@ final class AppWindowObserver {
         let results: [String: AXError]
     }
 
+    private var pendingApplicationNotifications: [String] {
+        var names = Self.applicationNotifications
+        if movementAttempts < 3 { names.append(kAXWindowMovedNotification) }
+        return names.filter { applicationItems[$0] != .done && applicationItems[$0] != .unsupported }
+    }
+
     func start() {
         if !isRunning {
             isRunning = true
@@ -94,10 +107,10 @@ final class AppWindowObserver {
         }
         retryPendingRemovals()
         guard !isStarting, clock() >= applicationRetryAt else { return }
-        let notifications = Self.applicationNotifications.filter {
-            applicationItems[$0] != .done && applicationItems[$0] != .unsupported
-        }
+        let notifications = pendingApplicationNotifications
         guard session == nil || !notifications.isEmpty else { return }
+        let required = notifications.filter { $0 != kAXWindowMovedNotification }
+        let registerMovement = notifications.contains(kAXWindowMovedNotification)
         isStarting = true
         let currentSession = session
         let makeSession = makeSession
@@ -115,22 +128,17 @@ final class AppWindowObserver {
             let created = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
                 let session = currentSession ?? makeSession(pid, receive)
                 var results: [String: AXError] = [:]
-                for notification in notifications {
+                for notification in required {
                     guard !cancellation.isCancelled else { break }
                     if let session { results[notification] = session.add(notification, element: nil) }
                 }
                 return ApplicationAttemptResult(session: session, results: results)
             }
-            await MainActor.run { [weak self] in
-                guard let self, self.work.isCurrent(generation) else { return }
-                self.isStarting = false
-                guard let created else { return }
+            let pendingRegistrations = await MainActor.run { [weak self] () -> [Task<Void, Never>] in
+                guard let self, self.work.isCurrent(generation), let created else { return [] }
+                let wasReady = self.canReceiveWindowCreated
                 for (notification, result) in created.results {
-                    switch result {
-                    case .success, .notificationAlreadyRegistered: self.applicationItems[notification] = .done
-                    case .notificationUnsupported: self.applicationItems[notification] = .unsupported
-                    default: self.applicationItems[notification] = .failed
-                    }
+                    self.recordApplicationRegistration(notification, result: result)
                 }
                 if let session = created.session, self.session == nil {
                     self.session = session
@@ -140,9 +148,30 @@ final class AppWindowObserver {
                     self.waitingWindows.removeAll()
                     for (id, key) in windows { _ = self.registerWindow(key.e, cgWindowID: id) }
                 }
-                let needsRetry = self.session == nil || Self.applicationNotifications.contains {
-                    self.applicationItems[$0] != .done && self.applicationItems[$0] != .unsupported
+                if !wasReady, self.canReceiveWindowCreated { self.onWindowCreationReady?(pid) }
+                return registerMovement ? self.inFlight.values.compactMap(\.task) : []
+            }
+            let movementResult: AXError?
+            if registerMovement, let session = created?.session {
+                for task in pendingRegistrations {
+                    if Task.isCancelled { return }
+                    await task.value
                 }
+                guard !Task.isCancelled else { return }
+                movementResult = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
+                    session.add(kAXWindowMovedNotification, element: nil)
+                }
+            } else {
+                movementResult = nil
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.work.isCurrent(generation) else { return }
+                self.isStarting = false
+                if let movementResult {
+                    self.movementAttempts += 1
+                    self.recordApplicationRegistration(kAXWindowMovedNotification, result: movementResult)
+                }
+                let needsRetry = self.session == nil || !self.pendingApplicationNotifications.isEmpty
                 if needsRetry {
                     let delays = WindowSubscriptionLedger<AXElementKey>.backoff
                     self.applicationRetryAt = self.clock() + delays[min(self.applicationRetryStep, delays.count - 1)]
@@ -152,6 +181,14 @@ final class AppWindowObserver {
                     self.applicationRetryStep = 0
                 }
             }
+        }
+    }
+
+    private func recordApplicationRegistration(_ notification: String, result: AXError) {
+        switch result {
+        case .success, .notificationAlreadyRegistered: applicationItems[notification] = .done
+        case .notificationUnsupported: applicationItems[notification] = .unsupported
+        default: applicationItems[notification] = .failed
         }
     }
 
@@ -167,6 +204,7 @@ final class AppWindowObserver {
         applicationItems.removeAll()
         applicationRetryAt = 0
         applicationRetryStep = 0
+        movementAttempts = 0
         waitingWindows.removeAll()
         inFlight.removeAll()
         subscriptions.removeAll()
@@ -290,7 +328,7 @@ final class AppWindowObserver {
         let finish: @MainActor @Sendable (WindowSubscriptionAttemptReport) -> Void = completion ?? { [weak self] in self?.onSubscriptionAttempt?($0) }
         #endif
         let cancellation = registration.cancellation
-        work.launch { [weak self] generation in
+        let task = work.launch { [weak self] generation in
             let result = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
                 let start = clock()
                 var results: [WindowSubscriptionItem: AXError] = [:]
@@ -349,6 +387,7 @@ final class AppWindowObserver {
                 #endif
             }
         }
+        inFlight[key]?.task = task
     }
 
     #if DEBUG
@@ -357,7 +396,7 @@ final class AppWindowObserver {
 
     fileprivate func handleNotification(element: AXUIElement, notification notifStr: String) {
         if notifStr == (kAXWindowCreatedNotification as String) {
-            onWindowCreated?(pid)
+            onWindowCreated?(pid, AXElementKey(e: element))
         } else if notifStr == (kAXFocusedWindowChangedNotification as String)
                     || notifStr == (kAXMainWindowChangedNotification as String) {
             onFocusedWindowChanged?(pid)
@@ -386,6 +425,11 @@ final class AppWindowObserver {
         } else if notifStr == (kAXTitleChangedNotification as String) {
             if let cgID = subscriptions.cgWindowID(forElement: AXElementKey(e: element)) {
                 onTitleChanged?(pid, cgID)
+            }
+        } else if notifStr == kAXWindowMovedNotification {
+            let key = AXElementKey(e: element)
+            if let cgID = subscriptions.cgWindowID(forElement: key) {
+                onWindowMoved?(pid, cgID, key)
             }
         }
     }

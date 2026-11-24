@@ -64,24 +64,22 @@ final class ManualPanelHostTests: XCTestCase {
         XCTAssertEqual(panel.frame, originalFrame)
     }
 
-    func testHostingViewSizeChangeDoesNotResizeVisiblePanel() {
+    func testHostingViewSizeChangeDoesNotResizeDetachedPanel() {
         let panel = makePanel(size: NSSize(width: 500, height: 120))
-        panel.alphaValue = 0
         let content = NSHostingView(rootView: SizedProbeView(size: CGSize(width: 240, height: 80)))
         _ = ManualPanelHost(contentView: content, in: panel)
-        panel.orderFront(nil)
-        defer { panel.orderOut(nil); panel.close() }
         panel.layoutIfNeeded()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         let originalFrame = panel.frame
+        XCTAssertEqual(content.fittingSize, CGSize(width: 240, height: 80))
 
         content.rootView = SizedProbeView(size: CGSize(width: 900, height: 400))
         content.invalidateIntrinsicContentSize()
         content.needsLayout = true
         panel.layoutIfNeeded()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
 
         XCTAssertEqual(panel.frame, originalFrame)
+        XCTAssertEqual(content.fittingSize, CGSize(width: 900, height: 400))
+        XCTAssertFalse(panel.isVisible)
     }
 
     func testZeroSizedPanelStillMeasuresHostingContent() {

@@ -1041,7 +1041,7 @@ final class WindowLiftAvoidanceTests: XCTestCase {
                 intendedWindowFrame: target,
                 liftRetryCount: 0
             ),
-            .continueFromActual(actualFrame: midpoint)
+            .clearSession(preservingFrame: midpoint)
         )
         XCTAssertEqual(
             WindowLiftAvoidance.animationRecoveryAction(
@@ -1975,15 +1975,16 @@ extension WindowLiftAvoidanceTests {
         let result = WindowLiftCGWindowProbe.capture(on: contexts, excludingPID: 999,
             includeLiveWindowKeys: false, includesTiles: false, trackedKeys: [], system: system)
         XCTAssertEqual(result.candidatesByScreenIndex, [
-            0: spanning,
-            1: WindowLiftCGCandidate(key: .init(pid: 100, cgWindowID: 14), quartzFrame: rightOnly)
+            0: [spanning, WindowLiftCGCandidate(key: .init(pid: 100, cgWindowID: 16), quartzFrame: left)],
+            1: [WindowLiftCGCandidate(key: .init(pid: 100, cgWindowID: 14), quartzFrame: rightOnly)]
         ])
         XCTAssertEqual(result.onScreenFrames.count, 6)
+        XCTAssertEqual(system.options.withLock { $0 }, [[.optionOnScreenOnly, .excludeDesktopElements]])
 
         let spanningOnly = WindowLiftCGWindowProbe.capture(on: contexts, excludingPID: 999,
             includeLiveWindowKeys: false, includesTiles: false, trackedKeys: [],
             system: LiftCaptureSystem(onScreen: [spanningWindow], all: nil))
-        XCTAssertEqual(spanningOnly.candidatesByScreenIndex, [0: spanning])
+        XCTAssertEqual(spanningOnly.candidatesByScreenIndex, [0: [spanning]])
     }
 
     func testOverhangingWindowCannotOccupyAnotherDisplaysLiftCandidateSlot() {
@@ -1998,8 +1999,8 @@ extension WindowLiftAvoidanceTests {
                                                    liftWindowInfo(pid: 100, id: 11, bounds: right)], all: nil)
         let result = WindowLiftCGWindowProbe.capture(on: contexts, excludingPID: 999, includeLiveWindowKeys: false,
                                                       includesTiles: false, trackedKeys: [], system: system)
-        XCTAssertEqual(result.candidatesByScreenIndex[0]?.key.cgWindowID, 10)
-        XCTAssertEqual(result.candidatesByScreenIndex[1]?.key.cgWindowID, 11)
+        XCTAssertEqual(result.candidatesByScreenIndex[0]?.map(\.key.cgWindowID), [10])
+        XCTAssertEqual(result.candidatesByScreenIndex[1]?.map(\.key.cgWindowID), [11])
     }
 
     func testLiftCaptureKeepsTrackedTileAheadOfWideWindowOnlyWhenTilesAreEnabled() {
@@ -2016,13 +2017,13 @@ extension WindowLiftAvoidanceTests {
             liftWindowInfo(pid: 100, id: 8, bounds: wideFrame)
         ], all: nil)
         for (includesTiles, tracked, expected) in [
-            (true, Set([tile]), tile),
-            (true, [], wide),
-            (false, [tile], wide)
+            (true, Set([tile]), [tile, wide]),
+            (true, [], [wide]),
+            (false, [tile], [wide])
         ] {
             let result = WindowLiftCGWindowProbe.capture(on: [context], excludingPID: 999,
                 includeLiveWindowKeys: false, includesTiles: includesTiles, trackedKeys: tracked, system: system)
-            XCTAssertEqual(result.candidatesByScreenIndex[0]?.key, expected)
+            XCTAssertEqual(result.candidatesByScreenIndex[0]?.map(\.key), expected)
         }
     }
 
@@ -2113,6 +2114,31 @@ extension WindowLiftAvoidanceTests {
         XCTAssertEqual(system.descriptionRequests.withLock { $0.count }, 1)
         XCTAssertEqual(system.descriptionRequests.withLock { $0.first.map(Set.init) }, [7, 8])
         XCTAssertTrue(system.options.withLock { $0.isEmpty })
+    }
+
+    func testLiftProbeAcceptsSignedWindowNumbersAndRejectsMalformedNumbers() {
+        let bounds = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let key = WindowLiftAvoidance.WindowKey(pid: 100, cgWindowID: 4_294_967_294)
+        let info = liftWindowInfo(pid: 100, id: 7, bounds: bounds)
+        let windows = [
+            NSNumber(value: Int32(-2)),
+            NSNumber(value: UInt64(4_294_967_303)),
+            NSNumber(value: 7.5),
+            NSNumber(value: UInt64.max),
+            NSNumber(value: 0)
+        ].map { number -> [String: Any] in
+            var window = info
+            window[kCGWindowNumber as String] = number
+            return window
+        }
+        let missing = WindowLiftAvoidance.WindowKey(pid: 100, cgWindowID: 7)
+        let system = LiftCaptureSystem(onScreen: windows, all: windows)
+        let capture = WindowLiftCGWindowProbe.capture(on: [], excludingPID: 999,
+            includeLiveWindowKeys: true, includesTiles: false, trackedKeys: [key, missing], system: system)
+
+        XCTAssertEqual(capture.onScreenFrames, [key: bounds])
+        XCTAssertEqual(capture.liveWindowKeys, [key])
+        XCTAssertEqual(WindowLiftCGWindowProbe.frames(for: [key, missing], system: system), [key: bounds])
     }
 
     func testTrackedFrameProbeKeepsMissingOrUnreadWindowsUnknown() {

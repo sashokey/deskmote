@@ -8,42 +8,44 @@ enum FinderWindowRules {
         bundleIdentifier == Self.bundleIdentifier
     }
 
+    static func isTrackableForObservation(_ window: AXWindowSnapshot, applicationName: String?,
+                                          cgObservations: [SystemObservation]) -> Bool {
+        let isCorroborated: Bool
+        if let id = window.cgWindowID, id != 0, let bounds = window.bounds {
+            isCorroborated = cgObservations.contains { observation in
+                observation.source == .coreGraphics && observation.kind != .disappeared
+                    && observation.pid == window.pid && observation.cgWindowID == id
+                    && observation.bounds.map { WindowFrameMatchPolicy.areClose($0, bounds) } == true
+            }
+        } else {
+            isCorroborated = false
+        }
+        return isTrackable(title: window.title, role: window.role, subrole: window.subrole, bounds: window.bounds,
+                           applicationName: applicationName, isModal: window.isModal, isTopLevel: window.isTopLevel,
+                           hasCorroboratedGeometry: isCorroborated)
+    }
+
     static func isTrackable(
         title: String?,
         role: String?,
         subrole: String?,
         bounds: CGRect?,
-        isMinimized: Bool,
-        applicationName: String? = nil
+        applicationName: String? = nil,
+        isModal: Bool? = nil,
+        isTopLevel: Bool? = nil,
+        isNativeRoot: Bool = false,
+        matchesCommonWindowRules: Bool? = nil,
+        hasCorroboratedGeometry: Bool = false
     ) -> Bool {
-        guard AXTaskbarWindowRules.isMainWindow(
-            role: role,
-            subrole: subrole,
-            bounds: bounds
-        ) || isMinimizedMainWindow(role: role, subrole: subrole, isMinimized: isMinimized) else {
+        guard isModal != true, isTopLevel != false,
+              matchesCommonWindowRules ?? AXTaskbarWindowRules.isMainWindow(role: role, subrole: subrole,
+                bounds: bounds, isModal: isModal, isTopLevel: isTopLevel),
+              let bounds, WindowFrameMatchPolicy.isValid(bounds), bounds.width >= 40, bounds.height >= 40,
+              let normalized = normalizedWindowTitle(title) else {
             return false
         }
 
-        guard let bounds, bounds.width >= 40, bounds.height >= 40 else {
-            return false
-        }
-
-        guard let normalized = canonicalWindowTitle(title),
-              normalized != "finder",
-              normalized != canonicalWindowTitle(applicationName) else {
-            return false
-        }
-
-        return true
-    }
-
-    private static func isMinimizedMainWindow(role: String?, subrole: String?, isMinimized: Bool) -> Bool {
-        isMinimized
-            && role == (kAXWindowRole as String)
-            && subrole == (kAXDialogSubrole as String)
-    }
-
-    static func canonicalWindowTitle(_ title: String?) -> String? {
-        normalizedWindowTitle(title)
+        if isNativeRoot || hasCorroboratedGeometry, subrole == kAXStandardWindowSubrole as String { return true }
+        return normalized != "finder" && normalized != normalizedWindowTitle(applicationName)
     }
 }

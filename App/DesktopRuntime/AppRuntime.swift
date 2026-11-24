@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import CoreGraphics
 import Foundation
+import Synchronization
 #if DEBUG || DESKMOTE_QA_JOURNAL
 import os
 #endif
@@ -187,14 +188,117 @@ final class AppRuntime: ObservableObject {
     @Published private(set) var snapshot: DockSnapshot = .empty
     #if DEBUG
     let debugState = DebugRuntimeState()
+    var clickLatencyTrace = ClickLatencyTrace.live
     #endif
-    @Published private(set) var optimisticStatesByWindowID: [String: OptimisticWindowState] = [:]
+    @Published private(set) var optimisticStatesByWindowID: [String: OptimisticWindowState] = [:] {
+        didSet {
+            if let prediction = activeFocusPrediction,
+               optimisticStatesByWindowID[prediction.windowID.rawValue]?.status != .active {
+                activeFocusPrediction = nil
+            }
+        }
+    }
+    var effectiveActiveWindowID: WindowID? {
+        OptimisticWindowState.activeWindowID(in: snapshot, states: optimisticStatesByWindowID)
+    }
+
+    private struct ActionToken: Sendable {
+        let id = UUID()
+        let activationTarget: WindowActionIdentity?
+        let activationSequence: UInt64?
+        let focusAttempt: NativeFocusAttempt?
+    }
+
+    private final class NativeFocusAttempt: Sendable {
+        private enum Target: Sendable {
+            case waiting
+            case expected(WindowActionIdentity)
+            case finished
+            case rejected
+        }
+
+        private let target = Mutex<Target>(.waiting)
+
+        func expect(_ identity: WindowActionIdentity) -> Bool {
+            target.withLock {
+                guard case .waiting = $0 else { return false }
+                $0 = .expected(identity)
+                return true
+            }
+        }
+
+        func consume(matching identity: WindowActionIdentity) -> Bool {
+            target.withLock {
+                guard case let .expected(expected) = $0,
+                      expected == identity || expected.representsSameTarget(as: identity) else { return false }
+                $0 = .finished
+                return true
+            }
+        }
+
+        func invalidate() { target.withLock { $0 = .rejected } }
+
+        var isRejected: Bool {
+            target.withLock {
+                if case .rejected = $0 { return true }
+                return false
+            }
+        }
+
+        var isPending: Bool {
+            target.withLock {
+                switch $0 {
+                case .waiting, .expected: return true
+                case .finished, .rejected: return false
+                }
+            }
+        }
+    }
+
+    private struct ActiveFocusPrediction {
+        let windowID: WindowID
+        let source: ActionToken
+        var earlierAttempts: [UUID: NativeFocusAttempt]
+        var lastNativeFocus: WindowActionIdentity?
+        var observedPredecessors: [UUID: NativeFocusAttempt]?
+
+        mutating func consumeEarlierAttempts(matching identity: WindowActionIdentity) -> [UUID: NativeFocusAttempt] {
+            var matched: [UUID: NativeFocusAttempt] = [:]
+            earlierAttempts = earlierAttempts.filter { token, attempt in
+                if attempt.consume(matching: identity) { matched[token] = attempt }
+                return attempt.isPending
+            }
+            return matched
+        }
+
+        mutating func retainsPrediction(afterObserving identity: WindowActionIdentity) -> Bool {
+            if lastNativeFocus.map({ $0 == identity || $0.representsSameTarget(as: identity) }) != true {
+                lastNativeFocus = identity
+                observedPredecessors = consumeEarlierAttempts(matching: identity)
+            }
+            return observedPredecessors?.values.contains(where: { !$0.isRejected }) ?? true
+        }
+    }
+
+    private struct HandoffFocusPrediction {
+        let source: WindowActionIdentity
+        let target: WindowActionIdentity
+        let action: ActionToken
+        let precedingActivation: UInt64
+        let state: OptimisticWindowState
+    }
+
     private let tracker: any WindowInventoryTracking
     private let work = WindowActionQueue()
-    private var actionTokens: [String: UUID] = [:]
+    private var actionTokens: [String: ActionToken] = [:]
+    private var activationSequence: UInt64 = 0
+    private var settledActivationSequence: UInt64 = 0
+    private var activeFocusPrediction: ActiveFocusPrediction?
+    private var handoffFocusPrediction: HandoffFocusPrediction?
     private var activatingTargets: [String: WindowActionIdentity] = [:]
     private var projectionInvalidationSubscriptions: [String: AnyCancellable] = [:]
     private let intentPipeline: IntentPipeline
+    private let monotonicNow: () -> ContinuousClock.Instant
     private let actionExecutor: any WindowActionExecuting
     private let utilityWindows: UtilityWindowRegistry
     private var externalSnapshot: DockSnapshot = .empty
@@ -216,12 +320,15 @@ final class AppRuntime: ObservableObject {
             DisplayIdentity.attributionTable()
         },
         isAppFrontmost: @escaping (pid_t) -> Bool = { NSRunningApplication(processIdentifier: $0)?.isActive == true },
+        monotonicNow: @escaping () -> ContinuousClock.Instant = { .now },
         activateUtilityApplication: @escaping @MainActor () -> Void = {
             if NSApp.isHidden { NSApp.unhide(nil) }
             NSApp.activate()
         }
     ) {
-        self.intentPipeline = IntentPipeline(actionPlanning: LifecycleActionPlanner(isAppFrontmost: isAppFrontmost))
+        self.monotonicNow = monotonicNow
+        self.intentPipeline = IntentPipeline(actionPlanning: LifecycleActionPlanner(isAppFrontmost: isAppFrontmost),
+                                             monotonicNow: monotonicNow)
         self.tracker = tracker ?? AppTracker(inventoryLog: inventoryLog, displayTableProvider: displayTableProvider)
         self.actionExecutor = actionExecutor
         self.utilityWindows = UtilityWindowRegistry(isAppFrontmost: isAppFrontmost, activateApplication: activateUtilityApplication)
@@ -249,6 +356,9 @@ final class AppRuntime: ObservableObject {
     func stop() {
         work.stop()
         actionTokens.removeAll()
+        activationSequence = 0
+        settledActivationSequence = 0
+        handoffFocusPrediction = nil
         activatingTargets.removeAll()
         projectionInvalidationSubscriptions.removeAll()
         tracker.stop()
@@ -314,11 +424,14 @@ final class AppRuntime: ObservableObject {
         for (oldKey, target) in activatingTargets where oldKey != key && target.representsSameTarget(as: current.actionIdentity) {
             cancelAction(for: oldKey)
         }
+        let replacedState = optimisticStatesByWindowID[key]
         retireAction(for: key)
+        var planningStates = optimisticStatesByWindowID
+        if let replacedState, !replacedState.systemPredicted { planningStates[key] = replacedState }
         let request = intentPipeline.plan(
             intent: intent,
             snapshot: snapshot,
-            optimisticStates: optimisticStatesByWindowID
+            optimisticStates: planningStates
         )
 
         #if DEBUG
@@ -327,34 +440,40 @@ final class AppRuntime: ObservableObject {
            let record = snapshot.windows[wid] {
             let runningApp = NSRunningApplication(processIdentifier: record.pid)
             let freshActive = runningApp?.isActive == true
-            let optimisticStatus = optimisticStatesByWindowID[wid.rawValue]?.status.rawValue ?? "none"
+            let optimisticStatus = planningStates[wid.rawValue]?.status.rawValue ?? "none"
             chipProbeLogger.info("toggle-planned windowID=\(wid.rawValue, privacy: .public) app=\(runningApp?.localizedName ?? "(unknown)", privacy: .public) bundleID=\(record.bundleIdentifier ?? "(none)", privacy: .public) recordStatus=\(record.status.rawValue, privacy: .public) optimisticStatus=\(optimisticStatus, privacy: .public) freshActive=\(freshActive, privacy: .public) plannedAction=\(request.kind.rawValue, privacy: .public)")
         }
         #endif
 
+        let activationTarget = request.kind == .activateWindow ? current.actionIdentity : nil
+        if activationTarget != nil { activationSequence &+= 1 }
+        let focusAttempt = activationTarget != nil || Self.handoffActivePredictionEnabled ? NativeFocusAttempt() : nil
+        let token = ActionToken(activationTarget: activationTarget,
+                                activationSequence: activationTarget.map { _ in activationSequence }, focusAttempt: focusAttempt)
         #if DEBUG
-        if ClickLatencyTrace.isEnabled, let wid = request.windowID?.rawValue {
+        if let clickLatencyTrace, let wid = request.windowID?.rawValue {
             let record = snapshot.windows[WindowID(rawValue: wid)]
-            ClickLatencyTrace.begin(
+            clickLatencyTrace.begin(
                 windowID: wid,
+                token: token.id,
                 kind: request.kind.rawValue,
                 status: record?.status.rawValue ?? "unknown",
                 bundleID: record?.bundleIdentifier
             )
         }
         #endif
-
-        let token = UUID()
         actionTokens[key] = token
         projectionInvalidationSubscriptions[key] = projectionInvalidations?.sink { [weak self] in
-            guard let self, self.actionTokens[key] == token else { return }
+            guard let self, self.actionTokens[key]?.id == token.id else { return }
             self.cancelAction(for: key)
         }
         let effectiveStatusAtPlan: WindowStatus? = request.windowID.flatMap { wid in
-            optimisticStatesByWindowID[wid.rawValue]?.status ?? snapshot.windows[wid]?.status
+            planningStates[wid.rawValue]?.status ?? snapshot.windows[wid]?.status
         }
-        applyOptimisticState(for: request, wasMinimizedAtPlan: effectiveStatusAtPlan == .minimized)
-        intentPipeline.registerPending(intent: intent, request: request)
+        let requestedAt = monotonicNow()
+        applyOptimisticState(for: request, token: token, wasMinimizedAtPlan: effectiveStatusAtPlan == .minimized, at: requestedAt)
+        reconcileHandoffPrediction(now: requestedAt)
+        intentPipeline.registerPending(intent: intent, request: request, at: requestedAt)
         publishFeedbackEntries()
         updateFeedbackTimer()
 
@@ -374,22 +493,33 @@ final class AppRuntime: ObservableObject {
         }
         let generation = work.generation
         let key = intent.windowID.rawValue
-        guard let token = actionTokens[key] else { return }
+        guard let action = actionTokens[key] else { return }
+        let token = action.id
+        #if DEBUG
+        let clickLatencyTrace = clickLatencyTrace
+        let traceWindowID = request.windowID?.rawValue
+        #endif
         let onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?
-        if (request.kind == .minimizeWindow || request.kind == .closeWindow) && Self.handoffActivePredictionEnabled {
+        if request.kind != .activateWindow, let focusAttempt = action.focusAttempt,
+           let sourceIdentity = capturedSnapshot.windows[intent.windowID]?.actionIdentity {
+            let precedingActivation = activationSequence
             onHandoffActivePrediction = { @Sendable [weak self] (windowID: WindowID) in
+                guard let planned = capturedSnapshot.windows[windowID],
+                      focusAttempt.expect(planned.actionIdentity) else { return }
                 Task { @MainActor [weak self] in
                     guard let self, self.work.isCurrent(generation),
-                          self.actionTokens[key] == token else { return }
-                    guard self.optimisticStatesByWindowID[windowID.rawValue] == nil else { return }
-                    guard let planned = capturedSnapshot.windows[windowID],
-                          let current = self.snapshot.windows[windowID],
-                          current.actionIdentity == planned.actionIdentity,
-                          current.status != .minimized, current.status != .hidden else { return }
-                    self.optimisticStatesByWindowID[windowID.rawValue] = OptimisticWindowState(
-                        status: .active, createdAt: Date(), focusHandoffGrace: true,
-                        systemPredicted: true, handoffSourceToken: token
+                          self.actionTokens[key]?.id == token,
+                          self.handoffFocusPrediction == nil else { return }
+                    let reportedAt = self.monotonicNow()
+                    let state = OptimisticWindowState(
+                        status: .active, createdAt: reportedAt, focusHandoffGrace: true,
+                        systemPredicted: true, sourceActionToken: token
                     )
+                    self.handoffFocusPrediction = HandoffFocusPrediction(
+                        source: sourceIdentity, target: planned.actionIdentity, action: action,
+                        precedingActivation: precedingActivation, state: state
+                    )
+                    self.reconcileHandoffPrediction(now: reportedAt)
                 }
             }
         } else {
@@ -399,10 +529,13 @@ final class AppRuntime: ObservableObject {
             maximumPendingKeys: max(32, snapshot.windows.count)) { [weak self] generation, cancellation in
             let admitted = await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation), !cancellation.isCancelled,
-                      self.actionTokens[key] == token else { return false }
+                      self.actionTokens[key]?.id == token else { return false }
                 if isProjectionCurrent?() == false {
                     self.cancelAction(for: key)
                     return false
+                }
+                if let target = action.activationTarget {
+                    _ = action.focusAttempt?.expect(target)
                 }
                 if request.kind == .activateWindow, let record = capturedSnapshot.windows[intent.windowID],
                    record.actionTarget != nil {
@@ -412,13 +545,15 @@ final class AppRuntime: ObservableObject {
             }
             guard admitted else { return }
             #if DEBUG
-            ClickLatencyTrace.mark(windowID: request.windowID?.rawValue, "execStart")
+            if let traceWindowID {
+                clickLatencyTrace?.mark(windowID: traceWindowID, token: token, stage: "execStart")
+            }
             #endif
             let result: Bool?
             if let utilityRecord {
                 result = await MainActor.run { [weak self] in
                     guard let self, self.work.isCurrent(generation), !cancellation.isCancelled,
-                          self.actionTokens[key] == token else { return nil }
+                          self.actionTokens[key]?.id == token else { return nil }
                     guard self.snapshot.windows[utilityRecord.id]?.actionIdentity == utilityRecord.actionIdentity,
                           isProjectionCurrent?() != false else {
                         self.cancelAction(for: key)
@@ -428,21 +563,31 @@ final class AppRuntime: ObservableObject {
                 }
             } else {
                 result = await AsyncWorkScope.performBlocking(cancellation: cancellation) {
-                    executor.execute(request, snapshot: capturedSnapshot,
-                                     forcedMinimizedPrior: forcedMinimizedPrior,
-                                     cancellation: cancellation,
-                                     onHandoffActivePrediction: onHandoffActivePrediction)
+                    let execute = {
+                        executor.execute(request, snapshot: capturedSnapshot,
+                                         forcedMinimizedPrior: forcedMinimizedPrior,
+                                         cancellation: cancellation,
+                                         onHandoffActivePrediction: onHandoffActivePrediction)
+                    }
+                    #if DEBUG
+                    if let clickLatencyTrace, let traceWindowID {
+                        return clickLatencyTrace.withOperation(windowID: traceWindowID, token: token, execute)
+                    }
+                    #endif
+                    return execute()
                 }
             }
             guard let success = result else { return }
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation), !cancellation.isCancelled,
-                      self.actionTokens[key] == token else { return }
+                      self.actionTokens[key]?.id == token else { return }
                 #if DEBUG
-                ClickLatencyTrace.end(windowID: request.windowID?.rawValue, success: success)
+                if let traceWindowID {
+                    clickLatencyTrace?.end(windowID: traceWindowID, token: token, success: success)
+                }
                 #endif
-                self.retireAction(for: key, preservingHandoff: success)
-                if !success { self.optimisticStatesByWindowID.removeValue(forKey: key) }
+                self.retireAction(for: key, preservingEffects: success)
+                self.reconcileHandoffPrediction()
                 self.intentPipeline.registerExecutionResult(intent: intent, request: request, success: success)
                 self.publishFeedbackEntries()
                 self.updateFeedbackTimer()
@@ -450,7 +595,7 @@ final class AppRuntime: ObservableObject {
         }
         if !accepted {
             retireAction(for: key)
-            optimisticStatesByWindowID.removeValue(forKey: key)
+            reconcileHandoffPrediction()
             intentPipeline.registerExecutionResult(intent: intent, request: request, success: false)
             publishFeedbackEntries()
             updateFeedbackTimer()
@@ -460,22 +605,40 @@ final class AppRuntime: ObservableObject {
     private func cancelAction(for key: String) {
         work.cancel(key: key)
         #if DEBUG
-        ClickLatencyTrace.end(windowID: key, success: false)
+        if let token = actionTokens[key]?.id {
+            clickLatencyTrace?.end(windowID: key, token: token, success: false)
+        }
         #endif
         retireAction(for: key)
-        optimisticStatesByWindowID.removeValue(forKey: key)
+        reconcileHandoffPrediction()
         intentPipeline.discardFeedback(for: [key])
         publishFeedbackEntries()
         updateFeedbackTimer()
     }
 
-    private func retireAction(for key: String, preservingHandoff: Bool = false) {
+    private func retireAction(for key: String, preservingEffects: Bool = false, reconcileFocus: Bool = true) {
         projectionInvalidationSubscriptions.removeValue(forKey: key)
         activatingTargets.removeValue(forKey: key)
-        guard let token = actionTokens.removeValue(forKey: key), !preservingHandoff else { return }
-        let retainedStates = optimisticStatesByWindowID.filter { $0.value.handoffSourceToken != token }
+        guard let action = actionTokens.removeValue(forKey: key) else { return }
+        if preservingEffects {
+            markActivationSettled(action)
+            return
+        }
+        action.focusAttempt?.invalidate()
+        if handoffFocusPrediction?.action.id == action.id { handoffFocusPrediction = nil }
+        activeFocusPrediction?.earlierAttempts.removeValue(forKey: action.id)
+        let retainedStates = optimisticStatesByWindowID.filter { $0.value.sourceActionToken != action.id }
         if retainedStates.count != optimisticStatesByWindowID.count {
             optimisticStatesByWindowID = retainedStates
+        }
+        if reconcileFocus, activeFocusPrediction?.observedPredecessors?[action.id] != nil {
+            reconcileOptimisticStates()
+        }
+    }
+
+    private func markActivationSettled(_ action: ActionToken) {
+        if let sequence = action.activationSequence {
+            settledActivationSequence = max(settledActivationSequence, sequence)
         }
     }
 
@@ -501,7 +664,7 @@ final class AppRuntime: ObservableObject {
         }
         for key in actionTokens.keys where !retainedActionIDs.contains(key) {
             let closed = !replacedIDs.contains(key) && work.contains(key: key, kind: .closeWindow)
-            retireAction(for: key, preservingHandoff: closed)
+            retireAction(for: key, preservingEffects: closed, reconcileFocus: false)
         }
         work.retain(windowIDs: retainedActionIDs)
         if !replacedIDs.isEmpty {
@@ -512,18 +675,20 @@ final class AppRuntime: ObservableObject {
             }
         }
         if snapshot != newSnapshot { snapshot = newSnapshot }
-        intentPipeline.reconcile(with: newSnapshot)
+        let now = monotonicNow()
+        intentPipeline.reconcile(with: newSnapshot, now: now)
         publishFeedbackEntries()
-        reconcileOptimisticStates()
+        reconcileOptimisticStates(now: now)
         updateFeedbackTimer()
 
     }
 
     private func tickFeedback() {
         guard isRunning else { return }
-        intentPipeline.reconcile(with: snapshot)
+        let now = monotonicNow()
+        intentPipeline.reconcile(with: snapshot, now: now)
         publishFeedbackEntries()
-        reconcileOptimisticStates()
+        reconcileOptimisticStates(now: now)
         updateFeedbackTimer()
     }
 
@@ -557,48 +722,112 @@ final class AppRuntime: ObservableObject {
     var pendingActionsForTesting: [Task<Void, Never>] { work.pendingForTesting }
     #endif
 
-    private static let optimisticTimeout: TimeInterval = 4.0
+    private static let optimisticTimeout: Duration = .seconds(4)
 
-    private func applyOptimisticState(for request: PlatformActionRequest, wasMinimizedAtPlan: Bool) {
-        let state: OptimisticWindowState?
-        switch request.kind {
-        case .activateWindow:
-            state = OptimisticWindowState(status: .active, createdAt: Date(), focusHandoffGrace: wasMinimizedAtPlan)
-        case .minimizeWindow:
-            state = OptimisticWindowState(status: .minimized, createdAt: Date())
-        case .closeWindow:
-            state = nil
-        }
-        guard let state, let windowID = request.windowID else { return }
-        optimisticStatesByWindowID[windowID.rawValue] = state
+    private var confirmedActiveWindow: WindowRecord? {
+        OptimisticWindowState.confirmedActiveWindow(in: snapshot, states: optimisticStatesByWindowID)
     }
 
-    private func reconcileOptimisticStates(now: Date = Date()) {
+    private var nativeActiveWindow: WindowRecord? {
+        OptimisticWindowState.confirmedActiveWindow(in: snapshot, states: [:])
+    }
+
+    private func applyOptimisticState(for request: PlatformActionRequest, token: ActionToken,
+                                      wasMinimizedAtPlan: Bool, at requestedAt: ContinuousClock.Instant) {
+        guard let windowID = request.windowID else { return }
+        if request.kind != .activateWindow, handoffFocusPrediction?.target.windowID == windowID {
+            handoffFocusPrediction = nil
+        }
+        switch request.kind {
+        case .activateWindow:
+            var earlierAttempts = activeFocusPrediction?.earlierAttempts ?? [:]
+            if let previous = activeFocusPrediction?.source, let attempt = previous.focusAttempt, attempt.isPending {
+                earlierAttempts[previous.id] = attempt
+            }
+            for action in actionTokens.values where action.id != token.id {
+                guard let attempt = action.focusAttempt, attempt.isPending else { continue }
+                earlierAttempts[action.id] = attempt
+            }
+            let nativeFocus = nativeActiveWindow?.actionIdentity
+            var prediction = ActiveFocusPrediction(windowID: windowID, source: token, earlierAttempts: earlierAttempts,
+                                                   lastNativeFocus: nativeFocus)
+            if let nativeFocus { _ = prediction.consumeEarlierAttempts(matching: nativeFocus) }
+            activeFocusPrediction = prediction
+            var states = optimisticStatesByWindowID.filter { $0.value.status != .active }
+            states[windowID.rawValue] = OptimisticWindowState(
+                status: .active, createdAt: requestedAt, focusHandoffGrace: wasMinimizedAtPlan, sourceActionToken: token.id
+            )
+            optimisticStatesByWindowID = states
+        case .minimizeWindow:
+            optimisticStatesByWindowID[windowID.rawValue] = OptimisticWindowState(
+                status: .minimized, createdAt: requestedAt, sourceActionToken: token.id
+            )
+        case .closeWindow:
+            optimisticStatesByWindowID.removeValue(forKey: windowID.rawValue)
+        }
+    }
+
+    private func reconcileHandoffPrediction(now instant: ContinuousClock.Instant? = nil) {
+        guard let prediction = handoffFocusPrediction else { return }
+        let now = instant ?? monotonicNow()
+        let key = prediction.target.windowID.rawValue
+        let visible = optimisticStatesByWindowID[key] == prediction.state
+        let source = snapshot.windows[prediction.source.windowID]?.actionIdentity
+        guard settledActivationSequence <= prediction.precedingActivation,
+              prediction.state.createdAt.duration(to: now) <= Self.optimisticTimeout,
+              source == nil || source == prediction.source,
+              let target = snapshot.windows[prediction.target.windowID], target.actionIdentity == prediction.target,
+              target.status != .active, target.status != .minimized, target.status != .hidden else {
+            handoffFocusPrediction = nil
+            if visible { optimisticStatesByWindowID.removeValue(forKey: key) }
+            return
+        }
+        if visible { return }
+        if let nativeFocus = nativeActiveWindow?.actionIdentity, nativeFocus != prediction.source {
+            handoffFocusPrediction = nil
+            return
+        }
+        if actionTokens.values.contains(where: { ($0.activationSequence ?? 0) > prediction.precedingActivation }) { return }
+        guard optimisticStatesByWindowID[key] == nil,
+              !optimisticStatesByWindowID.values.contains(where: { $0.status == .active }) else {
+            handoffFocusPrediction = nil
+            return
+        }
+        activeFocusPrediction = ActiveFocusPrediction(windowID: target.id, source: prediction.action, earlierAttempts: [:],
+                                                      lastNativeFocus: prediction.source)
+        optimisticStatesByWindowID[key] = prediction.state
+    }
+
+    private func reconcileOptimisticStates(now instant: ContinuousClock.Instant? = nil) {
+        let now = instant ?? monotonicNow()
+        defer { reconcileHandoffPrediction(now: now) }
         guard !optimisticStatesByWindowID.isEmpty else { return }
         let next = optimisticStatesByWindowID.filter { windowID, state in
+            let age = state.createdAt.duration(to: now)
             let cleared: String?
-            if now.timeIntervalSince(state.createdAt) > Self.optimisticTimeout {
+            if age > Self.optimisticTimeout {
                 cleared = "timeout"
             } else if snapshot.windows[WindowID(rawValue: windowID)] == nil {
                 cleared = "window-gone"
             } else if let record = snapshot.windows[WindowID(rawValue: windowID)],
                       Self.optimisticConfirmed(predicted: state.status, actual: record.status) {
+                if let prediction = activeFocusPrediction, prediction.windowID == record.id,
+                   prediction.source.focusAttempt?.consume(matching: record.actionIdentity) == true {
+                    markActivationSettled(prediction.source)
+                }
                 cleared = "confirmed"
             } else if let record = snapshot.windows[WindowID(rawValue: windowID)],
                       OptimisticWindowState.systemPredictionFalsified(state: state, actual: record.status) {
                 cleared = "prediction-falsified"
-            } else if OptimisticWindowState.supersededByActiveSibling(
-                windowID: windowID, state: state, now: now,
-                optimisticStates: optimisticStatesByWindowID,
-                snapshot: snapshot, handoffGraceEnabled: Self.handoffActiveGraceEnabled
-            ) {
-                cleared = "superseded-by-active-sibling"
+            } else if activePredictionSuperseded(windowID: windowID, state: state, now: now) {
+                cleared = "superseded-by-native-focus"
             } else {
                 cleared = nil
             }
+            if cleared != nil, handoffFocusPrediction?.state == state { handoffFocusPrediction = nil }
             #if DEBUG
             if Self.chipProbeEnabled, let cleared {
-                chipProbeLogger.info("optimistic-cleared windowID=\(windowID, privacy: .public) predicted=\(state.status.rawValue, privacy: .public) ageMs=\(Int(now.timeIntervalSince(state.createdAt) * 1000), privacy: .public) reason=\(cleared, privacy: .public)")
+                chipProbeLogger.info("optimistic-cleared windowID=\(windowID, privacy: .public) predicted=\(state.status.rawValue, privacy: .public) ageMs=\(Int(age / .milliseconds(1)), privacy: .public) reason=\(cleared, privacy: .public)")
             }
             #endif
             return cleared == nil
@@ -606,6 +835,21 @@ final class AppRuntime: ObservableObject {
         if next != optimisticStatesByWindowID {
             optimisticStatesByWindowID = next
         }
+    }
+
+    private func activePredictionSuperseded(windowID: String, state: OptimisticWindowState, now: ContinuousClock.Instant) -> Bool {
+        guard state.status == .active, let actual = confirmedActiveWindow,
+              actual.id.rawValue != windowID,
+              let predicted = snapshot.windows[WindowID(rawValue: windowID)] else { return false }
+        if activeFocusPrediction?.windowID == predicted.id,
+           activeFocusPrediction?.retainsPrediction(afterObserving: actual.actionIdentity) == true {
+            return false
+        }
+        guard actual.sharesApplicationFocus(with: predicted) else { return true }
+        return OptimisticWindowState.supersededByActiveSibling(
+            windowID: windowID, state: state, now: now, optimisticStates: optimisticStatesByWindowID,
+            snapshot: snapshot, handoffGraceEnabled: Self.handoffActiveGraceEnabled
+        )
     }
 
     private static func optimisticConfirmed(predicted: WindowStatus, actual: WindowStatus) -> Bool {

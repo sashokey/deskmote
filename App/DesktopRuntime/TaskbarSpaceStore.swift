@@ -8,6 +8,7 @@ final class TaskbarSpaceStore: ObservableObject {
     private let activeSpaceChange = PassthroughSubject<Void, Never>()
     var activeSpaceChanges: AnyPublisher<Void, Never> { activeSpaceChange.eraseToAnyPublisher() }
     private let read: @Sendable ([WindowSpaceRequest], OperationCancellation) -> WindowSpaceSnapshot?
+    private let readTransfers: @Sendable ([WindowSpaceRequest], OperationCancellation) -> WindowSpaceSnapshot?
     private let notifications: NotificationCenter
     private let pollInterval: TimeInterval
     private let queue = DispatchQueue(label: "io.github.sashokey.deskmote.window-spaces", qos: .utility)
@@ -19,6 +20,7 @@ final class TaskbarSpaceStore: ObservableObject {
     private var utilityOnActiveSpace: (WindowID) -> Bool? = { _ in nil }
     private var revision: UInt64 = 0
     private var spaceRevision: UInt64 = 0
+    private var minimumProjectionRevision: UInt64 = 0
     private var invalidatedDisplays: Set<String> = []
     private var inFlight = false
     private var needsRefresh = false
@@ -26,6 +28,8 @@ final class TaskbarSpaceStore: ObservableObject {
     private var receivedInventory = false
     private var unchangedLayoutDeadline: ContinuousClock.Instant?
     private var attachedDisplays: Set<String>?
+    private var screenTopology: ScreenTopologySnapshot?
+    private var transferRead: Task<Void, Never>?
 
     init(read: (@Sendable ([WindowSpaceRequest]) -> WindowSpaceSnapshot?)? = nil,
          notifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
@@ -33,6 +37,10 @@ final class TaskbarSpaceStore: ObservableObject {
         self.read = { requests, cancellation in
             if let read { return read(requests) }
             return WindowSpaceObservation.capture(requests, cancellation: cancellation, mode: .live)
+        }
+        self.readTransfers = { requests, cancellation in
+            if let read { return read(requests) }
+            return WindowSpaceObservation.capture(requests, cancellation: cancellation, maximumDuration: 0.2)
         }
         self.notifications = notifications
         self.pollInterval = pollInterval
@@ -44,6 +52,7 @@ final class TaskbarSpaceStore: ObservableObject {
         isRunning = true
         self.utilityOnActiveSpace = utilityOnActiveSpace
         work.restart()
+        publish(snapshot.clearingConfirmedTransfers())
         let generation = work.generation
         spaceObserver = notifications.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
@@ -73,8 +82,14 @@ final class TaskbarSpaceStore: ObservableObject {
     }
 
     func stop() {
+        if isRunning {
+            spaceRevision &+= 1
+            minimumProjectionRevision = spaceRevision
+            unchangedLayoutDeadline = nil
+        }
         isRunning = false
         work.stop()
+        transferRead = nil
         if let spaceObserver { notifications.removeObserver(spaceObserver) }
         spaceObserver = nil
         subscriptions.removeAll()
@@ -94,25 +109,33 @@ final class TaskbarSpaceStore: ObservableObject {
     }
 
     func canUseProjection(on displayUUID: String?, renderedSpaceRevision: UInt64) -> Bool {
-        guard snapshot.permitsProjection(on: displayUUID) else { return false }
+        guard renderedSpaceRevision >= minimumProjectionRevision,
+              confirmedSpaceRevision >= minimumProjectionRevision,
+              snapshot.permitsProjection(on: displayUUID) else { return false }
         if renderedSpaceRevision == spaceRevision { return true }
         guard let displayUUID else { return invalidatedDisplays.isEmpty }
         return !invalidatedDisplays.contains(displayUUID) && !invalidatedDisplays.contains("Main")
     }
 
     private func activeSpaceChanged() {
+        transferRead?.cancel()
         invalidatedDisplays = Set(snapshot.layouts.keys)
         spaceRevision &+= 1
         unchangedLayoutDeadline = nil
-        publish(snapshot.recordingSpaceChange(requests: liveUtilityRequests(requests)))
         activeSpaceChange.send()
+        publish(snapshot.recordingSpaceChange(requests: liveUtilityRequests(requests)))
         refresh()
     }
 
     func updateTopology(_ snapshot: ScreenTopologySnapshot) {
+        if screenTopology != snapshot {
+            screenTopology = snapshot
+            publish(self.snapshot.clearingConfirmedTransfers())
+        }
         let identifiers = Set(snapshot.identifiedDisplayUUIDs)
         attachedDisplays = snapshot.physicalDisplayCount > 0 &&
             identifiers.count == snapshot.physicalDisplayCount ? identifiers : nil
+        beginTransferRead(self.snapshot.transfers(in: requests, attachedDisplays: attachedDisplays))
         refresh()
     }
 
@@ -128,11 +151,70 @@ final class TaskbarSpaceStore: ObservableObject {
                 isOnDesktop: item.isOnDesktop, displayUUID: item.displayUUID, isUtility: isUtility)
         }
         guard !receivedInventory || next != requests else { return }
+        let previous = requests
+        let hadInventory = receivedInventory
+        let oldTransfers = hadInventory ? snapshot.transfers(in: previous, attachedDisplays: attachedDisplays) : []
         receivedInventory = true
         requests = next
-        publish(snapshot.updating(with: nil, requests: liveUtilityRequests(next),
-                                   afterSpaceChange: confirmedSpaceRevision != spaceRevision))
+        let updated = snapshot.updating(with: nil, requests: liveUtilityRequests(next),
+                                        afterSpaceChange: confirmedSpaceRevision != spaceRevision)
+        publish(updated)
+        let transfers = updated.transfers(in: next, attachedDisplays: attachedDisplays)
+        if transfers != oldTransfers {
+            beginTransferRead(transfers)
+            let moved = Set(transfers.filter { !oldTransfers.contains($0) }.map(\.identity))
+            if hadInventory, !inFlight, !updated.layouts.isEmpty, confirmedSpaceRevision == spaceRevision, !moved.isEmpty,
+               previous.filter({ !moved.contains($0.identity) }) == next.filter({ !moved.contains($0.identity) }) {
+                return
+            }
+        }
         refresh()
+    }
+
+    private func beginTransferRead(_ requests: [WindowSpaceRequest]) {
+        transferRead?.cancel()
+        transferRead = nil
+        guard !requests.isEmpty, confirmedSpaceRevision == spaceRevision else { return }
+        let spaceRevision = spaceRevision
+        let startingLayouts = snapshot.layouts
+        let read = readTransfers
+        transferRead = work.launch(priority: .userInitiated) { [weak self] generation in
+            var outstanding = requests
+            var layouts = startingLayouts
+            for delay in [Duration.zero, .milliseconds(80), .milliseconds(160)] {
+                if delay > .zero {
+                    do { try await Task.sleep(for: delay) }
+                    catch { return }
+                }
+                let pending = outstanding
+                let expectedLayouts = layouts
+                let cancellation = OperationCancellation()
+                let observation = await AsyncWorkScope.performBlocking(cancellation: cancellation) {
+                    read(pending, cancellation)
+                } ?? nil
+                let next = await MainActor.run { [weak self] () -> ([WindowSpaceRequest], [String: SpaceLayoutSnapshot])? in
+                    guard let self, !Task.isCancelled, self.work.isCurrent(generation),
+                          self.spaceRevision == spaceRevision, self.snapshot.layouts == expectedLayouts else { return nil }
+                    let pending = self.snapshot.transfers(in: pending)
+                    guard !pending.isEmpty, let observation else { return (pending, expectedLayouts) }
+                    guard observation.layouts == expectedLayouts || expectedLayouts.isEmpty else {
+                        self.refresh()
+                        return nil
+                    }
+                    let updated = self.snapshot.updating(with: observation, requests: self.liveUtilityRequests(self.requests),
+                                                         attachedDisplays: self.attachedDisplays, targetedTransferRead: true)
+                    let remaining = updated.transfers(in: pending)
+                    if remaining != pending {
+                        if self.inFlight { self.refresh() }
+                        self.publish(updated)
+                        return (remaining, updated.layouts)
+                    }
+                    return (remaining, expectedLayouts)
+                }
+                guard let next, !next.0.isEmpty else { return }
+                (outstanding, layouts) = next
+            }
+        }
     }
 
     private func beginRead() {
@@ -163,6 +245,7 @@ final class TaskbarSpaceStore: ObservableObject {
 
     private func applyRead(_ observation: WindowSpaceSnapshot?, requests: [WindowSpaceRequest], spaceRevision: UInt64) {
         let changed = confirmedSpaceRevision != spaceRevision
+        let priorLayouts = snapshot.layouts
         if changed, let observation, !observation.layouts.isEmpty, observation.layouts == snapshot.layouts {
             if let deadline = unchangedLayoutDeadline {
                 guard ContinuousClock.now >= deadline else { return }
@@ -187,6 +270,9 @@ final class TaskbarSpaceStore: ObservableObject {
                                    afterSpaceChange: changed, attachedDisplays: attachedDisplays))
         if changed, let observation, !observation.layouts.isEmpty {
             confirmedSpaceRevision = spaceRevision
+        }
+        if priorLayouts != snapshot.layouts || (changed && confirmedSpaceRevision == spaceRevision) {
+            beginTransferRead(snapshot.transfers(in: requests, attachedDisplays: attachedDisplays))
         }
     }
 

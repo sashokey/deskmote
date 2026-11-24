@@ -12,7 +12,8 @@ enum LabMode: String {
 }
 
 enum WindowLabInputError: Error {
-    case invalidMode, invalidSelectorArguments, invalidScenarioName, invalidGeometry, invalidScenario, duplicateWindowID
+    case invalidMode, invalidSelectorArguments, unexpectedArguments(LabMode)
+    case invalidScenarioName, invalidGeometry, invalidScenario, duplicateWindowID
 }
 
 enum WindowLabInput {
@@ -49,6 +50,37 @@ enum WindowLabInput {
         }
     }
 
+    static func analyzeRestoration(
+        _ observations: [SystemObservation], for record: WindowRecord, using identity: WindowIdentityEngine,
+        confirmsWindow: (CGWindowID) -> Bool
+    ) -> (observations: [AnalyzedObservation], match: AnalyzedObservation?) {
+        func currentNumber(_ observation: SystemObservation) -> CGWindowID? {
+            guard observation.source == .coreGraphics, observation.kind != .disappeared, !observation.isMinimized,
+                  observation.pid == record.pid, let number = observation.cgWindowID, number != kCGNullWindowID else {
+                return nil
+            }
+            return number
+        }
+        let confirmed = Set(observations.compactMap(currentNumber)).sorted().filter(confirmsWindow)
+        let restoredNumber = confirmed.count == 1 ? confirmed.first : nil
+        let oldNumber: CGWindowID?
+        if let restoredNumber, let restored = observations.first(where: { currentNumber($0) == restoredNumber }),
+           identity.bindConfirmedRestoration(observation: restored, of: record) {
+            oldNumber = record.cgWindowID
+        } else {
+            oldNumber = nil
+        }
+        let analyzed = observations.compactMap { observation -> AnalyzedObservation? in
+            if let oldNumber, observation.source == .accessibility, observation.kind == .disappeared,
+               observation.pid == record.pid, observation.cgWindowID == oldNumber {
+                return nil
+            }
+            return AnalyzedObservation(observation: observation, identity: identity.identify(observation: observation))
+        }
+        let match = restoredWindow(in: analyzed, identity: record.id, pid: record.pid) { $0 == restoredNumber }
+        return (analyzed, match)
+    }
+
     static func diagnosticLine(_ value: String) -> String {
         let singleLine = value.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).joined(separator: " ")
         return singleLine.unicodeScalars.map { scalar in
@@ -72,8 +104,13 @@ enum WindowLabInput {
 
     static func mode(_ arguments: [String]) throws -> LabMode {
         guard let value = arguments.first, let mode = LabMode(rawValue: value) else { throw WindowLabInputError.invalidMode }
-        if (mode == .closeTarget || mode == .minimizeRestore), arguments.count > 2 {
-            throw WindowLabInputError.invalidSelectorArguments
+        switch mode {
+        case .observe:
+            guard arguments.count == 1 else { throw WindowLabInputError.unexpectedArguments(mode) }
+        case .closeTarget, .minimizeRestore:
+            guard arguments.count <= 2 else { throw WindowLabInputError.invalidSelectorArguments }
+        case .replay, .placementReplay, .transitionReplay:
+            guard arguments.count <= 2 else { throw WindowLabInputError.unexpectedArguments(mode) }
         }
         return mode
     }

@@ -1,31 +1,30 @@
-import AppKit
-import Combine
 import XCTest
 
 @MainActor
-final class AppSettingsStoreTests: XCTestCase {
-    func testLoginChoiceDefaultsToOffAndPersistsBothValues() {
-        let defaults = makeDefaults()
-        let store = AppSettingsStore(defaults: defaults)
-        XCTAssertFalse(store.launchAtLogin)
-        store.setLaunchAtLogin(true)
-        XCTAssertTrue(AppSettingsStore(defaults: defaults).launchAtLogin)
-        store.setLaunchAtLogin(false)
-        XCTAssertFalse(AppSettingsStore(defaults: defaults).launchAtLogin)
-    }
+final class LegacyLaunchSettingsTests: XCTestCase {
+    func testSelectingLoginRechecksForApprovalAfterPublishingAnEnabledState() async throws {
+        let service = StoreRegressionLoginService()
+        let coordinator = SettingsCoordinator(launchAtLoginService: service)
+        let initialAccepted = await coordinator.refreshLaunchAtLoginState()
+        XCTAssertTrue(initialAccepted)
+        XCTAssertEqual(coordinator.launchAtLoginState, .on)
 
-    func testUnchangedValuesDoNotPublishAnotherUpdate() {
-        let store = AppSettingsStore(defaults: makeDefaults())
-        var loginChoices: [Bool] = []
-        let loginSubscription = store.$launchAtLogin.dropFirst().sink { loginChoices.append($0) }
-        store.setLaunchAtLogin(store.launchAtLogin)
-        XCTAssertTrue(loginChoices.isEmpty)
-        withExtendedLifetime(loginSubscription) {}
+        service.state = .requiresApproval
+        let result = await coordinator.selectLaunchAtLogin()
+        try result.get()
+        XCTAssertEqual(coordinator.launchAtLoginState, .requiresApproval)
+        XCTAssertTrue(service.registrationRequests.isEmpty)
+        XCTAssertEqual(service.settingsOpens, 1)
     }
+}
 
-    private func makeDefaults() -> UserDefaults {
-        let suite = "DeskMote.AppSettingsStoreTests.\(UUID().uuidString)"
-        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
-        return UserDefaults(suiteName: suite)!
-    }
+@MainActor
+private final class StoreRegressionLoginService: LaunchAtLoginServicing {
+    var state: LaunchAtLoginState = .on
+    private(set) var registrationRequests: [Bool] = []
+    private(set) var settingsOpens = 0
+
+    func currentState() async -> LaunchAtLoginState { state }
+    func setEnabled(_ enabled: Bool) throws { registrationRequests.append(enabled) }
+    func openSystemSettings() { settingsOpens += 1 }
 }

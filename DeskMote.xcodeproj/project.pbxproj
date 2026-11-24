@@ -42,9 +42,7 @@
 		B10000000000000000000122 /* TaskbarDisplayCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000121 /* TaskbarDisplayCoordinator.swift */; };
 		A00000000000000000005011 /* WindowOrderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000005010 /* WindowOrderStore.swift */; };
 		A00000000000000000005012 /* WindowOrderStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000005010 /* WindowOrderStore.swift */; };
-		A00000000000000000008011 /* UserSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000008010 /* UserSettingsStore.swift */; };
 		A00000000000000000008021 /* MenuBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000008020 /* MenuBarController.swift */; };
-		A00000000000000000008031 /* UserSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000008010 /* UserSettingsStore.swift */; };
 		A00000000000000000008041 /* UserSettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000008040 /* UserSettingsStoreTests.swift */; };
 		A00000000000000000009011 /* LoginItemService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000009010 /* LoginItemService.swift */; };
 		A00000000000000000009031 /* PanelVisibilityRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000009030 /* PanelVisibilityRules.swift */; };
@@ -102,9 +100,7 @@
 		C90000000000000000000004 /* AXHandleCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C90000000000000000000003 /* AXHandleCache.swift */; };
 		C9000000000000000000000B /* AXHandleCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = C90000000000000000000003 /* AXHandleCache.swift */; };
 		A00000000000000000001030 /* WindowEligibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000061 /* WindowEligibility.swift */; };
-		A00000000000000000001032 /* ReplayAdmission.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000062 /* ReplayAdmission.swift */; };
 		D419034221B622EE60894AB0 /* WindowLabInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 284869EFF1B89F353AFF5DDE /* WindowLabInput.swift */; };
-		A00000000000000000001033 /* ReplayAdmission.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000062 /* ReplayAdmission.swift */; };
 		1349CD49997A54A4413BE837 /* WindowLabInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 284869EFF1B89F353AFF5DDE /* WindowLabInput.swift */; };
 		A00000000000000000001034 /* WindowFrameMatching.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000063 /* WindowFrameMatching.swift */; };
 		A00000000000000000001035 /* WindowFrameMatching.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000063 /* WindowFrameMatching.swift */; };
@@ -318,7 +314,6 @@
 		32273939B976F1FCF388BCEF = {isa = PBXBuildFile; fileRef = 850966318312D06717F997D9; };
 		A9E872FD40EA610B434DE40F = {isa = PBXBuildFile; fileRef = FDA9C291AB216308A4E9F9B6; };
 		EA413F427BB25B2642B9C1E9 = {isa = PBXBuildFile; fileRef = B22AB8D0E817646DD051407A; };
-		A1FC686B4764680B8B94CB93 = {isa = PBXBuildFile; fileRef = F1A25C0D0B507F244190D02F; };
 		7C03119E9954E36991B186EE = {isa = PBXBuildFile; fileRef = F95B53009D4BA51EFF2D5267; };
 		F9F5BA976CC7E95FF95B74E9 = {isa = PBXBuildFile; fileRef = 6F4D3EC223B8A6F284C3BE6B; };
 		C35FE0C403F83A75A5CEBDD9 = {isa = PBXBuildFile; fileRef = 22A2BCA76EB5059C51042AAB; };
@@ -1221,7 +1216,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		3F97EE07A0B13A9102A21BAA = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A1FC686B4764680B8B94CB93,); runOnlyForDeploymentPostprocessing = 0; };
+		3F97EE07A0B13A9102A21BAA = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		A703775A8249F1D39D14675D = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 
@@ -1277,7 +1272,6 @@
 					D90000000000000000000104 /* DisplayTopologyRefreshController.swift in Sources */,
 					A00000000000000000005011 /* WindowOrderStore.swift in Sources */,
 					A00000000000000000009751 /* TaskbarPanel.swift in Sources */,
-					A00000000000000000008011 /* UserSettingsStore.swift in Sources */,
 					F1B0000000000000000000C3 /* ScreenIdentity.swift in Sources */,
 					A00000000000000000009011 /* LoginItemService.swift in Sources */,
 					A00000000000000000009031 /* PanelVisibilityRules.swift in Sources */,
@@ -1451,7 +1445,6 @@
 				A0000000000000000000B042 /* AccessRecovery.swift in Sources */,
 				A0000000000000000000B052 /* AccessibilityTrust.swift in Sources */,
 				A0000000000000000000B062 /* AccessibilitySetupTests.swift in Sources */,
-				A00000000000000000008031 /* UserSettingsStore.swift in Sources */,
 				D20000000000000000000013 /* AppSettings.swift in Sources */,
 				D20000000000000000000067 /* HoverDiagnostics.swift in Sources */,
 				D20000000000000000000017 /* AppSettingsTests.swift in Sources */,
@@ -1535,7 +1528,6 @@
 					A00000000000000000000C01 /* PanelHostTests.swift in Sources */,
 					A0000000000000000000ACC1 /* TaskbarPanelGeometryTests.swift in Sources */,
 					A00000000000000000001031 /* WindowEligibility.swift in Sources */,
-					A00000000000000000001033 /* ReplayAdmission.swift in Sources */,
 					1349CD49997A54A4413BE837 /* WindowLabInput.swift in Sources */,
 					1F02A8BFECD24FDA9B548B44 /* AXObservationSource.swift in Sources */,
 					69B1F6209FC34B1EB13A0641 /* CGObservationSource.swift in Sources */,

@@ -37,7 +37,7 @@
       "label": "restored",
       "observations": [
         {
-          "kind": "appeared",
+          "kind": "restored",
           "source": "coreGraphics",
           "pid": 1001,
           "cgWindowID": 5009,

@@ -101,6 +101,38 @@ final class ApplicationOwnershipTests: XCTestCase {
         XCTAssertEqual(operations.withLock { $0 }, 0)
     }
 
+    func testOwnershipCancellationDuringHelperSignaturePreventsHostSignatureLookup() {
+        let applications = [helper, host]
+        let signatures = Mutex<[pid_t]>([])
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let result = Mutex<[pid_t]>([])
+        let cancellation = OperationCancellation()
+        let ownership = ApplicationOwnership(applications: { applications }, identity: { pid, identifier in
+            .init(pid: pid, startTimeSec: 10, startTimeUsec: 1, bundleID: identifier)
+        }, signingTeam: { pid, _ in
+            signatures.withLock { $0.append(pid) }
+            if pid == 31 {
+                entered.signal()
+                guard release.wait(timeout: .now() + 5) == .success else { return nil }
+            }
+            return "VENDOR"
+        })
+
+        DispatchQueue.global().async {
+            let owners = ownership.owners(for: [31], cancellation: cancellation)
+            result.withLock { $0 = Array(owners.keys) }
+            finished.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        cancellation.cancel()
+        release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(signatures.withLock { $0 }, [31])
+        XCTAssertTrue(result.withLock { $0.isEmpty })
+    }
+
     func testMissingOrDifferentVerifiedSignersRejectTheBinding() {
         for teams: [pid_t: String] in [[:], [30: "VENDOR"], [31: "VENDOR"], [30: "OTHER", 31: "VENDOR"]] {
             XCTAssertNil(resolver([helper, host], teams: teams).owner(for: 31))
@@ -164,6 +196,31 @@ final class ApplicationOwnershipTests: XCTestCase {
         let parent = application(30, root: hostURL.path, identifier: "test.host")
         let embedded = application(31, root: link.path, identifier: "test.helper", helper: true)
         XCTAssertNil(resolver([embedded, parent]).owner(for: 31))
+    }
+
+    func testAliasToAnEmbeddedHelperRequiresVerifiedHostOwnership() throws {
+        let directory = TestFileSystem.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let hostURL = directory.appendingPathComponent("Host.app")
+        let helperURL = hostURL.appendingPathComponent("Contents/Helpers/Renderer.app")
+        let alias = directory.appendingPathComponent("Alias.app")
+        try FileManager.default.createDirectory(at: helperURL.appendingPathComponent("Contents/MacOS"),
+                                                withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: hostURL.appendingPathComponent("Contents/MacOS"),
+                                                withIntermediateDirectories: true)
+        try Data().write(to: helperURL.appendingPathComponent("Contents/MacOS/Executable"))
+        try Data().write(to: hostURL.appendingPathComponent("Contents/MacOS/Executable"))
+        let hostInfo: [String: Any] = ["CFBundlePackageType": "APPL", "CFBundleIdentifier": "test.host"]
+        try PropertyListSerialization.data(fromPropertyList: hostInfo, format: .xml, options: 0)
+            .write(to: hostURL.appendingPathComponent("Contents/Info.plist"))
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: helperURL)
+        let parent = application(30, root: hostURL.path, identifier: "test.host")
+        let embedded = application(31, root: alias.path, identifier: "test.helper", helper: true)
+
+        XCTAssertTrue(embedded.application.isEmbeddedHelper)
+        XCTAssertFalse(embedded.application.canOwnTaskbarWindows)
+        XCTAssertEqual(resolver([embedded, parent]).owner(for: 31)?.identity.pid, 30)
+        XCTAssertNil(resolver([embedded, parent], teams: [30: "VENDOR", 31: "OTHER"]).owner(for: 31))
     }
 
     func testStandaloneApplicationsDoNotTriggerSigningWork() {

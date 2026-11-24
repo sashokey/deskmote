@@ -125,25 +125,43 @@ struct AbsentSeatProbeEvidence: Sendable {
 }
 
 protocol AbsentSeatProbing: Sendable {
-    func probe(_ request: AbsentSeatProbeRequest, messagingTimeout: TimeInterval) -> AbsentSeatProbeEvidence
+    func probe(_ request: AbsentSeatProbeRequest, messagingTimeout: TimeInterval,
+               cancellation: OperationCancellation) -> AbsentSeatProbeEvidence?
 }
 
 struct LiveAbsentSeatProber: AbsentSeatProbing {
-    func probe(_ request: AbsentSeatProbeRequest, messagingTimeout: TimeInterval) -> AbsentSeatProbeEvidence {
-        AXUIElementSetMessagingTimeout(request.element.e, Float(messagingTimeout))
-        var value: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(request.element.e, kAXMinimizedAttribute as CFString, &value)
+    private let accessibility: any AccessibilityOperations
+    private let windowSpaceIDs: @Sendable (CGWindowID) -> [Int]?
+    private let currentSpaceIDs: @Sendable () -> Set<Int>?
+
+    init(accessibility: any AccessibilityOperations = NativeAccessibilityOperations(),
+         windowSpaceIDs: @escaping @Sendable (CGWindowID) -> [Int]? = LiveAbsentSeatProber.spaceIDs(of:),
+         currentSpaceIDs: @escaping @Sendable () -> Set<Int>? = LiveAbsentSeatProber.readCurrentSpaceIDs) {
+        self.accessibility = accessibility
+        self.windowSpaceIDs = windowSpaceIDs
+        self.currentSpaceIDs = currentSpaceIDs
+    }
+
+    func probe(_ request: AbsentSeatProbeRequest, messagingTimeout: TimeInterval,
+               cancellation: OperationCancellation) -> AbsentSeatProbeEvidence? {
+        guard !cancellation.isCancelled else { return nil }
+        _ = accessibility.setTimeout(request.element.e, Float(messagingTimeout))
+        guard !cancellation.isCancelled else { return nil }
+        let (error, value) = accessibility.copy(request.element.e, kAXMinimizedAttribute as CFString)
         let element: AbsentSeatReleaseDecision.ElementState
         switch error {
         case .success: element = .alive(minimized: value as? Bool)
         case .invalidUIElement: element = .dead
         default: element = .unknown(errorCode: error.rawValue)
         }
+        guard !cancellation.isCancelled else { return nil }
+        let memberships = windowSpaceIDs(request.cgWindowID)
+        guard !cancellation.isCancelled else { return nil }
         return AbsentSeatProbeEvidence(
             request: request,
             element: element,
-            windowSpaceIDs: Self.spaceIDs(of: request.cgWindowID),
-            currentSpaceIDs: Self.currentSpaceIDs()
+            windowSpaceIDs: memberships,
+            currentSpaceIDs: currentSpaceIDs()
         )
     }
 
@@ -151,7 +169,7 @@ struct LiveAbsentSeatProber: AbsentSeatProbing {
         WindowSpaceMembershipReader.spaceIDs(forWindowNumber: Int(cgWindowID))
     }
 
-    private static func currentSpaceIDs() -> Set<Int>? {
+    private static func readCurrentSpaceIDs() -> Set<Int>? {
         guard let layouts = ManagedSpaceLayoutReader.layouts(), !layouts.isEmpty else { return nil }
         return Set(layouts.values.map(\.currentSpaceID))
     }

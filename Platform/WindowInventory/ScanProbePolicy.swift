@@ -7,12 +7,14 @@ enum ScanProbeGateDecision {
     struct Memo: Equatable {
         var identity: ScanAdmissionDecision.ProcessIdentity
         var lastCGIDs: Set<CGWindowID>
+        var lastCGParents: [CGWindowID: CGWindowID] = [:]
         var verdictWasNoEligible: Bool
     }
 
     struct Input {
         var captureFailed: Bool
         var cgWindowIDs: Set<CGWindowID>
+        var cgParents: [CGWindowID: CGWindowID] = [:]
         var memo: Memo?
         var currentIdentity: ScanAdmissionDecision.ProcessIdentity
         var workspaceDirty: Bool
@@ -26,6 +28,7 @@ enum ScanProbeGateDecision {
         case noMemo
         case identityChanged
         case cgSetChanged
+        case cgParentsChanged
         case memoNotConclusive
     }
 
@@ -50,10 +53,16 @@ enum ScanProbeGateDecision {
             .probe(.identityChanged)
         case let memo? where memo.lastCGIDs != input.cgWindowIDs:
             .probe(.cgSetChanged)
+        case let memo? where memo.lastCGParents != input.cgParents:
+            .probe(.cgParentsChanged)
         case let memo? where !memo.verdictWasNoEligible:
             .probe(.memoNotConclusive)
         case .some:
             .skipMemoized
         }
+    }
+
+    static func parents(for windowIDs: Set<CGWindowID>, in parents: [CGWindowID: CGWindowID]) -> [CGWindowID: CGWindowID] {
+        windowIDs.reduce(into: [:]) { evidence, id in evidence[id] = parents[id] }
     }
 }

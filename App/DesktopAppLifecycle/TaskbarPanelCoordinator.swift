@@ -21,12 +21,13 @@ final class PanelCoordinator: NSObject {
     #if DEBUG
     let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "dock-panel")
     #endif
-    var fullscreenReconcileTimer: Timer?
     var fullscreenProbeWorker: FullscreenProbeWorker?
     var fullscreenFrameProvider: (() -> CGRect?)?
+    var fullscreenDisplayUUIDProvider: (() -> String?)?
     var fullscreenSpaceProvider: (@Sendable (String) -> Bool?)?
     var fullscreenCGWindowsProvider: (() -> [[String: Any]]?)?
-    var workspaceObserverTokens: [NSObjectProtocol] = []
+    var fullscreenCGWindowObservationProvider: ((CGWindowID) -> (isOnscreen: Bool, bounds: CGRect?)?)?
+    var fullscreenCGConfirmation: FullscreenCGConfirmation?
     var fullscreenProbeGeneration: UInt64 = 0
     var fullscreenSpaceHoldGeneration: UInt64 = 0
     var fullscreenSpaceHold: FullscreenSpaceHold?
@@ -49,7 +50,7 @@ final class PanelCoordinator: NSObject {
 
     let unitPlacement: TaskbarUnitPlacement
     let overlaySpaceHost: OverlaySpaceHost?
-    let usesSharedFullscreenMonitor: Bool
+    let fullscreenSLSVerdictEnabled: Bool
     let displayTopologyStore: DisplayTopologyStore
     let screenProvider: @MainActor () -> [NSScreen]
     let mainScreenProvider: @MainActor () -> NSScreen?
@@ -64,7 +65,7 @@ final class PanelCoordinator: NSObject {
          stripOrderStore: StripOrderStore,
          displayTopologyStore: DisplayTopologyStore,
          spaceStore: TaskbarSpaceStore = TaskbarSpaceStore(),
-         usesSharedFullscreenMonitor: Bool = false,
+         fullscreenSLSVerdictEnabled: Bool = DebugSwitch.fullscreenSlsVerdict.isEnabled(in: ProcessInfo.processInfo.environment),
          screenProvider: @escaping @MainActor () -> [NSScreen] = { NSScreen.screens },
          mainScreenProvider: @escaping @MainActor () -> NSScreen? = { NSScreen.main }) {
         self.unitPlacement = placement
@@ -73,13 +74,14 @@ final class PanelCoordinator: NSObject {
         self.stripOrderStore = stripOrderStore
         self.displayTopologyStore = displayTopologyStore
         self.spaceStore = spaceStore
-        self.usesSharedFullscreenMonitor = usesSharedFullscreenMonitor
+        self.fullscreenSLSVerdictEnabled = fullscreenSLSVerdictEnabled
         self.screenProvider = screenProvider
         self.mainScreenProvider = mainScreenProvider
         super.init()
     }
 
     func start() -> Bool {
+        guard !isSuspendedForPermissionLoss, dockPanel == nil else { return false }
         guard setupDockPanel() else { return false }
         presentInitialPanels()
         pinResidentPanelsIfNeeded()
@@ -90,13 +92,9 @@ final class PanelCoordinator: NSObject {
 
     isolated deinit {
         fullscreenProbeWorker?.stop()
-        fullscreenReconcileTimer?.invalidate()
         fullscreenSpaceHoldTimer?.invalidate()
         overlayWindowWatchTimer?.invalidate()
         taskbarView?.taskbarContent.prepareForHiding()
-        workspaceObserverTokens.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
-        NotificationCenter.default.removeObserver(self)
     }
 
     func tearDown() {
@@ -105,19 +103,19 @@ final class PanelCoordinator: NSObject {
         fullscreenProbeGeneration &+= 1
         fullscreenProbeWorker?.stop()
         fullscreenProbeWorker = nil
-        fullscreenReconcileTimer?.invalidate()
-        fullscreenReconcileTimer = nil
         fullscreenSpaceHoldTimer?.invalidate()
         fullscreenSpaceHoldTimer = nil
         fullscreenSpaceHold = nil
+        fullscreenCGConfirmation = nil
         endOverlayWindowWatch()
+        displayTopologySubscription?.cancel()
+        displayTopologySubscription = nil
         taskbarPresenter?.setPanelVisible(false)
-        taskbarView?.taskbarContent.prepareForHiding()
+        orderDockSurfaceOut()
         taskbarPresenter = nil
         dockContentHost = nil
         taskbarView = nil
         dockPanel?.contentView = NSView()
-        dockPanel?.orderOut(nil)
         dockPanel?.close()
         dockPanel = nil
     }
@@ -175,8 +173,6 @@ final class PanelCoordinator: NSObject {
     private static var quartzPrimaryScreenHeight: CGFloat {
         NSScreen.screens.first?.frame.maxY ?? NSScreen.main?.frame.maxY ?? 0
     }
-
-    static let slsVerdictEnabled = DebugSwitch.fullscreenSlsVerdict.isEnabled(in: ProcessInfo.processInfo.environment)
 
     var fixedDisplayUUID: String? {
         switch unitPlacement {

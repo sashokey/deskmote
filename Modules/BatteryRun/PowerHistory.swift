@@ -5,6 +5,7 @@ struct PowerHistory {
         let date: Date
         let onBattery: Bool
         let percent: Double?
+        let isFullWake: Bool
 
         var sample: BatterySample? {
             percent.map { BatterySample(date: date, percent: $0, onBattery: onBattery) }
@@ -14,21 +15,24 @@ struct PowerHistory {
     private static let maximumStartupLoggingDelay: TimeInterval = 120
     private static let maximumUnplugUncertainty: TimeInterval = 60
     private var observations: [PowerObservation] = []
+    private var unmeasuredFullWakeIndices: [Date: Int] = [:]
     private var lastWake: (date: Date, firstObservationAfterWake: Int, observationIndex: Int?)?
-    private var lastSleep: Date?
+    private var lastSleepOrDarkWake: Date?
     private var startups: [(date: Date, observation: PowerObservation?)] = []
     private var firstRecordDate: Date?
     private var lastRecordDate: Date?
+    private var journalEnd: Date?
 
-    var hasRecords: Bool { !observations.isEmpty || lastWake != nil || lastSleep != nil || !startups.isEmpty }
+    var hasRecords: Bool { !observations.isEmpty || lastWake != nil || lastSleepOrDarkWake != nil || !startups.isEmpty }
 
-    func covers(_ date: Date) -> Bool {
-        guard let firstRecordDate, let lastRecordDate else { return false }
-        return firstRecordDate <= date && lastRecordDate > date
+    func covers(from checkpoint: Date, through resumed: Date) -> Bool {
+        guard let firstRecordDate, let journalEnd else { return false }
+        return firstRecordDate <= Self.logSecond(containing: checkpoint) &&
+            journalEnd > Self.logSecond(containing: resumed)
     }
 
-    func hasRecords(after date: Date) -> Bool {
-        lastRecordDate.map { $0 > date } == true
+    func awaitsFullWake(since bootDate: Date?) -> Bool {
+        lastWake == nil && lastSleepOrDarkWake.map { $0 >= (bootDate ?? .distantPast) } == true
     }
 
     func hasRecords(atOrAfter date: Date) -> Bool {
@@ -58,27 +62,35 @@ struct PowerHistory {
                 (message.hasPrefix("Entering Sleep state") || message.hasPrefix("Entering DarkWake state"))
             let isSummary = event.first == "Assertions" && message.hasPrefix("Summary- ")
             let isDarkWake = event.first == "DarkWake" && message.hasPrefix("DarkWake from ")
-            let isJournalRecord = isStartup || isWake || isSleep || isSummary || isDarkWake
+            let isWakeRequest = event.first == "Wake" && message.split(maxSplits: 1, whereSeparator: \.isWhitespace).first == "Requests"
+            let isJournalRecord = isStartup || isWake || isSleep || isSummary || isDarkWake || isWakeRequest
             if date < lastDate {
                 guard isJournalRecord else { continue }
                 observations.removeAll(keepingCapacity: true)
+                unmeasuredFullWakeIndices.removeAll(keepingCapacity: true)
                 startups.removeAll(keepingCapacity: true)
                 lastWake = nil
-                lastSleep = nil
+                lastSleepOrDarkWake = nil
                 firstRecordDate = nil
                 lastRecordDate = nil
+                journalEnd = nil
                 lastDate = .distantPast
             }
             guard date <= now else {
                 if isJournalRecord { lastDate = date }
                 continue
             }
+            if isWakeRequest {
+                journalEnd = date
+                lastDate = date
+                continue
+            }
             if isWake {
                 lastWake = (date, observations.count, nil)
                 lastDate = date
                 recordDate(date)
-            } else if isSleep {
-                lastSleep = date
+            } else if isSleep || isDarkWake {
+                lastSleepOrDarkWake = date
                 lastWake = nil
                 lastDate = date
                 recordDate(date)
@@ -96,13 +108,19 @@ struct PowerHistory {
             let powerMessage = String(message)
             guard let match = expression.firstMatch(in: powerMessage,
                 range: NSRange(powerMessage.startIndex..., in: powerMessage)),
-                let sourceRange = Range(match.range(at: 1), in: powerMessage) else { continue }
+                let sourceRange = Range(match.range(at: 1), in: powerMessage) else {
+                if isWake { recordUnmeasuredFullWake(at: date) }
+                continue
+            }
             let percent = Range(match.range(at: 2), in: powerMessage)
                 .flatMap { Double(powerMessage[$0]) }
                 .flatMap { (0...100).contains($0) ? $0 : nil }
             let observation = PowerObservation(date: date, onBattery: powerMessage[sourceRange].lowercased() == "batt",
-                                               percent: percent)
-            if isWake { lastWake = (date, observations.count, observations.count) }
+                                               percent: percent, isFullWake: isWake)
+            if isWake {
+                if observation.onBattery && percent == nil { recordUnmeasuredFullWake(at: date) }
+                lastWake = (date, observations.count, observations.count)
+            }
             if let startup = startups.indices.last, startups[startup].date == date, startups[startup].observation == nil {
                 startups[startup].observation = observation
             }
@@ -115,30 +133,49 @@ struct PowerHistory {
     private mutating func recordDate(_ date: Date) {
         if firstRecordDate == nil { firstRecordDate = date }
         lastRecordDate = date
+        journalEnd = date
+    }
+
+    private mutating func recordUnmeasuredFullWake(at date: Date) {
+        if unmeasuredFullWakeIndices[date] == nil { unmeasuredFullWakeIndices[date] = observations.count }
+    }
+
+    private func firstObservationAfterFullWake(for anchor: BatterySample?, requiresFullWake: Bool) -> Int? {
+        guard requiresFullWake, let anchor else { return nil }
+        if let measured = observations.firstIndex(where: { $0.isFullWake && Self.matches($0.sample, anchor: anchor) }) {
+            return measured + 1
+        }
+        return unmeasuredFullWakeIndices[Self.logSecond(containing: anchor.date)]
     }
 
     func recoverForecast(
-        at current: BatterySample, bootDate: Date?, historyFloor: Date?, forecastFloor: Date?, saved: BatterySample?
+        at current: BatterySample, bootDate: Date?, historyFloor: Date?, forecastFloor: Date?, saved: BatterySample?,
+        savedRequiresFullWakeMatch: Bool = false
     ) -> (start: BatterySample?, floor: Date?) {
         let earliestBoot = bootDate ?? startups.last?.date ?? .distantPast
         let evidenceFloor = max(historyFloor.map(Self.logSecond(containing:)) ?? .distantPast, earliestBoot)
         var startFloor = max(historyFloor ?? .distantPast, earliestBoot, forecastFloor ?? .distantPast,
-                             lastSleep ?? .distantPast, lastWake?.date ?? .distantPast)
+                             lastSleepOrDarkWake ?? .distantPast, lastWake?.date ?? .distantPast)
         var historicalStart = bootDate.flatMap(startupBaseline(at:))
         var previous: PowerObservation?
         var lastBatteryReading: BatterySample?
         var usableSaved = saved
         var sawSaved = false
+        let afterFullWake = firstObservationAfterFullWake(for: saved, requiresFullWake: savedRequiresFullWakeMatch)
         for (index, observation) in observations.enumerated() where observation.date >= evidenceFloor {
+            if let afterFullWake, index >= afterFullWake, !sawSaved {
+                sawSaved = true
+                lastBatteryReading = usableSaved
+                previous = nil
+            }
             let sample = observation.sample
             let increased = sample.flatMap { reading in lastBatteryReading.map { reading.hasMoreCharge(than: $0) } } == true
-            let savedSecond = usableSaved.map { PowerHistory.logSecond(containing: $0.date) }
-            if let sample, let saved = usableSaved, sample.onBattery, sample.date == savedSecond,
-               !sample.hasMoreCharge(than: saved), !saved.hasMoreCharge(than: sample) { sawSaved = true }
+            if let saved = usableSaved, !savedRequiresFullWakeMatch,
+               Self.matches(sample, anchor: saved) { sawSaved = true }
             if !observation.onBattery || increased {
                 startFloor = max(startFloor, observation.date)
                 historicalStart = nil
-                if let saved = usableSaved, observation.date > saved.date || (observation.date == savedSecond && sawSaved) {
+                if let saved = usableSaved, Self.follows(observation.date, anchor: saved, matched: sawSaved) {
                     usableSaved = nil
                 }
             }
@@ -159,10 +196,14 @@ struct PowerHistory {
             }
             previous = observation
         }
+        if afterFullWake != nil, !sawSaved {
+            lastBatteryReading = usableSaved
+            previous = nil
+        }
         let floor = startFloor == .distantPast ? nil : startFloor
         let contradiction = previous.flatMap { $0.onBattery ? nil : $0.date }
             ?? lastBatteryReading.flatMap { current.hasMoreCharge(than: $0) ? $0.date : nil }
-        if lastWake == nil, let lastSleep, lastSleep >= (bootDate ?? .distantPast) {
+        if awaitsFullWake(since: bootDate) {
             historicalStart = nil
         }
         if let contradiction {
@@ -179,6 +220,15 @@ struct PowerHistory {
         Date(timeIntervalSince1970: date.timeIntervalSince1970.rounded(.down))
     }
 
+    private static func matches(_ sample: BatterySample?, anchor: BatterySample) -> Bool {
+        guard let sample, sample.onBattery, sample.date == logSecond(containing: anchor.date) else { return false }
+        return !sample.hasMoreCharge(than: anchor) && !anchor.hasMoreCharge(than: sample)
+    }
+
+    private static func follows(_ date: Date, anchor: BatterySample, matched: Bool) -> Bool {
+        date > anchor.date || (matched && date == logSecond(containing: anchor.date))
+    }
+
     private func startupBaseline(at bootDate: Date) -> BatterySample? {
         guard let startup = startups.first(where: { $0.date >= bootDate }),
               startup.date.timeIntervalSince(bootDate) <= Self.maximumStartupLoggingDelay,
@@ -190,39 +240,65 @@ struct PowerHistory {
         PowerHistory(from: text, before: current.date).recoverSession(at: current).session
     }
 
-    func recoverSession(at current: BatterySample, since floor: Date? = nil, replacing existing: DischargeSession? = nil)
-        -> (session: DischargeSession?, interruption: Date?) {
-        guard current.isValid, current.onBattery else { return (nil, nil) }
+    func recoverSession(
+        at current: BatterySample, since floor: Date? = nil, replacing existing: DischargeSession? = nil,
+        forecast: BatterySample? = nil, forecastRequiresFullWakeMatch: Bool = false
+    ) -> (session: DischargeSession?, interruption: Date?, forecastInterruption: Date?) {
+        guard current.isValid, current.onBattery else { return (nil, nil, nil) }
         var start: BatterySample?
         var previous: BatterySample?
         var interruption: Date?
+        var forecastInterruption: Date?
+        var previousForecastReading: BatterySample?
         var sawExistingStart = false
+        var sawForecast = false
         let evidenceFloor = floor.map(Self.logSecond(containing:)) ?? .distantPast
-        for observation in observations where observation.date >= evidenceFloor && observation.date <= current.date {
+        let afterFullWake = firstObservationAfterFullWake(for: forecast, requiresFullWake: forecastRequiresFullWakeMatch)
+        for (index, observation) in observations.enumerated() where observation.date >= evidenceFloor && observation.date <= current.date {
+            if let afterFullWake, index >= afterFullWake, !sawForecast {
+                sawForecast = true
+                previousForecastReading = forecast
+            }
             let sample = observation.sample
             let increased = sample.map { reading in previous.map { reading.hasMoreCharge(than: $0) } == true } == true
+            let increasedSinceForecast = afterFullWake == nil ? increased :
+                sample.flatMap { reading in previousForecastReading.map { reading.hasMoreCharge(than: $0) } } == true
+            if let forecast, !observation.onBattery || increasedSinceForecast,
+               Self.follows(observation.date, anchor: forecast, matched: sawForecast) {
+                forecastInterruption = observation.date
+            }
             if !observation.onBattery || increased {
-                if let existing, observation.date > existing.start.date || sawExistingStart {
+                if let existing, Self.follows(observation.date, anchor: existing.start, matched: sawExistingStart) {
                     interruption = observation.date
                 }
                 start = nil
             }
             if !observation.onBattery {
                 previous = nil
+                previousForecastReading = nil
             } else if let sample {
-                if let existing, sample.date == Self.logSecond(containing: existing.start.date),
-                   !sample.hasMoreCharge(than: existing.start), !existing.start.hasMoreCharge(than: sample) {
-                    sawExistingStart = true
-                }
+                if let existing, Self.matches(sample, anchor: existing.start) { sawExistingStart = true }
+                if let forecast, !forecastRequiresFullWakeMatch,
+                   Self.matches(sample, anchor: forecast) { sawForecast = true }
+                if afterFullWake != nil, sawForecast { previousForecastReading = sample }
                 if start == nil, sample.date >= (interruption ?? floor ?? .distantPast) { start = sample }
                 previous = sample
             }
         }
+        if afterFullWake != nil {
+            if !sawForecast { previousForecastReading = forecast }
+            if let previousForecastReading, current.hasMoreCharge(than: previousForecastReading) {
+                forecastInterruption = current.date
+            }
+        }
         if let previous, let existing, previous.date >= existing.start.date, current.hasMoreCharge(than: previous) {
-            return (nil, current.date)
+            if afterFullWake == nil, let forecast, previous.date >= forecast.date || sawForecast {
+                forecastInterruption = current.date
+            }
+            return (nil, current.date, forecastInterruption)
         }
         guard let start, let previous,
-              !current.hasMoreCharge(than: previous), current.date > start.date else { return (nil, interruption) }
-        return (DischargeSession(start: start, origin: .history), interruption)
+              !current.hasMoreCharge(than: previous), current.date > start.date else { return (nil, interruption, forecastInterruption) }
+        return (DischargeSession(start: start, origin: .history), interruption, forecastInterruption)
     }
 }

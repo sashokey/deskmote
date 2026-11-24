@@ -12,13 +12,11 @@ enum FinderFileCreationIPCTests {
                        "An interrupted XPC connection cannot confirm that creation failed")
             try expect(FinderFileCreationClient.awaitReply(deadline: .now()) { $0(false) } == .failed,
                        "A service rejection must still report failure")
+            try testDestinationPathValidation()
             let folder = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
             defer { try? FileManager.default.removeItem(at: folder) }
             let handler = FinderFileCreationHandler()
-            try expect(!create(handler, type: 0, path: "relative"), "Reject relative destination paths")
-            try expect(!create(handler, type: 0, path: folder.path + "\0other"), "Reject an embedded NUL")
-            try expect(!create(handler, type: 0, path: "/" + String(repeating: "x", count: 4096)), "Reject an oversized destination")
             try expect(!create(handler, type: 99, path: folder.path), "Reject unsupported file types")
             try expect(try FileManager.default.contentsOfDirectory(atPath: folder.path).isEmpty,
                        "Invalid requests must leave the folder untouched")
@@ -45,6 +43,14 @@ enum FinderFileCreationIPCTests {
             FileHandle.standardError.write(Data("\(error)\n".utf8))
             exit(EXIT_FAILURE)
         }
+    }
+
+    private static func testDestinationPathValidation() throws {
+        let atLimit = "/" + String(repeating: "é", count: 2047) + "x"
+        try expect(FinderFileCreationIPC.destination(for: atLimit) != nil, "Accept exactly 4096 UTF-8 bytes")
+        try expect(FinderFileCreationIPC.destination(for: atLimit + "x") == nil, "Reject 4097 UTF-8 bytes")
+        try expect(FinderFileCreationIPC.destination(for: "relative") == nil, "Reject relative destination paths")
+        try expect(FinderFileCreationIPC.destination(for: "/selected\0other") == nil, "Reject an embedded NUL")
     }
 
     private static func create(_ handler: FinderFileCreationHandler, type: Int, path: String,

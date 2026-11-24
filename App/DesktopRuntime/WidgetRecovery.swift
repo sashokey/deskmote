@@ -13,41 +13,50 @@ enum WidgetRecovery {
     }
 
     static func recover(executable: URL,
+                        readInode: (String) -> UInt64? = fileInode,
                         readProcesses: ([String]) -> String? = mappedExecutables,
                         stopProcess: (pid_t, String) -> Bool = stopStaleProcess) -> Bool {
         let path = executable.path
-        guard let inode = fileInode(at: path) else { return true }
-        guard let records = readProcesses(["-c", String(executable.lastPathComponent.prefix(15))]) else { return false }
-        let stopped = staleProcesses(in: records, executablePath: path, inode: inode).map { stopProcess($0, path) }
+        guard let inode = readInode(path),
+              let records = readProcesses(["-c", String(executable.lastPathComponent.prefix(15))]),
+              let mappings = textMappings(in: records, executablePath: path) else { return false }
+        let stopped = mappings.filter { $0.value != inode }.keys.map { stopProcess($0, path) }
         return stopped.allSatisfy { $0 }
     }
 
-    static func staleProcesses(in records: String, executablePath: String, inode: UInt64) -> Set<pid_t> {
+    private static func textMappings(in records: String, executablePath: String,
+                                     onlyPID: pid_t? = nil) -> [pid_t: UInt64]? {
+        if records.isEmpty { return [:] }
+        guard records.hasSuffix("\0\n") else { return nil }
         let encodedPath = lsofPath(executablePath)
-        var stale: Set<pid_t> = []
+        var mappings: [pid_t: UInt64] = [:]
+        var seenPIDs: Set<pid_t> = []
         var pid: pid_t?
-        var mappedInode: UInt64?
+        var hasFile = false
 
-        for rawField in records.split(separator: "\0") {
-            let field = rawField.first == "\n" ? rawField.dropFirst() : rawField
-            switch field.first {
-            case "p":
-                pid = pid_t(field.dropFirst())
-                mappedInode = nil
-            case "f":
-                mappedInode = nil
-            case "i":
-                mappedInode = UInt64(field.dropFirst())
-            case "n":
-                if let pid, pid > 1, let mappedInode, mappedInode != inode,
-                   field.dropFirst() == encodedPath {
-                    stale.insert(pid)
-                }
-            default:
-                break
+        for set in records.dropLast().split(separator: "\n", omittingEmptySubsequences: false) {
+            let fields = set.split(separator: "\0", omittingEmptySubsequences: false)
+            guard fields.last?.isEmpty == true else { return nil }
+            if fields.count == 2, fields[0].first == "p" {
+                guard (pid == nil || hasFile), let nextPID = pid_t(fields[0].dropFirst()), nextPID > 1,
+                      onlyPID == nil || onlyPID == nextPID,
+                      seenPIDs.insert(nextPID).inserted else { return nil }
+                pid = nextPID
+                hasFile = false
+                continue
+            }
+            guard let pid, fields.count == 4, fields[0] == "ftxt",
+                  fields[1].first == "i", let inode = UInt64(fields[1].dropFirst()), inode > 0,
+                  fields[2].hasPrefix("n/"), fields[2].utf8.allSatisfy({ (32...126).contains($0) }) else { return nil }
+            let name = fields[2].dropFirst()
+            guard !name.hasSuffix(")") || !name.contains(" (") else { return nil }
+            hasFile = true
+            if name == encodedPath {
+                guard mappings[pid] == nil || mappings[pid] == inode else { return nil }
+                mappings[pid] = inode
             }
         }
-        return stale
+        return hasFile ? mappings : nil
     }
 
     private static func lsofPath(_ path: String) -> String {
@@ -74,18 +83,39 @@ enum WidgetRecovery {
         watcher.activate()
         defer { watcher.cancel() }
 
-        guard let records = mappedExecutables(matching: ["-p", String(pid)]) else {
-            return exited.wait(timeout: .now()) == .success
-        }
-        var processPath = [CChar](repeating: 0, count: 4096)
-        guard let inode = fileInode(at: path),
-              staleProcesses(in: records, executablePath: path, inode: inode).contains(pid),
-              proc_pidpath(pid, &processPath, UInt32(processPath.count)) > 0,
-              String(decoding: processPath.prefix(while: { $0 != 0 }).map(UInt8.init(bitPattern:)), as: UTF8.self) == path,
-              exited.wait(timeout: .now()) == .timedOut else { return true }
+        return stopStaleProcess(pid, at: path,
+                                readProcesses: { mappedExecutables(matching: ["-p", String(pid)]) },
+                                readInode: { fileInode(at: path) },
+                                readPath: { processPath(pid) },
+                                hasExited: { exited.wait(timeout: .now()) == .success },
+                                terminate: {
+                                    guard kill(pid, SIGTERM) == 0 else { return errno == ESRCH }
+                                    return exited.wait(timeout: .now() + 2) == .success
+                                })
+    }
 
-        guard kill(pid, SIGTERM) == 0 else { return errno == ESRCH }
-        return exited.wait(timeout: .now() + 2) == .success
+    static func stopStaleProcess(_ pid: pid_t, at path: String,
+                                 readProcesses: () -> String?, readInode: () -> UInt64?,
+                                 readPath: () -> String?, hasExited: () -> Bool,
+                                 terminate: () -> Bool) -> Bool {
+        let records = readProcesses()
+        let inode = readInode()
+        let observedPath = readPath()
+        if hasExited() { return true }
+        guard let observedPath else { return false }
+        if observedPath != path { return true }
+        guard let inode, let records,
+              let mappings = textMappings(in: records, executablePath: path, onlyPID: pid),
+              let mappedInode = mappings[pid] else { return false }
+        return mappedInode == inode || hasExited() || terminate()
+    }
+
+    private static func processPath(_ pid: pid_t) -> String? {
+        var path = [CChar](repeating: 0, count: 4096)
+        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+        let bytes = path.prefix(while: { $0 != 0 }).map(UInt8.init(bitPattern:))
+        guard bytes.first == UInt8(ascii: "/") else { return nil }
+        return String(bytes: bytes, encoding: .utf8)
     }
 
     private static func fileInode(at path: String) -> UInt64? {
@@ -97,8 +127,9 @@ enum WidgetRecovery {
         let executable = URL(fileURLWithPath: "/usr/sbin/lsof")
         let arguments = ["-nP", "-a", "-u", String(getuid()), "-d", "txt", "-F0pfin"] + filters
         guard let result = readProcessOutput(executable: executable, arguments: arguments, timeout: 3),
-              result.status == 0 || (result.status == 1 && result.data.isEmpty && !result.hadDiagnostics) else { return nil }
-        return String(decoding: result.data, as: UTF8.self)
+              !result.hadDiagnostics,
+              (result.status == 0 && !result.data.isEmpty) || (result.status == 1 && result.data.isEmpty) else { return nil }
+        return String(data: result.data, encoding: .utf8)
     }
 
     static func readProcessOutput(executable: URL, arguments: [String], timeout: TimeInterval)

@@ -87,19 +87,19 @@ enum WindowCommandIdentity {
             accessibilityPID = reader.accessibility.pid(element)
             guard accessibilityPID == record.pid else { return false }
         }
-        let owner: Int32?
-        if let windowID = record.cgWindowID,
-           let values = system.windowDescriptions(for: [windowID]),
-           let value = values.first(where: { nativeWindowNumber(in: $0) == windowID }),
-           let number = value[kCGWindowOwnerPID as String] as? NSNumber {
-            owner = Int32(exactly: number.int64Value)
-        } else { owner = nil }
+        let owner = record.cgWindowID.flatMap { ownerPID(for: $0, in: system.windowDescriptions(for: [$0])) }
         guard !requiresCGOwner || owner == record.pid else { return false }
         let accessibilityWindowID = record.cgWindowID == nil ? nil : element.flatMap {
             reader.cgWindowID(for: $0, maxAttempts: 1, messagingTimeout: 0.05)
         }
         return permits(record, currentGeneration: generation, ownerPID: owner,
                        accessibilityOwnerPID: accessibilityPID, accessibilityWindowID: accessibilityWindowID)
+    }
+
+    fileprivate static func ownerPID(for windowID: CGWindowID, in descriptions: [[String: Any]]?) -> pid_t? {
+        guard let value = descriptions?.first(where: { nativeWindowNumber(in: $0) == windowID }),
+              let number = value[kCGWindowOwnerPID as String] as? NSNumber else { return nil }
+        return pid_t(exactly: number.int64Value)
     }
 }
 
@@ -154,7 +154,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
             && !cancellation.isCancelled && budget?.canContinue != false
     }
 
-    private func canAct(on handle: WindowHandle) -> Bool {
+    fileprivate func canAct(on handle: WindowHandle) -> Bool {
         canAct(pid: handle.pid, windowID: handle.cgWindowID ?? reader.cgWindowID(for: handle.element),
                element: handle.element)
     }
@@ -297,8 +297,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
             let (result, value) = reader.accessibility.copy(handle.element, kAXMinimizeButtonAttribute as CFString)
             guard !cancellation.isCancelled, budget?.canContinue != false else { return nil }
             if result == .success {
-                guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-                return unsafeBitCast(value, to: AXUIElement.self)
+                return AXWindowReader.validatedElement(value)
             }
             guard result == .cannotComplete else { return nil }
             let wait = min(0.02, budget?.remaining ?? 0.02)
@@ -481,8 +480,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
             var raw: CFTypeRef?
             let readError: AXError
             (readError, raw) = reader.accessibility.copy(handle.element, kAXCloseButtonAttribute as CFString)
-            if readError == .success, let raw, CFGetTypeID(raw) == AXUIElementGetTypeID() {
-                let button = raw as! AXUIElement
+            if readError == .success, let button = AXWindowReader.validatedElement(raw) {
                 guard canAct(on: handle), prepare(button), canAct(on: handle) else { return false }
                 let pressError = reader.accessibility.perform(button, kAXPressAction as CFString)
                 #if DEBUG
@@ -577,8 +575,8 @@ struct AccessibilityWindowActionExecutor: Sendable {
             guard !cancellation.isCancelled else { return .none }
             var raw: CFTypeRef?
             (readError, raw) = reader.accessibility.copy(appElement, kAXFocusedWindowAttribute as CFString)
-            if readError == .success, let raw, CFGetTypeID(raw) == AXUIElementGetTypeID() {
-                focused = (raw as! AXUIElement)
+            if readError == .success {
+                focused = AXWindowReader.validatedElement(raw)
             }
             guard readError == .cannotComplete, Date() < deadline else { break }
             usleep(20_000)
@@ -617,17 +615,22 @@ struct AccessibilityWindowActionExecutor: Sendable {
         return verdict
     }
 
-    func switchFrontmostForHandoff(toPID pid: pid_t, windowID: CGWindowID, element: AXUIElement?,
-                                   awaitingDeactivationOf targetPID: pid_t,
+    func switchFrontmostForHandoff(to candidate: WindowRecord, windowID: CGWindowID, element: AXUIElement?,
+                                   from source: WindowHandle, original: WindowRecord,
                                    deactivationCap: TimeInterval = 0.1) -> Bool {
+        let pid = candidate.pid
+        func authorizeHandoff() -> Bool {
+            canSwitchForHandoff(to: candidate, windowID: windowID, element: element, from: source, original: original)
+        }
         #if DEBUG
         let route: String
         #endif
-        if postSkyLightFrontSwitchOnly(pid: pid, windowID: windowID, mode: Self.kCPSNoWindows, element: element) {
+        if Self.skyLightFocusEnabled, authorizeHandoff(),
+           focusBackend.setFrontmost(pid: pid, windowID: windowID, mode: Self.kCPSNoWindows) {
             #if DEBUG
             route = "skylight"
             #endif
-        } else if activateApplicationViaAccessibility(pid: pid, windowID: windowID, element: element) {
+        } else if activateApplicationViaAccessibility(pid: pid, authorized: authorizeHandoff) {
             #if DEBUG
             route = "ax-frontmost"
             #endif
@@ -637,7 +640,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
             #endif
             return false
         }
-        let targetApp = reader.accessibility.application(targetPID)
+        let targetApp = reader.accessibility.application(source.pid)
         _ = reader.accessibility.setTimeout(targetApp, 0.05)
         let deadline = Date().addingTimeInterval(deactivationCap)
         var stillFrontmost: Bool? = true
@@ -667,10 +670,33 @@ struct AccessibilityWindowActionExecutor: Sendable {
         return stillFrontmost == false && system.app(pid)?.isActive == true
     }
 
-    private func activateApplicationViaAccessibility(pid: pid_t, windowID: CGWindowID, element: AXUIElement?) -> Bool {
+    private func canSwitchForHandoff(to candidate: WindowRecord, windowID: CGWindowID, element: AXUIElement?,
+                                     from source: WindowHandle, original: WindowRecord) -> Bool {
+        guard canAct(pid: candidate.pid, windowID: windowID, element: element), canAct(on: source) else { return false }
+        let originalAXID = original.cgWindowID
+        if let originalAXID {
+            guard reader.matchesCGWindowID(originalAXID, element: source.element, messagingTimeout: 0.05) == true else { return false }
+        }
+        if let element {
+            guard reader.accessibility.pid(element) == candidate.pid,
+                  reader.matchesCGWindowID(windowID, element: element, messagingTimeout: 0.05) == true else { return false }
+        }
+        guard !cancellation.isCancelled, budget?.canContinue != false else { return false }
+        let descriptions = system.windowDescriptions(for: [candidate.cgWindowID, originalAXID].compactMap { $0 })
+        guard reader.accessibility.pid(source.element) == original.pid else { return false }
+        let candidateOwner = WindowCommandIdentity.ownerPID(for: windowID, in: descriptions)
+        let originalOwner = originalAXID.flatMap { WindowCommandIdentity.ownerPID(for: $0, in: descriptions) }
+        return WindowCommandIdentity.permits(candidate, currentGeneration: system.generation(candidate.pid), ownerPID: candidateOwner,
+                    accessibilityOwnerPID: element.flatMap { reader.accessibility.pid($0) }, accessibilityWindowID: element == nil ? nil : windowID)
+            && WindowCommandIdentity.permits(original, currentGeneration: system.generation(original.pid), ownerPID: originalOwner,
+                    accessibilityOwnerPID: original.pid, accessibilityWindowID: originalAXID)
+            && !cancellation.isCancelled && budget?.canContinue != false
+    }
+
+    private func activateApplicationViaAccessibility(pid: pid_t, authorized: () -> Bool) -> Bool {
         let app = reader.accessibility.application(pid)
         _ = reader.accessibility.setTimeout(app, 0.2)
-        guard canAct(pid: pid, windowID: windowID, element: element) else { return false }
+        guard authorized() else { return false }
         return reader.accessibility.set(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue) == .success
     }
 
@@ -729,12 +755,16 @@ struct ActionExecutionSwitches: Equatable {
     let fastWindowHandleEnabled: Bool
     let axElementCacheEnabled: Bool
     let chipProbeEnabled: Bool
+    #if DEBUG
+    let clickTraceEnabled: Bool
+    #endif
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         fastWindowHandleEnabled = DebugSwitch.fastWindowHandle.isEnabled(in: environment)
         axElementCacheEnabled = DebugSwitch.axElementCache.isEnabled(in: environment)
         #if DEBUG
         chipProbeEnabled = DebugSwitch.chipProbe.isEnabled(in: environment)
+        clickTraceEnabled = DebugSwitch.clickTrace.isEnabled(in: environment)
         #else
         chipProbeEnabled = false
         #endif
@@ -895,7 +925,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
             }
         )
         #if DEBUG
-        ClickLatencyTrace.mark(windowID: request.windowID?.rawValue, "handle", detail: captureTier)
+        if switches.clickTraceEnabled { ClickLatencyTrace.markCurrent("handle", detail: captureTier) }
         #endif
 
         guard !cancellation.isCancelled else { return false }
@@ -932,7 +962,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
                system.app(record.pid)?.isActive != true {
                 windowExecutor.requestWindowFocusViaSkyLight(handle)
                 #if DEBUG
-                ClickLatencyTrace.mark(windowID: request.windowID?.rawValue, "earlyFocus")
+                if switches.clickTraceEnabled { ClickLatencyTrace.markCurrent("earlyFocus") }
                 #endif
             }
             return windowExecutor.activate(
@@ -1044,12 +1074,13 @@ struct PlatformActionExecutor: WindowActionExecuting {
         )
         switch verdict {
         case .siblingTakesOver(let windowID):
+            guard windowExecutor.canAct(on: handle) else { return nil }
             onHandoffActivePrediction?(windowID)
             return nil
         case .none:
             return nil
         case .switchTo(let pid, let wid, let windowID):
-            guard let candidate = snapshot.windows[windowID] else { return nil }
+            guard let candidate = snapshot.windows[windowID], candidate.pid == pid, candidate.cgWindowID == wid else { return nil }
             let element: AXUIElement?
             if let expectedElement = candidate.actionTarget?.element {
                 guard let candidateHandle = windowExecutor.captureHandleByCGWindowID(wid, pid: pid, title: candidate.title,
@@ -1058,9 +1089,10 @@ struct PlatformActionExecutor: WindowActionExecuting {
             } else {
                 element = nil
             }
+            guard windowExecutor.canAct(on: handle) else { return nil }
             onHandoffActivePrediction?(windowID)
             let preSwitched = windowExecutor.switchFrontmostForHandoff(
-                toPID: pid, windowID: wid, element: element, awaitingDeactivationOf: handle.pid,
+                to: candidate, windowID: wid, element: element, from: handle, original: record,
                 deactivationCap: patience.deactivationCap
             )
             return Handoff(pid: pid, windowID: wid, element: element, preSwitched: preSwitched)

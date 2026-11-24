@@ -627,17 +627,14 @@ enum WindowLiftAvoidance {
         }
 
         let classification = frames.classify(actual)
-        if classification == .target { return .complete(actualFrame: actual) }
         if let lastAcknowledgedFrame, measuredFramesAgree(actual, lastAcknowledgedFrame) {
-            return .continueFromActual(actualFrame: actual)
+            return classification == .target ? .complete(actualFrame: actual) : .continueFromActual(actualFrame: actual)
         }
 
         switch classification {
         case .target:
             return .complete(actualFrame: actual)
-        case .managedTrajectory:
-            return .continueFromActual(actualFrame: actual)
-        case .external:
+        case .managedTrajectory, .external:
             return .clearSession(preservingFrame: actual)
         case .native:
             if liftRetryCount < maxLiftRetries {

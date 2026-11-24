@@ -3,6 +3,7 @@ import Combine
 
 extension PanelCoordinator {
     func subscribeSettings() {
+        guard !isSuspendedForPermissionLoss else { return }
         displayTopologySubscription = displayTopologyStore.$table
             .removeDuplicates()
             .dropFirst()
@@ -25,7 +26,8 @@ extension PanelCoordinator {
         dockContentHost?.layoutContent()
     }
 
-    func screenParametersChanged(sharedRead: FullscreenAXReadBatch? = nil) {
+    func screenParametersChanged(sharedRead: FullscreenReadBatch? = nil) {
+        guard !isSuspendedForPermissionLoss else { return }
         fullscreenProbeGeneration &+= 1
         taskbarView?.taskbarContent.prepareForHiding()
         relayout()

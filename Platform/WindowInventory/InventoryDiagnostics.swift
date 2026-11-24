@@ -10,6 +10,7 @@ enum InventoryReconcileSource: String, Codable {
     case initialEnumeration
     case windowCreated
     case windowDestroyed
+    case windowMoved
     case focusChanged
     case titleChanged
     case frontmostPoll

@@ -26,6 +26,95 @@ final class AppTrackerPeriodicBatchTests: XCTestCase {
         try await assertConfirmedMinimizeWithUnreadFrame(subrole: nil, minimizedCG: emptyCG)
     }
 
+    func testPeriodicReadRetainsMinimizedSeatWithExactAXPresenceAndNoCGID() async throws {
+        let visible = makeSnapshot(pid: pidA, cgWindowID: cgWindowA, title: "Window")
+        let reader = PeriodicBatchReader(resultsByPID: [pidA: .success([visible])])
+        let tracker = AppTracker(reader: reader, processProvider: BatchFixedProcessProvider(),
+            onScreenWindowIDsProvider: { [] })
+        defer { tracker.stop() }
+        tracker.installFixtureForTesting(makeApp(pid: pidA, cgWindowID: cgWindowA))
+        tracker.runPeriodicBatchForTesting(cgSnapshot: cgSnapshot())
+        await drainInventory(tracker)
+        let original = try XCTUnwrap(tracker.fixtureAppForTesting(pid: pidA)?.windowsByID[cgWindowA])
+        tracker.minimizeForTesting(pid: pidA, cgWindowID: cgWindowA)
+
+        let minimized = AXWindowSnapshot(pid: pidA, cgWindowID: nil, titleRead: .value("Renamed while minimized"),
+            bounds: nil, role: visible.role, subrole: visible.subrole, isMinimized: true,
+            isFocusedWindow: false, element: visible.element, isMinimizedRead: true)
+        let capture = AppTrackerCGWindowSnapshot(
+            allWindowIDs: [], onScreenWindowIDs: [], windowIDsByPID: [:], alphaByWindowID: [:])
+        reader.setResult(.success([minimized]), for: pidA)
+        tracker.runPeriodicBatchForTesting(cgSnapshot: capture)
+        await drainInventory(tracker)
+        let retained = try XCTUnwrap(tracker.fixtureAppForTesting(pid: pidA)?.windowsByID[cgWindowA])
+        XCTAssertEqual(retained.token, original.token)
+        XCTAssertEqual(retained.actionTarget?.id, original.actionTarget?.id)
+        XCTAssertEqual(retained.bounds, original.bounds)
+        XCTAssertEqual(retained.title, "Renamed while minimized")
+        XCTAssertTrue(retained.isMinimized)
+        XCTAssertNil(retained.minAbsentSince)
+        XCTAssertNil(retained.absentProbe)
+        XCTAssertEqual(tracker.snapshot.windows[WindowID(rawValue: "cgw-\(cgWindowA)")]?.title, retained.title)
+
+        reader.setResult(.success([]), for: pidA)
+        tracker.runPeriodicBatchForTesting(cgSnapshot: capture)
+        await drainInventory(tracker)
+        XCTAssertTrue(tracker.snapshot.windows.isEmpty)
+        XCTAssertNil(tracker.fixtureAppForTesting(pid: pidA)?.windowsByID[cgWindowA])
+    }
+
+    func testPeriodicReadRestoresMinimizedSeatWhenExactAXAndVisibleCGAgreeWithoutAXNumber() async throws {
+        let element = AXUIElementCreateApplication(pidA)
+        let window = AXWindowSnapshot(pid: pidA, cgWindowID: nil, titleRead: .value("Restored"),
+            bounds: CGRect(x: 30, y: 40, width: 600, height: 400), role: kAXWindowRole as String,
+            subrole: kAXStandardWindowSubrole as String, isMinimized: false, isFocusedWindow: false,
+            element: element, isMinimizedRead: false)
+        let reader = PeriodicBatchReader(resultsByPID: [pidA: .success([window])])
+        let tracker = AppTracker(reader: reader, processProvider: BatchFixedProcessProvider(), frontmostPIDProvider: { nil })
+        defer { tracker.stop() }
+        let target = WindowActionTarget(element: AXElementKey(e: element))
+        var app = makeApp(pid: pidA, cgWindowID: cgWindowA)
+        app.windowsByID[cgWindowA]?.actionTarget = target
+        app.windowsByID[cgWindowA]?.isMinimized = true
+        tracker.installFixtureForTesting(app)
+        let parked = AppTrackerCGWindowSnapshot(allWindowIDs: [], onScreenWindowIDs: [],
+            windowIDsByPID: [:], alphaByWindowID: [:])
+        tracker.runPeriodicBatchForTesting(cgSnapshot: parked)
+        await drainInventory(tracker)
+        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pidA)?.windowsByID[cgWindowA]?.isMinimized, true)
+
+        let visible = AppTrackerCGWindowSnapshot(allWindowIDs: [cgWindowA], onScreenWindowIDs: [cgWindowA],
+            windowIDsByPID: [pidA: [cgWindowA]], alphaByWindowID: [cgWindowA: 1], parentWindowIDs: [cgWindowA: 0])
+        tracker.runPeriodicBatchForTesting(cgSnapshot: visible)
+        await drainInventory(tracker)
+        let restored = try XCTUnwrap(tracker.snapshot.windows[WindowID(rawValue: "cgw-\(cgWindowA)")])
+        XCTAssertEqual(restored.status, .inactive)
+        XCTAssertEqual(restored.title, "Restored")
+        XCTAssertEqual(restored.bounds, window.bounds)
+        XCTAssertEqual(restored.actionTarget, target)
+    }
+
+    func testPeriodicReadRejectsExplicitModalElementsWithoutAnAXWindowNumber() async {
+        for subrole in [kAXDialogSubrole, kAXUnknownSubrole] {
+            let element = AXUIElementCreateApplication(pidA)
+            let modal = AXWindowSnapshot(pid: pidA, cgWindowID: nil, titleRead: .value("Modal"),
+                bounds: nil, role: kAXWindowRole as String, subrole: subrole as String,
+                isMinimized: true, isFocusedWindow: false, element: element, isMinimizedRead: true,
+                isModal: true, isTopLevel: true)
+            let reader = PeriodicBatchReader(resultsByPID: [pidA: .success([modal])])
+            let tracker = AppTracker(reader: reader, processProvider: BatchFixedProcessProvider(), frontmostPIDProvider: { nil })
+            defer { tracker.stop() }
+            var app = makeApp(pid: pidA, cgWindowID: cgWindowA)
+            app.windowsByID[cgWindowA]?.actionTarget = WindowActionTarget(element: AXElementKey(e: element))
+            app.windowsByID[cgWindowA]?.isMinimized = true
+            tracker.installFixtureForTesting(app)
+            tracker.runPeriodicBatchForTesting(cgSnapshot: AppTrackerCGWindowSnapshot(allWindowIDs: [], onScreenWindowIDs: [],
+                windowIDsByPID: [:], alphaByWindowID: [:]))
+            await drainInventory(tracker)
+            XCTAssertNil(tracker.fixtureAppForTesting(pid: pidA)?.windowsByID[cgWindowA], subrole as String)
+        }
+    }
+
     func testPeriodicReadKeepsSeatWhenTheSameAXWindowChangesCGID() async throws {
         let siblingID: CGWindowID = 99
         let initial = makeSnapshot(pid: pidA, cgWindowID: cgWindowA, title: "Window")
@@ -904,6 +993,124 @@ final class AppTrackerPeriodicBatchTests: XCTestCase {
         XCTAssertEqual(reader.readCount, 2)
     }
 
+    func testUnreadRealEventSurvivesLaterAbsenceTimerThroughBackoff() async {
+        for source in [InventoryReconcileSource.titleChanged, .windowCreated] {
+            let uptime = UptimeBox(value: 1000)
+            let reader = PeriodicBatchReader(resultsByPID: [pidA: .unread(.cannotComplete)], blocksTimedReads: true)
+            let tracker = makeCountingTracker(probeBox: ProbeBox(value: []), counters: CGCallCounters(),
+                uptime: uptime, reader: reader)
+            defer { reader.releaseOne(); tracker.stop() }
+            tracker.installFixtureForTesting(makeApp(pid: pidA, cgWindowID: cgWindowA))
+            tracker.scheduleEventReadForTesting(pid: pidA, source: source)
+            await waitUntil { reader.readCount == 1 }
+            XCTAssertEqual(reader.readCount, 1)
+            tracker.scheduleEventReadForTesting(pid: pidA, source: .absenceProbe)
+            reader.setResult(.success([makeSnapshot(pid: pidA, cgWindowID: cgWindowA, title: "Updated")]), for: pidA)
+            reader.releaseOne()
+            await drainInventory(tracker)
+
+            uptime.value = 1000.49
+            tracker.scheduleFrontmostPollForTesting(pid: pidB)
+            XCTAssertEqual(reader.readCount, 1)
+            uptime.value = 1000.5
+            tracker.scheduleFrontmostPollForTesting(pid: pidB)
+            reader.releaseOne()
+            await drainInventory(tracker)
+            XCTAssertEqual(reader.readCount, 2, source.rawValue)
+            XCTAssertEqual(tracker.snapshot.windows[WindowID(rawValue: "cgw-\(cgWindowA)")]?.title, "Updated")
+        }
+    }
+
+    func testUnreadAbsenceOnlyEventDoesNotBecomeAnInventoryRetry() async {
+        let uptime = UptimeBox(value: 1000)
+        let reader = PeriodicBatchReader(resultsByPID: [pidA: .unread(.cannotComplete)])
+        let tracker = makeCountingTracker(probeBox: ProbeBox(value: []), counters: CGCallCounters(),
+            uptime: uptime, reader: reader)
+        defer { tracker.stop() }
+        tracker.installFixtureForTesting(makeApp(pid: pidA, cgWindowID: cgWindowA))
+        tracker.scheduleEventReadForTesting(pid: pidA, source: .absenceProbe)
+        await drainInventory(tracker)
+        uptime.value = 1000.5
+        tracker.scheduleFrontmostPollForTesting(pid: pidB)
+        await drainInventory(tracker)
+        XCTAssertEqual(reader.readCount, 1)
+    }
+
+    func testStoppingAnEventReadPreventsFurtherBoundaryCallsAfterAXReturns() async {
+        let capture = cgSnapshot()
+        let counters = CGCallCounters()
+        let absentProber = CountingInventoryAbsenceProber()
+        let visible = makeSnapshot(pid: pidA, cgWindowID: cgWindowA, title: "Window")
+        let reader = PeriodicBatchReader(resultsByPID: [pidA: .success([visible])], blocksTimedReads: true)
+        let tracker = AppTracker(reader: reader, processProvider: BatchFixedProcessProvider(),
+            cgSnapshotProvider: { counters.noteCapture(); return capture },
+            onScreenWindowIDsProvider: { counters.noteProbe(); return [] },
+            absentSeatReleaseEnabled: true, absentSeatProber: absentProber, uptimeProvider: { 1000 })
+        defer { reader.releaseOne(); tracker.stop() }
+        var app = makeApp(pid: pidA, cgWindowID: cgWindowA)
+        app.windowsByID[cgWindowA]?.absentProbe = AbsentSeatProbeState(nextProbeUptime: 1000)
+        tracker.installFixtureForTesting(app)
+        tracker.setSubscribedElementForTesting(pid: pidA, cgWindowID: cgWindowA, element: visible.element, instanceID: 1)
+        tracker.scheduleEventReadForTesting(pid: pidA, source: .titleChanged)
+        await waitUntil { reader.readCount == 1 }
+        XCTAssertEqual(reader.readCount, 1)
+        let pending = tracker.pendingInventoryWorkForTesting
+        XCTAssertEqual(pending.count, 1)
+        tracker.stop()
+        reader.releaseOne()
+        for task in pending { await task.value }
+        XCTAssertEqual(absentProber.calls.withLock { $0 }, 0)
+        XCTAssertEqual(counters.captures, 0)
+        XCTAssertEqual(counters.probes, 0)
+    }
+
+    func testStoppingDuringAnAXAbsenceProbePreventsBothSpaceReads() async throws {
+        let desktop = BehaviorDesktop()
+        let capture = cgSnapshot()
+        let gate = DispatchSemaphore(value: 0)
+        let entered = Mutex(false)
+        let timedOut = Mutex(false)
+        desktop.state.withLock {
+            $0.beforeRead = { attribute in
+                guard attribute == kAXMinimizedAttribute as String else { return }
+                entered.withLock { $0 = true }
+                if gate.wait(timeout: .now() + 5) == .timedOut { timedOut.withLock { $0 = true } }
+            }
+        }
+        let memberships = Mutex<[CGWindowID]>([])
+        let layouts = Mutex(0)
+        let prober = LiveAbsentSeatProber(accessibility: desktop, windowSpaceIDs: { id in
+            memberships.withLock { $0.append(id) }
+            return []
+        }, currentSpaceIDs: {
+            layouts.withLock { $0 += 1 }
+            return [1]
+        })
+        let reader = PeriodicBatchReader(resultsByPID: [pidA: .success([])])
+        let tracker = AppTracker(reader: reader, processProvider: BatchFixedProcessProvider(),
+            cgSnapshotProvider: { capture }, onScreenWindowIDsProvider: { [] },
+            absentSeatReleaseEnabled: true, absentSeatProber: prober, uptimeProvider: { 1000 },
+            frontmostPIDProvider: { nil })
+        defer { gate.signal(); tracker.stop() }
+        var app = makeApp(pid: pidA, cgWindowID: cgWindowA)
+        app.windowsByID[cgWindowA]?.absentProbe = AbsentSeatProbeState(nextProbeUptime: 1000)
+        tracker.installFixtureForTesting(app)
+        let element = try XCTUnwrap(desktop.elements[1001])
+        tracker.setSubscribedElementForTesting(pid: pidA, cgWindowID: cgWindowA, element: element, instanceID: 1)
+        tracker.scheduleEventReadForTesting(pid: pidA, source: .absenceProbe)
+        await waitUntil { entered.withLock { $0 } }
+        XCTAssertTrue(entered.withLock { $0 })
+        XCTAssertEqual(reader.readCount, 1)
+        let pending = tracker.pendingInventoryWorkForTesting
+        XCTAssertEqual(pending.count, 1)
+        tracker.stop()
+        gate.signal()
+        for task in pending { await task.value }
+        XCTAssertFalse(timedOut.withLock { $0 })
+        XCTAssertTrue(memberships.withLock { $0.isEmpty })
+        XCTAssertEqual(layouts.withLock { $0 }, 0)
+    }
+
     func testFrontmostCGChangePromotesTheProbeToAFullRead() async {
         let counters = CGCallCounters()
         let probe = ProbeBox(value: [])
@@ -1446,6 +1653,16 @@ private final class CGCallCounters: @unchecked Sendable {
 
     var captures: Int { lock.lock(); defer { lock.unlock() }; return captureCount }
     var probes: Int { lock.lock(); defer { lock.unlock() }; return probeCount }
+}
+
+private final class CountingInventoryAbsenceProber: AbsentSeatProbing {
+    let calls = Mutex(0)
+
+    func probe(_ request: AbsentSeatProbeRequest, messagingTimeout: TimeInterval,
+               cancellation: OperationCancellation) -> AbsentSeatProbeEvidence? {
+        calls.withLock { $0 += 1 }
+        return AbsentSeatProbeEvidence(request: request, element: .dead, windowSpaceIDs: nil, currentSpaceIDs: nil)
+    }
 }
 
 private final class ProbeBox: @unchecked Sendable {

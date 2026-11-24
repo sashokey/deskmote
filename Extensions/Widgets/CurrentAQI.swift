@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 func collectAQIBody<Bytes: AsyncSequence>(_ bytes: Bytes, limit: Int) async throws -> Data? where Bytes.Element == UInt8 {
@@ -27,6 +28,18 @@ let pollutantNames = [
     ("NO2", "NO₂"), ("PM2_5", "PM₂.₅"), ("PM10", "PM₁₀"),
     ("O3", "O₃"), ("SO2", "SO₂"), ("CO", "CO")
 ]
+
+func currentAirQuality(in data: Data, textEncodingName: String?) -> AirQualityReading? {
+    var encoding = String.Encoding.utf8
+    if let textEncodingName {
+        let ianaEncoding = CFStringConvertIANACharSetNameToEncoding(textEncodingName as CFString)
+        if ianaEncoding != kCFStringEncodingInvalidId, CFStringIsEncodingAvailable(ianaEncoding) {
+            encoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(ianaEncoding))
+        }
+    }
+    guard let html = String(data: data, encoding: encoding) else { return nil }
+    return currentAirQuality(in: html)
+}
 
 func currentAirQuality(in html: String) -> AirQualityReading? {
     let (markup, scripts) = activeMarkup(html)
@@ -202,16 +215,24 @@ private func isInlineJavaScript(_ element: XMLElement) -> Bool {
     return javascriptMIMETypes.contains(classicType) && element.attribute(forName: "nomodule") == nil
 }
 
+private let javaScriptLineTerminators = "\r\n\u{2028}\u{2029}"
+
+private func isJavaScriptLineTerminator(_ scalar: Unicode.Scalar) -> Bool {
+    javaScriptLineTerminators.unicodeScalars.contains(scalar)
+}
+
 private func localizedCity(in document: XMLDocument, scripts: [String]) -> String? {
     let quoted = #""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#
-    let comment = #"(?:/\*.*?(?:\*/|$)|(?://|<!--)[^\r\n\u2028\u2029]*|(?m:^[ \t]*-->[^\r\n\u2028\u2029]*))"#
+    let comment = #"(?:/\*.*?(?:\*/|$)|(?://|<!--)[^\#(javaScriptLineTerminators)]*|(?m:^[ \t]*-->[^\#(javaScriptLineTerminators)]*))"#
     let whitespace = "(?:" + comment + "|\\s++)"
     let trivia = whitespace + "*+"
     let identifier = #"[$_\p{L}][$_\p{L}\p{N}\p{M}]*"#
+    let identifierEscape = #"\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})"#
+    let privateIdentifier = #"#(?:[$_\p{ID_Start}]|\#(identifierEscape))(?:[$_\p{ID_Continue}\u200C\u200D]|\#(identifierEscape))*"#
     let tokens = try! NSRegularExpression(pattern: "(?s)(" + whitespace + ")|(?:" + quoted +
-        ")|" + identifier + #"|=>|\+\+|--|."#)
+        ")|" + privateIdentifier + "|" + identifier + #"|=>|\+\+|--|."#)
     let regexLiteral = try! NSRegularExpression(
-        pattern: #"/(?![/*])(?:\\.|\[(?:\\.|[^\]\\\r\n\u2028\u2029])*\]|[^/\\\r\n\u2028\u2029\[])+/[a-z]*"#)
+        pattern: #"/(?![/*])(?:\\.|\[(?:\\.|[^\]\\\#(javaScriptLineTerminators)])*\]|[^/\\\#(javaScriptLineTerminators)\[])+/[a-z]*"#)
     let declaration = try! NSRegularExpression(pattern: "(?s)" + trivia + #"\bcurrentLocation\b"# + trivia +
         "=" + trivia + #"(\{)"#)
     let terminator = try! NSRegularExpression(pattern: "(?s)(" + trivia +
@@ -227,14 +248,20 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
         var cursor = script.startIndex
         var previous = ""
         var beforePrevious = ""
+        var previousEnd = cursor
         var expectsOperand = true
-        var parens: [(control: Bool, functionExpression: Bool, asyncFunction: Bool?, asyncArrow: Bool)] = []
+        var parens: [(control: Bool, switchCondition: Bool, functionExpression: Bool,
+                      asyncFunction: Bool?, asyncArrow: Bool)] = []
+        var closedSwitchCondition = false
+        var switchBodies: [(depth: Int, conditionalDepth: Int?)] = []
+        var afterCaseLabel = false
         var pendingFunctionExpression = false
         var closedFunctionExpression = false
         var pendingAsyncFunction: Bool?
         var closedAsyncFunction: Bool?
         var closedAsyncArrow = false
         var statementBraces: [Bool] = []
+        var pendingClasses: [(depth: Int, isDeclaration: Bool)] = []
         var asyncContext: [Bool] = []
         var bracketDepth = 0
         var expressionArrows: [(depth: Int, braceDepth: Int, isAsync: Bool)] = []
@@ -244,6 +271,11 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
             cursor = matched.upperBound
             if match.range(at: 1).location != NSNotFound { continue }
             let token = String(script[matched])
+            let beginsCaseBody = afterCaseLabel
+            let beginsSwitchBody = closedSwitchCondition
+            afterCaseLabel = false
+            closedSwitchCondition = false
+            defer { previousEnd = cursor }
             if token == "\u{0060}" {
                 cursor = templateEnd(in: script, after: cursor)
                 expectsOperand = false
@@ -274,6 +306,26 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
                 continue
             }
             let depth = parens.count + statementBraces.count + bracketDepth
+            if let scope = switchBodies.indices.last, switchBodies[scope].depth == depth {
+                if previous != ".", ["case", "default"].contains(token) {
+                    switchBodies[scope].conditionalDepth = 0
+                } else if let conditionalDepth = switchBodies[scope].conditionalDepth {
+                    if token == "?", previous != "?" {
+                        let remainder = script[cursor...]
+                        let isOptionalChain = remainder.first == "." &&
+                            remainder.dropFirst().first.map { !"0123456789".contains($0) } != false
+                        if remainder.first != "?", !isOptionalChain {
+                            switchBodies[scope].conditionalDepth = conditionalDepth + 1
+                        }
+                    } else if token == ":" {
+                        afterCaseLabel = conditionalDepth == 0
+                        switchBodies[scope].conditionalDepth = afterCaseLabel ? nil : conditionalDepth - 1
+                    }
+                }
+            }
+            if pendingClasses.last?.depth == depth, [":", ",", ";", ")", "]", "}"].contains(token) {
+                pendingClasses.removeLast()
+            }
             if [")", "]", "}", ",", ";"].contains(token) {
                 while let arrow = expressionArrows.last, arrow.depth >= depth {
                     expressionArrows.removeLast()
@@ -288,6 +340,14 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
             switch token {
             case _ where previous == ".":
                 expectsOperand = false
+            case "class":
+                let isDeclaration = beginsCaseBody || previous.isEmpty || [";", "export", "default"].contains(previous)
+                    || (previous == "{" && statementBraces.last == true)
+                    || (previous == "}" && expectsOperand)
+                    || (!expectsOperand && script[previousEnd..<matched.lowerBound].unicodeScalars
+                        .contains(where: isJavaScriptLineTerminator))
+                pendingClasses.append((depth, isDeclaration))
+                expectsOperand = true
             case "function":
                 let context = previous == "async" ? beforePrevious : previous
                 pendingFunctionExpression = !context.isEmpty && ![";", "{", "}", "export", "default"].contains(context)
@@ -297,13 +357,14 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
                 let asynchronousMethod = beforePrevious == "async" && previous != "async" && previous != "function"
                 let loopOrCondition = ["if", "while", "for", "with", "switch", "catch"].contains(previous)
                     || (beforePrevious == "for" && previous == "await")
-                parens.append((loopOrCondition,
+                parens.append((loopOrCondition, previous == "switch" && beforePrevious != ".",
                                pendingFunctionExpression, pendingAsyncFunction ?? (asynchronousMethod ? true : nil), previous == "async"))
                 pendingFunctionExpression = false
                 pendingAsyncFunction = nil
                 expectsOperand = true
             case ")":
                 let context = parens.popLast()
+                closedSwitchCondition = context?.switchCondition == true
                 closedFunctionExpression = context?.functionExpression == true
                 closedAsyncFunction = context?.asyncFunction
                 closedAsyncArrow = context?.asyncArrow == true
@@ -313,13 +374,21 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
                 expressionArrows.append((depth, statementBraces.count, isAsync))
                 expectsOperand = true
             case "{":
+                if beginsSwitchBody {
+                    switchBodies.append((depth + 1, nil))
+                }
                 let statement = previous.isEmpty || [";", ")", "else", "do", "try", "finally", "{", "}"].contains(previous)
-                statementBraces.append(statement && !(previous == ")" && closedFunctionExpression))
+                if pendingClasses.last?.depth == depth, let currentClass = pendingClasses.popLast() {
+                    statementBraces.append(currentClass.isDeclaration)
+                } else {
+                    statementBraces.append(statement && !(previous == ")" && closedFunctionExpression))
+                }
                 let asyncFunction = previous == "=>" ? expressionArrows.popLast()?.isAsync :
                     (previous == ")" ? closedAsyncFunction : nil)
                 asyncContext.append(asyncFunction ?? inheritedAsync)
                 expectsOperand = true
             case "}":
+                if switchBodies.last?.depth == depth { switchBodies.removeLast() }
                 expectsOperand = statementBraces.popLast() ?? true
                 _ = asyncContext.popLast()
             case "[":
@@ -333,7 +402,7 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
             default:
                 expectsOperand = [";", ",", ":", "=", "?", "!", "+", "-", "*", "%", "~", "/",
                                   "&", "|", "^", "<", ">", "return", "throw", "case", "yield", "else", "do",
-                                  "delete", "void", "typeof", "in", "instanceof"].contains(token)
+                                  "delete", "void", "typeof", "new", "in", "instanceof"].contains(token)
                     || (inheritedAsync && token == "await")
             }
             beforePrevious = previous
@@ -344,41 +413,41 @@ private func localizedCity(in document: XMLDocument, scripts: [String]) -> Strin
 }
 
 private func templateEnd(in script: String, after start: String.Index) -> String.Index {
-    let bytes = script.utf8
-    var delimiters: [UInt8] = [96]
+    let scalars = script.unicodeScalars
+    var delimiters: [Unicode.Scalar] = ["`"]
     var index = start
-    while index < bytes.endIndex, let delimiter = delimiters.last {
-        let byte = bytes[index]
-        bytes.formIndex(after: &index)
-        if byte == 92, index < bytes.endIndex {
-            bytes.formIndex(after: &index)
-        } else if byte == delimiter {
+    while index < scalars.endIndex, let delimiter = delimiters.last {
+        let scalar = scalars[index]
+        scalars.formIndex(after: &index)
+        if scalar == "\\", index < scalars.endIndex {
+            scalars.formIndex(after: &index)
+        } else if scalar == delimiter {
             delimiters.removeLast()
-        } else if delimiter == 96 {
-            if byte == 36, index < bytes.endIndex, bytes[index] == 123 {
-                delimiters.append(125)
-                bytes.formIndex(after: &index)
+        } else if delimiter == "`" {
+            if scalar == "$", index < scalars.endIndex, scalars[index] == "{" {
+                delimiters.append("}")
+                scalars.formIndex(after: &index)
             }
-        } else if delimiter == 125 {
-            switch byte {
-            case 34, 39, 96: delimiters.append(byte)
-            case 123: delimiters.append(125)
-            case 47 where index < bytes.endIndex && bytes[index] == 47:
-                index = bytes[index...].firstIndex(where: { $0 == 10 || $0 == 13 }) ?? bytes.endIndex
-            case 47 where index < bytes.endIndex && bytes[index] == 42:
-                bytes.formIndex(after: &index)
-                while index < bytes.endIndex {
-                    let wasAsterisk = bytes[index] == 42
-                    bytes.formIndex(after: &index)
-                    if wasAsterisk, index < bytes.endIndex, bytes[index] == 47 {
-                        bytes.formIndex(after: &index)
+        } else if delimiter == "}" {
+            switch scalar {
+            case "\"", "'", "`": delimiters.append(scalar)
+            case "{": delimiters.append("}")
+            case "/" where index < scalars.endIndex && scalars[index] == "/":
+                index = scalars[index...].firstIndex(where: isJavaScriptLineTerminator) ?? scalars.endIndex
+            case "/" where index < scalars.endIndex && scalars[index] == "*":
+                scalars.formIndex(after: &index)
+                while index < scalars.endIndex {
+                    let wasAsterisk = scalars[index] == "*"
+                    scalars.formIndex(after: &index)
+                    if wasAsterisk, index < scalars.endIndex, scalars[index] == "/" {
+                        scalars.formIndex(after: &index)
                         break
                     }
                 }
             default: break
             }
         }
-        if delimiters.count > 64 { return bytes.endIndex }
+        if delimiters.count > 64 { return scalars.endIndex }
     }
     return index
 }
@@ -423,7 +492,7 @@ private func locationObject(in script: String, startingAt start: String.Index, e
                 if let token = Range(match.range(at: 2), in: script),
                    !["", ";", "}"].contains(String(script[token])) {
                     guard let whitespace = Range(match.range(at: 1), in: script),
-                          script[whitespace].contains(where: \.isNewline) else { return nil }
+                          script[whitespace].unicodeScalars.contains(where: isJavaScriptLineTerminator) else { return nil }
                 }
                 return (Data(bytes[..<end]), end)
             }

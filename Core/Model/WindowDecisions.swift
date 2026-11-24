@@ -17,6 +17,7 @@ struct IdentityDecision: Hashable, Sendable {
     let windowID: WindowID
     let confidence: Confidence
     let reason: String
+    let isConfirmed: Bool
 }
 
 struct LifecycleDecision: Hashable, Sendable {

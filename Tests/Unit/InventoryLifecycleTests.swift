@@ -1230,15 +1230,18 @@ final class InventoryLifecycleTests: XCTestCase {
         _ desktop: FamilyFocusAccessibility,
         process: FamilyFocusProcess = FamilyFocusProcess(),
         reader: (any AppTrackerWindowReading)? = nil,
-        frontmostPIDProvider: @escaping @MainActor () -> pid_t? = {
-            NSWorkspace.shared.frontmostApplication?.processIdentifier
-        }
+        frontmostPIDProvider: @escaping @MainActor () -> pid_t? = { -41000 }
     ) async -> AppTracker {
-        let cg = AppTrackerCGWindowSnapshot(allWindowIDs: [1001, 2001, 3000], onScreenWindowIDs: [1001, 2001, 3000],
-            windowIDsByPID: [-41000: [1001], -42000: [2001], -44000: [3000]], alphaByWindowID: [:])
+        let windowsByPID = desktop.desktop.state.withLock { state in
+            Dictionary(grouping: state.windows.values, by: \.pid).mapValues { Set($0.compactMap(\.cgWindowID)) }
+        }
+        let windowIDs = Set(windowsByPID.values.flatMap { $0 })
+        let cg = AppTrackerCGWindowSnapshot(allWindowIDs: windowIDs, onScreenWindowIDs: windowIDs,
+            windowIDsByPID: windowsByPID, alphaByWindowID: [:])
         let tracker = AppTracker(reader: reader ?? AXWindowReader(accessibility: desktop), processProvider: process,
-            cgSnapshotProvider: { cg }, onScreenWindowIDsProvider: { [1001, 2001, 3000] },
-            frontmostPIDProvider: frontmostPIDProvider)
+            cgSnapshotProvider: { cg }, onScreenWindowIDsProvider: { windowIDs },
+            frontmostPIDProvider: frontmostPIDProvider, isAccessibilityTrusted: { true },
+            makeWindowObserver: { pid in AppWindowObserver(pid: pid, makeSession: { _, _ in nil }) })
         tracker.setFrontmostPIDForTesting(-41000)
         for app in FamilyRunningApplication.family {
             tracker.runAdmissionForTesting(source: "seed", app: app, application: app.eligibility)
@@ -1253,9 +1256,10 @@ final class InventoryLifecycleTests: XCTestCase {
         }
     }
 
-    private func assertFamilyActions(_ tracker: AppTracker, active: CGWindowID?, file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertEqual(tracker.snapshot.windows.count, 3, file: file, line: line)
-        let planner = LifecycleActionPlanner(isAppFrontmost: { $0 == -41000 })
+    private func assertFamilyActions(_ tracker: AppTracker, active: CGWindowID?, windowCount: Int = 3,
+                                     file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(tracker.snapshot.windows.count, windowCount, file: file, line: line)
+        let planner = LifecycleActionPlanner(isAppFrontmost: { $0 == -41000 || $0 == -44000 })
         for window in tracker.snapshot.windows.values {
             XCTAssertEqual(window.status, window.cgWindowID == active ? .active : .inactive, file: file, line: line)
             XCTAssertEqual(planner.plan(intent: .toggle(window.id), snapshot: tracker.snapshot).kind,
@@ -1280,6 +1284,220 @@ final class InventoryLifecycleTests: XCTestCase {
         desktop.state.withLock { $0.systemError = .cannotComplete }
         tracker.handleFocusedWindowChanged(pid: -42000)
         tracker.handleFocusedWindowChanged(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: nil)
+    }
+
+    func testFrontmostHelperUsesExactLocalFocusWhenSystemFocusIsUnread() async {
+        let desktop = FamilyFocusAccessibility()
+        let frontmost = Mutex<pid_t>(-41000)
+        let tracker = await familyFocusTracker(desktop, frontmostPIDProvider: { frontmost.withLock { $0 } })
+        defer { tracker.stop() }
+        desktop.state.withLock { $0.systemError = .cannotComplete }
+        frontmost.withLock { $0 = -44000 }
+        tracker.setFrontmostPIDForTesting(-44000)
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await drainInventory(tracker)
+
+        assertFamilyActions(tracker, active: 3000)
+
+        frontmost.withLock { $0 = -41000 }
+        tracker.setFrontmostPIDForTesting(-41000)
+        tracker.handleFocusedWindowChanged(pid: -41000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: nil)
+
+        frontmost.withLock { $0 = -44000 }
+        tracker.setFrontmostPIDForTesting(-44000)
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [1001, 2001, 3000])
+        assertFamilyActions(tracker, active: nil)
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: 3000)
+    }
+
+    func testExactSystemFocusOverridesContradictoryNativeHelperLocalFocus() async {
+        let desktop = FamilyFocusAccessibility()
+        let tracker = await familyFocusTracker(desktop, frontmostPIDProvider: { -44000 })
+        defer { tracker.stop() }
+        tracker.setFrontmostPIDForTesting(-44000)
+        desktop.state.withLock { $0.focused = 2001 }
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await drainInventory(tracker)
+
+        assertFamilyActions(tracker, active: 2001)
+
+        desktop.state.withLock { $0.focused = nil }
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: nil)
+    }
+
+    func testFrontmostHelperRejectsLocalAXFocusForAReplacedElementWithTheSameCGNumber() async {
+        let desktop = FamilyFocusAccessibility()
+        let capture = Mutex((armed: false, held: false))
+        let release = DispatchSemaphore(value: 0)
+        let reader = FamilyFocusReader(reader: AXWindowReader(accessibility: desktop), afterLocalRead: { pid, result in
+            guard pid == -44000, result.result == .window(3000) else { return }
+            let shouldHold = capture.withLock { state in
+                guard state.armed else { return false }
+                state.armed = false
+                state.held = true
+                return true
+            }
+            if shouldHold { _ = release.wait(timeout: .now() + 3) }
+        })
+        let tracker = await familyFocusTracker(desktop, reader: reader, frontmostPIDProvider: { -44000 })
+        defer { release.signal(); tracker.stop() }
+        tracker.setFrontmostPIDForTesting(-44000)
+        desktop.state.withLock { $0.systemError = .cannotComplete }
+        tracker.scheduleFrontmostPollForTesting(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: 3000)
+
+        capture.withLock { $0.armed = true }
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await waitForFocus { capture.withLock { $0.held } }
+        desktop.state.withLock { $0.replacedHelperWindow = true }
+        tracker.scheduleEventReadForTesting(pid: -44000, source: .titleChanged)
+        let id = WindowID(rawValue: "cgw-3000")
+        await waitForFocus { tracker.snapshot.windows[id]?.actionTarget?.element == AXElementKey(e: desktop.replacement) }
+        release.signal()
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: nil)
+
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: 3000)
+    }
+
+    func testLateLocalFocusCannotHighlightAReusedHelperProcessGeneration() async {
+        let desktop = FamilyFocusAccessibility()
+        let process = FamilyFocusProcess()
+        let didCapture = Mutex(false)
+        let release = DispatchSemaphore(value: 0)
+        let reader = FamilyFocusReader(reader: AXWindowReader(accessibility: desktop), afterLocalRead: { pid, result in
+            guard pid == -44000, result.result == .window(3000) else { return }
+            let first = didCapture.withLock { captured in
+                defer { captured = true }
+                return !captured
+            }
+            if first { _ = release.wait(timeout: .now() + 3) }
+        })
+        let tracker = await familyFocusTracker(desktop, process: process, reader: reader, frontmostPIDProvider: { -44000 })
+        defer { release.signal(); tracker.stop() }
+        tracker.setFrontmostPIDForTesting(-44000)
+        desktop.state.withLock { $0.systemError = .cannotComplete }
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await waitForFocus { didCapture.withLock { $0 } }
+
+        process.generations.withLock { $0[-44000] = 11 }
+        desktop.state.withLock { $0.localFocusUnavailable = true }
+        tracker.handleAppTerminated(pid: -44000)
+        let app = FamilyRunningApplication.family[2]
+        tracker.runAdmissionForTesting(source: "seed", app: app, application: app.eligibility)
+        let windowID = WindowID(rawValue: "cgw-3000")
+        await waitForFocus { tracker.snapshot.windows[windowID]?.processGeneration?.seconds == 11 }
+        release.signal()
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: nil)
+
+        desktop.state.withLock { $0.localFocusUnavailable = false }
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: 3000)
+    }
+
+    func testUnreadSystemFocusPollRefreshesTheLocalHelperWindowWithoutInventoryOrFocusEvents() async {
+        let desktop = FamilyFocusAccessibility(additionalHelperWindow: true)
+        let tracker = await familyFocusTracker(desktop, frontmostPIDProvider: { -44000 })
+        defer { tracker.stop() }
+        tracker.setFrontmostPIDForTesting(-44000)
+        desktop.state.withLock { $0.systemError = .cannotComplete }
+        tracker.scheduleFrontmostPollForTesting(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: 3000, windowCount: 4)
+        let inventoryReads = desktop.state.withLock { $0.inventoryReads }
+
+        desktop.state.withLock { $0.localFocusUnavailable = true }
+        tracker.scheduleFrontmostPollForTesting(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: 3000, windowCount: 4)
+
+        desktop.state.withLock { $0.localFocusUnavailable = false; $0.localFocusedHelperWindow = 3001 }
+        tracker.scheduleFrontmostPollForTesting(pid: -44000)
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: 3001, windowCount: 4)
+        XCTAssertEqual(desktop.state.withLock { $0.inventoryReads }, inventoryReads)
+    }
+
+    func testLateLocalFocusCannotPublishAfterOnlyTheLiveForegroundChanges() async {
+        let desktop = FamilyFocusAccessibility()
+        let frontmost = Mutex<pid_t>(-44000)
+        let captured = Mutex(false)
+        let release = DispatchSemaphore(value: 0)
+        let reader = FamilyFocusReader(reader: AXWindowReader(accessibility: desktop), afterLocalRead: { pid, result in
+            guard pid == -44000, result.result == .window(3000) else { return }
+            let first = captured.withLock { value in
+                defer { value = true }
+                return !value
+            }
+            if first { _ = release.wait(timeout: .now() + 3) }
+        })
+        let tracker = await familyFocusTracker(desktop, reader: reader, frontmostPIDProvider: { frontmost.withLock { $0 } })
+        defer { release.signal(); tracker.stop() }
+        tracker.setFrontmostPIDForTesting(-44000)
+        desktop.state.withLock { $0.systemError = .cannotComplete }
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await waitForFocus { captured.withLock { $0 } }
+
+        frontmost.withLock { $0 = -41000 }
+        release.signal()
+        await drainInventory(tracker)
+        assertFamilyActions(tracker, active: nil)
+    }
+
+    func testLiveHelperForegroundCanRecoverAMissedActivationFromTheCachedHost() async {
+        for poll in [false, true] {
+            let desktop = FamilyFocusAccessibility()
+            let frontmost = Mutex<pid_t>(-41000)
+            let tracker = await familyFocusTracker(desktop, frontmostPIDProvider: { frontmost.withLock { $0 } })
+            defer { tracker.stop() }
+            assertFamilyActions(tracker, active: 1001)
+            desktop.state.withLock { $0.systemError = .cannotComplete }
+
+            frontmost.withLock { $0 = -44000 }
+            if poll { tracker.pollFrontmostApp() }
+            else { tracker.handleFocusedWindowChanged(pid: -44000) }
+            await drainInventory(tracker)
+            assertFamilyActions(tracker, active: 3000)
+        }
+    }
+
+    func testLateExactSystemFocusCannotPublishAfterOnlyTheLiveForegroundLeavesTheFamily() async {
+        let desktop = FamilyFocusAccessibility()
+        let frontmost = Mutex<pid_t>(-41000)
+        let state = Mutex((armed: false, captured: false))
+        let release = DispatchSemaphore(value: 0)
+        let reader = FamilyFocusReader(reader: AXWindowReader(accessibility: desktop), afterSystemRead: { result in
+            guard result.result == .window(pid: -44000, windowID: 3000) else { return }
+            let hold = state.withLock { values in
+                guard values.armed else { return false }
+                values.armed = false
+                values.captured = true
+                return true
+            }
+            if hold { _ = release.wait(timeout: .now() + 3) }
+        })
+        let tracker = await familyFocusTracker(desktop, reader: reader, frontmostPIDProvider: { frontmost.withLock { $0 } })
+        defer { release.signal(); tracker.stop() }
+        desktop.state.withLock { $0.focused = 3000 }
+        state.withLock { $0.armed = true }
+        tracker.handleFocusedWindowChanged(pid: -44000)
+        await waitForFocus { state.withLock { $0.captured } }
+
+        frontmost.withLock { $0 = -45000 }
+        release.signal()
         await drainInventory(tracker)
         assertFamilyActions(tracker, active: nil)
     }
@@ -1322,7 +1540,7 @@ final class InventoryLifecycleTests: XCTestCase {
         let desktop = FamilyFocusAccessibility()
         let gateState = Mutex((armed: false, result: AXSystemFocusedWindowRead?.none, released: false))
         let release = DispatchSemaphore(value: 0)
-        let reader = FamilyFocusReader(reader: AXWindowReader(accessibility: desktop)) { result in
+        let reader = FamilyFocusReader(reader: AXWindowReader(accessibility: desktop), afterSystemRead: { result in
             let shouldHold = gateState.withLock { state in
                 guard state.armed else { return false }
                 state.armed = false
@@ -1332,7 +1550,7 @@ final class InventoryLifecycleTests: XCTestCase {
             guard shouldHold else { return }
             let released = release.wait(timeout: .now() + 5) == .success
             gateState.withLock { $0.released = released }
-        }
+        })
         desktop.state.withLock { $0.focused = 3000 }
         let tracker = await familyFocusTracker(desktop, reader: reader)
         defer { release.signal(); tracker.stop() }
@@ -1537,6 +1755,35 @@ final class InventoryLifecycleTests: XCTestCase {
         XCTAssertEqual(desktop.state.withLock { $0.systemTimeoutWrites }, 0)
     }
 
+    func testSystemFocusValidatesTheOriginalControlBeforeConfirmingNoWindow() {
+        for mode in ["stable", "changed", "cancelled"] {
+            let desktop = FamilyFocusAccessibility()
+            let cancellation = OperationCancellation()
+            desktop.state.withLock {
+                $0.focused = 3000
+                $0.focusedControl = true
+                $0.controlOwner = -44000
+                $0.childError = .noValue
+                $0.beforeRead = { [weak desktop] attribute in
+                    guard attribute == kAXWindowAttribute as String else { return }
+                    if mode == "changed" {
+                        desktop?.state.withLock { $0.focused = 1001; $0.focusedControl = false }
+                    }
+                    if mode == "cancelled" { cancellation.cancel() }
+                }
+            }
+            let result = AXWindowReader(accessibility: desktop).systemFocusedWindowRead(messagingTimeout: 0.05,
+                cancellation: cancellation)
+            switch mode {
+            case "stable": XCTAssertEqual(result.result, .none)
+            case "changed": XCTAssertEqual(result.result, .unread(.invalidUIElement))
+            default: XCTAssertEqual(result.result, .unread(.cannotComplete))
+            }
+            XCTAssertNil(result.windowElement)
+            XCTAssertEqual(desktop.state.withLock { $0.systemReads }, mode == "cancelled" ? 1 : 2)
+        }
+    }
+
     func testSystemFocusReadRejectsChangedFocusMismatchedOwnersAndCancellation() {
         for mode in ["changed", "owner", "cancel"] {
             let desktop = FamilyFocusAccessibility()
@@ -1579,12 +1826,112 @@ final class InventoryLifecycleTests: XCTestCase {
         }
     }
 
+    func testBackgroundScanDiscoversARootWhenItsSameWindowNumberGainsParentEvidence() async {
+        let reader = AdmissionWindowReader()
+        reader.state.withLock {
+            $0.subrole = kAXUnknownSubrole as String
+            $0.isModal = false
+            $0.isTopLevel = true
+        }
+        let pid: pid_t = 45321
+        let app = FamilyRunningApplication(pid: pid, identifier: "test.scan", policy: .regular, path: "/Applications/Scan.app")
+        let windowID: CGWindowID = 77
+        let unknown = AppTrackerCGWindowSnapshot(allWindowIDs: [windowID], onScreenWindowIDs: [windowID],
+            windowIDsByPID: [pid: [windowID]], alphaByWindowID: [windowID: 1])
+        let knownRoot = AppTrackerCGWindowSnapshot(allWindowIDs: [windowID], onScreenWindowIDs: [windowID],
+            windowIDsByPID: [pid: [windowID]], alphaByWindowID: [windowID: 1], parentWindowIDs: [windowID: 0])
+        let capture = Mutex(unknown)
+        let tracker = AppTracker(reader: reader, processProvider: LifecycleProcess(),
+            cgSnapshotProvider: { capture.withLock { $0 } }, onScreenWindowIDsProvider: { [windowID] },
+            scanGateEnabled: true, uptimeProvider: { 1000 }, frontmostPIDProvider: { nil },
+            isAccessibilityTrusted: { false })
+        defer { tracker.stop() }
+        tracker.runAdmissionForTesting(source: "scan", app: app)
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        tracker.runPeriodicReconcileForTesting()
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertTrue(tracker.snapshot.windows.isEmpty)
+        XCTAssertEqual(reader.state.withLock { $0.reads }, 2)
+
+        capture.withLock { $0 = knownRoot }
+        tracker.runPeriodicReconcileForTesting()
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(reader.state.withLock { $0.reads }, 3)
+        XCTAssertEqual(tracker.snapshot.windows.values.map(\.title), ["Dashboard"])
+    }
+
+    func testBackgroundScanMemoizesAConclusiveRejectionWithUnchangedParentEvidence() async {
+        let reader = AdmissionWindowReader(rejected: .utility)
+        let pid: pid_t = 45321
+        let app = FamilyRunningApplication(pid: pid, identifier: "test.scan", policy: .regular, path: "/Applications/Scan.app")
+        let capture = AppTrackerCGWindowSnapshot(allWindowIDs: [77], onScreenWindowIDs: [77],
+            windowIDsByPID: [pid: [77]], alphaByWindowID: [77: 1], parentWindowIDs: [77: 0])
+        let tracker = AppTracker(reader: reader, processProvider: LifecycleProcess(),
+            cgSnapshotProvider: { capture }, onScreenWindowIDsProvider: { [77] },
+            scanGateEnabled: true, uptimeProvider: { 1000 }, frontmostPIDProvider: { nil },
+            isAccessibilityTrusted: { false })
+        defer { tracker.stop() }
+        tracker.runAdmissionForTesting(source: "scan", app: app)
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        for _ in 0..<2 {
+            tracker.runPeriodicReconcileForTesting()
+            for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        }
+        XCTAssertEqual(reader.state.withLock { $0.reads }, 2)
+        XCTAssertTrue(tracker.snapshot.windows.isEmpty)
+    }
+
+    func testBackgroundScanCannotMemoizeNewRootEvidenceAgainstAnOlderEmptyAXRead() async {
+        let reader = AdmissionWindowReader()
+        reader.state.withLock { $0.windowID = nil }
+        let pid: pid_t = 45321
+        let app = FamilyRunningApplication(pid: pid, identifier: "test.scan", policy: .regular, path: "/Applications/Scan.app")
+        let windowID: CGWindowID = 77
+        let unknown = AppTrackerCGWindowSnapshot(allWindowIDs: [windowID], onScreenWindowIDs: [windowID],
+            windowIDsByPID: [pid: [windowID]], alphaByWindowID: [windowID: 1])
+        let knownRoot = AppTrackerCGWindowSnapshot(allWindowIDs: [windowID], onScreenWindowIDs: [windowID],
+            windowIDsByPID: [pid: [windowID]], alphaByWindowID: [windowID: 1], parentWindowIDs: [windowID: 0])
+        let capture = Mutex(unknown)
+        let tracker = AppTracker(reader: reader, processProvider: LifecycleProcess(),
+            cgSnapshotProvider: { capture.withLock { $0 } }, onScreenWindowIDsProvider: { [windowID] },
+            scanGateEnabled: true, uptimeProvider: { 1000 }, frontmostPIDProvider: { nil },
+            isAccessibilityTrusted: { false })
+        let gate = LaunchInventoryReadGate()
+        defer { gate.open(); tracker.stop() }
+        tracker.runAdmissionForTesting(source: "scan", app: app)
+        await drainInventory(tracker)
+        reader.state.withLock { $0.returnGate = gate }
+        tracker.runPeriodicReconcileForTesting()
+        await waitForFocus { gate.isWaiting }
+        XCTAssertTrue(gate.isWaiting)
+        XCTAssertEqual(reader.state.withLock { $0.reads }, 2)
+
+        reader.state.withLock {
+            $0.returnGate = nil
+            $0.windowID = windowID
+            $0.subrole = kAXUnknownSubrole as String
+            $0.isModal = false
+            $0.isTopLevel = true
+        }
+        capture.withLock { $0 = knownRoot }
+        tracker.runPeriodicReconcileForTesting()
+        XCTAssertEqual(reader.state.withLock { $0.reads }, 2)
+        gate.open()
+        await drainInventory(tracker)
+        XCTAssertTrue(tracker.snapshot.windows.isEmpty)
+
+        tracker.runPeriodicReconcileForTesting()
+        await drainInventory(tracker)
+        XCTAssertEqual(reader.state.withLock { $0.reads }, 3)
+        XCTAssertEqual(tracker.snapshot.windows.values.map(\.title), ["Dashboard"])
+    }
+
     private func ownedTracker(reader: any AppTrackerWindowReading, process: OwnedApplicationProcess) -> AppTracker {
         let pid = NSRunningApplication.current.processIdentifier
         let cg = AppTrackerCGWindowSnapshot(allWindowIDs: [77], onScreenWindowIDs: [77],
             windowIDsByPID: [pid: [77]], alphaByWindowID: [77: 1])
         return AppTracker(reader: reader, processProvider: process,
-                          cgSnapshotProvider: { cg }, onScreenWindowIDsProvider: { [77] })
+                          cgSnapshotProvider: { cg }, onScreenWindowIDsProvider: { [77] }, frontmostPIDProvider: { -43000 })
     }
 
     func testLateAdmissionCannotReplaceTheBindingOfAnAlreadyAdmittedHelper() async {
@@ -1896,6 +2243,34 @@ final class InventoryLifecycleTests: XCTestCase {
         }
     }
 
+    func testCoreGraphicsOnlyCandidatesCannotAdmitAnApplication() async {
+        let app = FamilyRunningApplication(pid: 40421, identifier: "test.CGOnly", policy: .regular,
+                                           path: "/Applications/CGOnly.app")
+        let ids = Set((100...159).map { CGWindowID($0) })
+        let cg = AppTrackerCGWindowSnapshot(allWindowIDs: ids, onScreenWindowIDs: ids,
+            windowIDsByPID: [app.processIdentifier: ids],
+            alphaByWindowID: Dictionary(uniqueKeysWithValues: ids.map { ($0, 1) }))
+
+        for source in ["seed", "scan", "launchRetry"] {
+            for readError in [nil, AXError.cannotComplete] {
+                let reader = AdmissionWindowReader(rejected: .empty)
+                reader.state.withLock { $0.readError = readError }
+                let tracker = AppTracker(reader: reader, processProvider: LifecycleProcess(),
+                    cgSnapshotProvider: { cg }, onScreenWindowIDsProvider: { ids }, frontmostPIDProvider: { nil },
+                    workspaceNotifications: NotificationCenter(), isAccessibilityTrusted: { false })
+                defer { tracker.stop() }
+
+                tracker.runAdmissionForTesting(source: source, app: app, application: app.eligibility)
+                for task in tracker.pendingInventoryWorkForTesting { await task.value }
+
+                let context = "\(source), AX read error: \(String(describing: readError))"
+                XCTAssertGreaterThan(reader.state.withLock { $0.reads }, 0, context)
+                XCTAssertNil(tracker.fixtureAppForTesting(pid: app.processIdentifier), context)
+                XCTAssertTrue(tracker.snapshot.windows.isEmpty, context)
+            }
+        }
+    }
+
     func testAccessoryWindowCanReopenFromAnEventWithoutPeriodicAdmission() async {
         let reader = AdmissionWindowReader()
         let tracker = admissionTracker(reader: reader)
@@ -2083,6 +2458,528 @@ final class InventoryLifecycleTests: XCTestCase {
             XCTAssertEqual(captures.withLock { $0 }, 0)
         }
     }
+
+    func testLaunchWindowCreatedPublishesTheExactButtonBeforeAXListsTheWindow() async throws {
+        try await assertLaunchWindowCreatedPublishesButton(initiallyUnread: false)
+    }
+
+    func testLaunchWindowCreatedPublishesTheExactButtonAfterAnUnreadProbe() async throws {
+        try await assertLaunchWindowCreatedPublishesButton(initiallyUnread: true)
+    }
+
+    func testActivationWindowCreatedPublishesTheExactButtonBeforeLaunchNotification() async throws {
+        try await assertLaunchWindowCreatedPublishesButton(initiallyUnread: true,
+            notification: NSWorkspace.didActivateApplicationNotification)
+    }
+
+    private func assertLaunchWindowCreatedPublishesButton(initiallyUnread: Bool,
+        notification: Notification.Name = NSWorkspace.didLaunchApplicationNotification) async throws {
+        let fixture = LaunchInventoryFixture(unread: initiallyUnread)
+        let runtime = AppRuntime(tracker: fixture.tracker, actionExecutor: PlatformActionExecutor(
+            reader: AXWindowReader(accessibility: fixture.desktop), system: fixture.desktop, focusBackend: fixture.desktop))
+        let spaces = TaskbarSpaceStore(read: { requests in
+            WindowSpaceSnapshot(layouts: ["left": .init(orderedSpaceIDs: [1], fullscreenSpaceIDs: [], currentSpaceID: 1)],
+                memberships: Dictionary(uniqueKeysWithValues: requests.map { ($0.identity, [1]) }))
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        let topology = DisplayTopologyStore(initialSnapshot: ScreenTopologySnapshot(
+            physicalDisplayCount: 1, identifiedDisplayUUIDs: ["left"], attributionTable: fixture.table))
+        let domain = "DeskMote.LaunchInventory.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        let view = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+        let presenter = TaskbarPresenter(view: view, runtime: runtime, ordering: StripOrderStore(defaults: defaults),
+            topology: topology, spaces: spaces, displayUUID: "left", backgroundMenu: { _, _ in },
+            popupPresented: { _ in }, contextMenuVisibilityChanged: { _ in },
+            icons: AppIconResolver(notifications: fixture.notifications, applicationURL: { _ in nil },
+                imageForFile: { _ in NSImage(size: .zero) }, fallbackImage: { NSImage(size: .zero) }, stampAtPath: { _ in nil }),
+            system: fixture.desktop)
+        runtime.start()
+        spaces.start(snapshots: runtime.$snapshot.eraseToAnyPublisher())
+        defer {
+            spaces.stop()
+            runtime.stop()
+            defaults.removePersistentDomain(forName: domain)
+            withExtendedLifetime(presenter) {}
+        }
+        func buttonIDs() -> [String] {
+            view.taskbarContent.groups.flatMap(\.windows).map(\.item.actionWindowID)
+        }
+
+        fixture.post(notification)
+        try await waitForLaunch { fixture.session.attachments == 1 && fixture.inventoryReads > 0 }
+        await drainInventory(fixture.tracker)
+        XCTAssertTrue(fixture.tracker.snapshot.windows.isEmpty)
+        XCTAssertTrue(buttonIDs().isEmpty)
+        let capturesBeforeCreation = fixture.fullCaptures
+        let receive = try XCTUnwrap(fixture.receive)
+        XCTAssertTrue(fixture.session.applicationNotifications.withLock { $0.contains(kAXWindowCreatedNotification) })
+        receive(fixture.element, kAXWindowCreatedNotification)
+        try await waitForLaunch { buttonIDs() == ["cgw-1001"] }
+
+        let record = try XCTUnwrap(fixture.tracker.snapshot.windows[WindowID(rawValue: "cgw-1001")])
+        XCTAssertEqual(record.actionTarget?.element, fixture.element)
+        XCTAssertEqual(record.status, .inactive)
+        XCTAssertEqual(capturesBeforeCreation, 0)
+        XCTAssertEqual(fixture.fullCaptures, 1)
+    }
+
+    func testLaunchRechecksAfterWindowCreatedSubscriptionCoversTheSetupGap() async throws {
+        let fixture = LaunchInventoryFixture()
+        fixture.session.blockedApplicationNotification.withLock { $0 = kAXWindowCreatedNotification }
+        defer { fixture.session.gate.signal(); fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch {
+            fixture.session.applicationCalls.withLock { $0.contains(kAXWindowCreatedNotification) } &&
+                fixture.inventoryReads == 1
+        }
+        await drainInventory(fixture.tracker)
+        XCTAssertTrue(fixture.tracker.snapshot.windows.isEmpty)
+        XCTAssertEqual(fixture.fullCaptures, 0)
+        fixture.desktop.state.withLock { $0.enumeratedWindows[fixture.app.processIdentifier] = [1001] }
+        XCTAssertEqual(fixture.session.attachments, 0)
+        fixture.session.gate.signal()
+        try await waitForLaunch { fixture.tracker.snapshot.orderedWindowIDs == [WindowID(rawValue: "cgw-1001")] }
+
+        XCTAssertEqual(fixture.session.attachments, 1)
+        XCTAssertEqual(fixture.inventoryReads, 2)
+        XCTAssertEqual(fixture.fullCaptures, 1)
+    }
+
+    func testLaunchAttachmentRecheckSurvivesExactAdmissionOfAnotherWindow() async throws {
+        let emptyReturn = LaunchInventoryReadGate()
+        let fixture = LaunchInventoryFixture(cgSamples: [[1001, 1002]], firstEmptyReturn: emptyReturn)
+        fixture.session.blockedApplicationNotification.withLock { $0 = kAXWindowCreatedNotification }
+        defer { emptyReturn.open(); fixture.session.gate.signal(); fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch {
+            emptyReturn.isWaiting && fixture.session.applicationCalls.withLock { $0.contains(kAXWindowCreatedNotification) }
+        }
+        XCTAssertEqual(fixture.session.attachments, 0)
+        XCTAssertEqual(fixture.fullCaptures, 0)
+        fixture.desktop.state.withLock {
+            $0.enumeratedWindows[fixture.app.processIdentifier] = [1001]
+            $0.windows[1002]?.bounds = CGRect(x: 100, y: 100, width: 700, height: 500)
+        }
+        fixture.session.gate.signal()
+        try await waitForLaunch { fixture.session.attachments == 1 }
+        try await deliverStartupCreations([1002], fixture: fixture)
+        var publications: [[WindowID]] = []
+        let subscription = fixture.tracker.snapshots.sink { publications.append($0.orderedWindowIDs) }
+        defer { subscription.cancel() }
+
+        emptyReturn.open()
+        await drainInventory(fixture.tracker)
+
+        let preAttach = WindowID(rawValue: "cgw-1001")
+        let exact = WindowID(rawValue: "cgw-1002")
+        XCTAssertEqual(publications, [[], [exact], [exact, preAttach]])
+        XCTAssertEqual(Set(StripItem.openWindows(from: fixture.tracker.snapshot).map(\.title)), ["editor-a", "editor-b"])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[preAttach]?.actionTarget?.element, fixture.element(for: 1001))
+        XCTAssertEqual(fixture.tracker.snapshot.windows[exact]?.actionTarget?.element, fixture.element(for: 1002))
+        XCTAssertEqual(fixture.inventoryReads, 2)
+        XCTAssertEqual(fixture.uptime, 100)
+    }
+
+    func testLaunchAttachmentRecheckSurvivesExactAdmissionThroughInventoryBackoff() async throws {
+        let fixture = LaunchInventoryFixture(unread: true, cgSamples: [[1001, 1002]])
+        fixture.session.blockedApplicationNotification.withLock { $0 = kAXWindowCreatedNotification }
+        defer { fixture.session.gate.signal(); fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch {
+            fixture.inventoryReads == 1 && fixture.session.applicationCalls.withLock { $0.contains(kAXWindowCreatedNotification) }
+        }
+        await drainInventory(fixture.tracker)
+        fixture.desktop.state.withLock {
+            let pid = fixture.app.processIdentifier
+            $0.unreadInventories.remove(pid)
+            $0.enumeratedWindows[pid] = [1001]
+            $0.windows[1002]?.bounds = CGRect(x: 100, y: 100, width: 700, height: 500)
+        }
+        fixture.session.gate.signal()
+        try await waitForLaunch { fixture.session.attachments == 1 }
+        try await deliverStartupCreations([1002], fixture: fixture)
+        await drainInventory(fixture.tracker)
+
+        let preAttach = WindowID(rawValue: "cgw-1001")
+        let exact = WindowID(rawValue: "cgw-1002")
+        XCTAssertEqual(fixture.tracker.snapshot.orderedWindowIDs, [exact])
+        XCTAssertEqual(fixture.inventoryReads, 1)
+        fixture.uptime = 100.49
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: -49900)
+        await drainInventory(fixture.tracker)
+        XCTAssertEqual(fixture.inventoryReads, 1)
+        fixture.uptime = 100.5
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: -49900)
+        await drainInventory(fixture.tracker)
+        XCTAssertEqual(fixture.tracker.snapshot.orderedWindowIDs, [exact, preAttach])
+        XCTAssertEqual(fixture.inventoryReads, 2)
+        fixture.uptime = 101
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: -49900)
+        await drainInventory(fixture.tracker)
+        XCTAssertEqual(fixture.inventoryReads, 2)
+    }
+
+    func testLaunchReusesTheObserverAlreadyStartedByActivation() async throws {
+        let fixture = LaunchInventoryFixture()
+        defer { fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didActivateApplicationNotification)
+        try await waitForLaunch { fixture.session.attachments == 1 }
+        await drainInventory(fixture.tracker)
+        let readsBeforeLaunch = fixture.inventoryReads
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch { fixture.inventoryReads == readsBeforeLaunch + 1 }
+        await drainInventory(fixture.tracker)
+        XCTAssertEqual(fixture.session.attachments, 1)
+
+        let receive = try XCTUnwrap(fixture.receive)
+        receive(fixture.element, kAXWindowCreatedNotification)
+        try await waitForLaunch { !fixture.tracker.snapshot.windows.isEmpty }
+        XCTAssertEqual(fixture.tracker.snapshot.windows.count, 1)
+    }
+
+    func testReusedPIDDoesNotReadACreationFromThePreviousLaunch() async throws {
+        let fixture = LaunchInventoryFixture()
+        defer { fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch { fixture.session.attachments == 1 && fixture.inventoryReads > 0 }
+        await drainInventory(fixture.tracker)
+        let receive = try XCTUnwrap(fixture.receive)
+        let reads = fixture.inventoryReads
+        fixture.process.generation.withLock { $0 += 1 }
+        receive(fixture.element, kAXWindowCreatedNotification)
+        try await waitForLaunch { fixture.session.detachments == 1 }
+        await drainInventory(fixture.tracker)
+        XCTAssertEqual(fixture.inventoryReads, reads)
+        XCTAssertTrue(fixture.tracker.snapshot.windows.isEmpty)
+    }
+
+    func testLaunchRescueRespectsFullInventoryBackoffAfterActivationUnread() async throws {
+        let retry = LaunchRetryGate()
+        let fixture = LaunchInventoryFixture(unread: true, retry: retry)
+        defer { retry.open(); fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didActivateApplicationNotification)
+        try await waitForLaunch { fixture.session.attachments == 1 && fixture.inventoryReads == 1 }
+        await drainInventory(fixture.tracker)
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch { retry.isWaiting }
+        retry.open()
+        await drainInventory(fixture.tracker)
+        XCTAssertEqual(fixture.inventoryReads, 1)
+
+        let receive = try XCTUnwrap(fixture.receive)
+        receive(fixture.element, kAXWindowCreatedNotification)
+        try await waitForLaunch { fixture.tracker.snapshot.windows[WindowID(rawValue: "cgw-1001")] != nil }
+        let reads = fixture.inventoryReads
+        for (early, due) in [(100.49, 100.5), (101.49, 101.5), (103.49, 103.5)] {
+            fixture.uptime = early
+            fixture.tracker.scheduleFrontmostPollForTesting(pid: fixture.app.processIdentifier)
+            await drainInventory(fixture.tracker)
+            let unchanged = fixture.inventoryReads
+            fixture.uptime = due
+            fixture.tracker.scheduleFrontmostPollForTesting(pid: fixture.app.processIdentifier)
+            await drainInventory(fixture.tracker)
+            XCTAssertEqual(fixture.inventoryReads, unchanged + 1)
+        }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(fixture.inventoryReads, 4)
+        XCTAssertEqual(fixture.tracker.snapshot.orderedWindowIDs, [WindowID(rawValue: "cgw-1001")])
+        fixture.uptime = 120
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: fixture.app.processIdentifier)
+        await drainInventory(fixture.tracker)
+        XCTAssertEqual(fixture.inventoryReads, 4)
+    }
+
+    func testLaunchRescueDoesNotRetryRegistrationOnAReusedPIDWithAPendingRead() async throws {
+        let retry = LaunchRetryGate()
+        let inventoryGate = LaunchInventoryReadGate()
+        let fixture = LaunchInventoryFixture(retry: retry, firstRead: inventoryGate)
+        fixture.session.applicationResults.withLock { $0[kAXWindowCreatedNotification] = [.cannotComplete, .success] }
+        defer { inventoryGate.open(); retry.open(); fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch {
+            retry.isWaiting && inventoryGate.isWaiting && fixture.session.attachments == 1
+        }
+        let oldObserver = try XCTUnwrap(fixture.observers.first)
+        for task in oldObserver.pendingWorkForTesting { await task.value }
+        let createdCalls = fixture.session.applicationCalls.withLock { $0.filter { $0 == kAXWindowCreatedNotification }.count }
+        XCTAssertEqual(createdCalls, 1)
+        fixture.process.generation.withLock { $0 += 1 }
+        fixture.uptime = 101
+        retry.open()
+        try await waitForLaunch { fixture.session.detachments == 1 }
+        XCTAssertEqual(fixture.session.applicationCalls.withLock { $0.filter { $0 == kAXWindowCreatedNotification }.count }, 1)
+        XCTAssertEqual(fixture.inventoryReads, 1)
+
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch { fixture.observers.count == 2 && fixture.session.attachments == 2 }
+        XCTAssertFalse(fixture.observers[1] === oldObserver)
+        XCTAssertEqual(fixture.session.applicationCalls.withLock { $0.filter { $0 == kAXWindowCreatedNotification }.count }, 2)
+        inventoryGate.open()
+        await drainInventory(fixture.tracker)
+    }
+
+    func testStartupCoalescingKeepsEarlierEligibleCreationWhenLaterCreationIsFiltered() async throws {
+        let gate = LaunchInventoryReadGate()
+        let fixture = LaunchInventoryFixture(firstRead: gate, cgSamples: [[1001, 1002]])
+        fixture.desktop.state.withLock { $0.subroles[1002] = kAXFloatingWindowSubrole }
+        defer { gate.open(); fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch { gate.isWaiting && fixture.session.attachments == 1 }
+        try await deliverStartupCreations([1001, 1002], fixture: fixture)
+        gate.open()
+        await drainInventory(fixture.tracker)
+
+        XCTAssertEqual(fixture.tracker.snapshot.orderedWindowIDs, [WindowID(rawValue: "cgw-1001")])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[WindowID(rawValue: "cgw-1001")]?.actionTarget?.element, fixture.element)
+    }
+
+    func testQueuedCreationAfterFirstFullAdmissionAddsWithoutRemovingUnobservedWindow() async throws {
+        let gate = LaunchInventoryReadGate()
+        let fixture = LaunchInventoryFixture(firstRead: gate, initialWindows: [1001],
+            cgSamples: [[1001], [1002], [1001, 1002]])
+        defer { gate.open(); fixture.tracker.stop() }
+        fixture.post(NSWorkspace.didLaunchApplicationNotification)
+        try await waitForLaunch { gate.isWaiting && fixture.session.attachments == 1 }
+        fixture.desktop.state.withLock { $0.enumeratedWindows[fixture.app.processIdentifier] = [] }
+        try await deliverStartupCreations([1002], fixture: fixture)
+        var publications: [[WindowID]] = []
+        let subscription = fixture.tracker.snapshots.sink { publications.append($0.orderedWindowIDs) }
+        defer { subscription.cancel() }
+        gate.open()
+        await drainInventory(fixture.tracker)
+
+        let first = WindowID(rawValue: "cgw-1001")
+        let second = WindowID(rawValue: "cgw-1002")
+        XCTAssertEqual(publications, [[], [first], [first, second]])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[second]?.actionTarget?.element, fixture.element(for: 1002))
+        XCTAssertEqual(fixture.inventoryReads, 2, "Only the initial and attachment inventory reads are performed")
+    }
+
+    func testCreatedUntitledCustomWindowUsesOnlyMatchingConfirmedFocus() async throws {
+        for focusedWindow: CGWindowID in [1001, 2001] {
+            let pid: pid_t = 515123
+            let fixture = LaunchInventoryFixture(unread: true, cgSamples: [[2001]], browserPID: pid)
+            let id = WindowID(rawValue: "cgw-2001")
+            fixture.desktop.state.withLock {
+                $0.windows[2001]?.title = ""
+                $0.subroles[2001] = kAXUnknownSubrole
+                $0.modalWindows[2001] = false
+                _ = $0.topLevelWindows.insert(2001)
+                $0.publishedFocusedWindows[pid] = focusedWindow
+            }
+            defer { fixture.tracker.stop() }
+            fixture.post(NSWorkspace.didLaunchApplicationNotification)
+            try await waitForLaunch { fixture.session.attachments == 1 && fixture.inventoryReads == 1 }
+            await drainInventory(fixture.tracker)
+            fixture.tracker.handleFocusedWindowChanged(pid: pid)
+            await drainInventory(fixture.tracker)
+            try await deliverStartupCreations([2001], fixture: fixture)
+            await drainInventory(fixture.tracker)
+
+            if focusedWindow == 2001 {
+                XCTAssertEqual(fixture.tracker.snapshot.windows[id]?.actionTarget?.element, fixture.element(for: 2001))
+            } else {
+                XCTAssertTrue(fixture.tracker.snapshot.windows.isEmpty)
+            }
+            XCTAssertEqual(fixture.inventoryReads, 1)
+        }
+    }
+
+    private func deliverStartupCreations(_ ids: [CGWindowID], fixture: LaunchInventoryFixture) async throws {
+        let observer = try XCTUnwrap(fixture.observers.first)
+        let receive = try XCTUnwrap(fixture.receive)
+        let handle = observer.onWindowCreated
+        var delivered = 0
+        observer.onWindowCreated = { pid, element in
+            handle?(pid, element)
+            delivered += 1
+        }
+        defer { observer.onWindowCreated = handle }
+        for (index, id) in ids.enumerated() {
+            receive(fixture.element(for: id), kAXWindowCreatedNotification)
+            try await waitForLaunch { delivered == index + 1 }
+        }
+    }
+
+    private func waitForLaunch(_ predicate: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while !predicate(), ContinuousClock.now < deadline { await Task.yield() }
+        _ = try XCTUnwrap(predicate() ? true : nil, "The launch event did not complete", file: file, line: line)
+    }
+}
+
+@MainActor
+private final class LaunchInventoryFixture {
+    private final class Signals: Sendable {
+        let inventoryReads = Mutex(0)
+        let fullCaptures = Mutex(0)
+        let callback = Mutex<(@Sendable (AXElementKey, String) -> Void)?>(nil)
+        let uptime = Mutex<TimeInterval>(100)
+    }
+
+    private final class Observers {
+        var values: [AppWindowObserver] = []
+    }
+
+    let app: FamilyRunningApplication
+    let desktop: BehaviorDesktop
+    let process = LifecycleProcess()
+    let session = ObservationFixture()
+    let notifications = NotificationCenter()
+    private let signals = Signals()
+    private let observationState = Observers()
+    let table = WindowDisplayAttribution.Table(displays: [
+        .init(uuid: "left", cgFrame: CGRect(x: 0, y: 0, width: 1920, height: 1080))
+    ], primaryUUID: "left")
+    let tracker: AppTracker
+    var element: AXElementKey { element(for: 1001) }
+    func element(for id: CGWindowID) -> AXElementKey { AXElementKey(e: desktop.elements[id]!) }
+    var inventoryReads: Int { signals.inventoryReads.withLock { $0 } }
+    var fullCaptures: Int { signals.fullCaptures.withLock { $0 } }
+    var receive: (@Sendable (AXElementKey, String) -> Void)? { signals.callback.withLock { $0 } }
+    var observers: [AppWindowObserver] { observationState.values }
+    var uptime: TimeInterval {
+        get { signals.uptime.withLock { $0 } }
+        set { signals.uptime.withLock { $0 = newValue } }
+    }
+
+    init(unread: Bool = false, retry: LaunchRetryGate? = nil, firstRead: LaunchInventoryReadGate? = nil,
+         initialWindows: [CGWindowID] = [], cgSamples: [Set<CGWindowID>] = [[1001]], browserPID: pid_t? = nil,
+         firstEmptyReturn: LaunchInventoryReadGate? = nil) {
+        app = FamilyRunningApplication(pid: browserPID ?? -41000, identifier: "test.Editor", policy: .regular,
+            path: "/Applications/Editor.app")
+        desktop = BehaviorDesktop(browserPID: browserPID ?? -42000)
+        let pid = app.processIdentifier
+        let signals = signals
+        desktop.state.withLock {
+            $0.focused = nil
+            $0.enumeratedWindows[pid] = initialWindows
+            if unread { $0.unreadInventories.insert(pid) }
+            $0.beforeInventoryRead = { _ in
+                let first = signals.inventoryReads.withLock { count in
+                    count += 1
+                    return count == 1
+                }
+                if first { firstRead?.wait() }
+            }
+        }
+        let session = session
+        let table = table
+        let observationState = observationState
+        let reader = AXWindowReader(accessibility: desktop)
+        let inventoryReader: any AppTrackerWindowReading
+        if let firstEmptyReturn {
+            inventoryReader = LaunchInventoryReturnGate(reader: reader, firstEmptyReturn: firstEmptyReturn)
+        } else {
+            inventoryReader = reader
+        }
+        tracker = AppTracker(reader: inventoryReader, processProvider: process,
+            cgSnapshotProvider: {
+                let capture = signals.fullCaptures.withLock { count in
+                    defer { count += 1 }
+                    return count
+                }
+                let ids = cgSamples[min(capture, cgSamples.count - 1)]
+                return .init(allWindowIDs: ids, onScreenWindowIDs: ids, windowIDsByPID: [pid: ids],
+                    alphaByWindowID: Dictionary(uniqueKeysWithValues: ids.map { ($0, 1) }),
+                    boundsByWindowID: Dictionary(uniqueKeysWithValues: ids.map { ($0, CGRect(x: 0, y: 30, width: 1920, height: 1050)) }),
+                    parentWindowIDs: Dictionary(uniqueKeysWithValues: ids.map { ($0, 0) }))
+            }, onScreenWindowIDsProvider: { cgSamples.last ?? [] }, cgSnapshotReuseEnabled: false,
+            uptimeProvider: { signals.uptime.withLock { $0 } },
+            frontmostPIDProvider: { nil },
+            displayTableProvider: { table }, workspaceNotifications: notifications, isAccessibilityTrusted: { true },
+            makeWindowObserver: { pid in
+                let observer = AppWindowObserver(pid: pid, clock: { signals.uptime.withLock { $0 } }, makeSession: { _, receive in
+                    signals.callback.withLock { $0 = receive }
+                    return session
+                })
+                observationState.values.append(observer)
+                return observer
+            }, launchRetryDelays: retry == nil ? [] : [0.2], waitForLaunchRetry: { _ in await retry?.wait() })
+        tracker.subscribeWorkspaceNotifications()
+    }
+
+    func post(_ notification: Notification.Name) {
+        notifications.post(name: notification, object: nil, userInfo: [NSWorkspace.applicationUserInfoKey: app])
+    }
+}
+
+private final class LaunchInventoryReturnGate: AppTrackerWindowReading, Sendable {
+    let reader: AXWindowReader
+    let firstEmptyReturn: LaunchInventoryReadGate
+    private let seenFirstEmpty = Mutex(false)
+
+    init(reader: AXWindowReader, firstEmptyReturn: LaunchInventoryReadGate) {
+        self.reader = reader
+        self.firstEmptyReturn = firstEmptyReturn
+    }
+
+    func windows(forPID pid: pid_t) -> [AXWindowSnapshot] { reader.windows(forPID: pid) }
+
+    func windowReadResult(forPID pid: pid_t) -> AXWindowReadResult { reader.windowReadResult(forPID: pid) }
+
+    func inventoryWindows(forPID pid: pid_t, messagingTimeout: TimeInterval) -> AXWindowReadResult {
+        inventoryWindows(forPID: pid, messagingTimeout: messagingTimeout, cancellation: OperationCancellation())
+    }
+
+    func inventoryWindows(forPID pid: pid_t, messagingTimeout: TimeInterval,
+                          cancellation: OperationCancellation) -> AXWindowReadResult {
+        let result = reader.inventoryWindows(forPID: pid, messagingTimeout: messagingTimeout, cancellation: cancellation)
+        if case .success(let windows) = result, windows.isEmpty {
+            let shouldHold = seenFirstEmpty.withLock { seen in
+                defer { seen = true }
+                return !seen
+            }
+            if shouldHold { firstEmptyReturn.wait() }
+        }
+        return result
+    }
+
+    func createdWindows(forPID pid: pid_t, elements: [AXElementKey], messagingTimeout: TimeInterval,
+                        cancellation: OperationCancellation) -> [AXWindowSnapshot] {
+        reader.createdWindows(forPID: pid, elements: elements, messagingTimeout: messagingTimeout, cancellation: cancellation)
+    }
+}
+
+private final class LaunchInventoryReadGate: Sendable {
+    private let waiting = Mutex(false)
+    private let gate = DispatchSemaphore(value: 0)
+    var isWaiting: Bool { waiting.withLock { $0 } }
+
+    func wait() {
+        waiting.withLock { $0 = true }
+        _ = gate.wait(timeout: .now() + 4)
+    }
+
+    func open() { gate.signal() }
+}
+
+private final class LaunchRetryGate: Sendable {
+    private struct State {
+        var continuation: CheckedContinuation<Void, Never>?
+        var opened = false
+    }
+    private let state = Mutex(State())
+    var isWaiting: Bool { state.withLock { $0.continuation != nil } }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let alreadyOpened = state.withLock {
+                guard !$0.opened else { return true }
+                $0.continuation = continuation
+                return false
+            }
+            if alreadyOpened { continuation.resume() }
+        }
+    }
+
+    func open() {
+        let continuation = state.withLock {
+            $0.opened = true
+            defer { $0.continuation = nil }
+            return $0.continuation
+        }
+        continuation?.resume()
+    }
 }
 
 private final class AdmissionWindowReader: AppTrackerWindowReading, Sendable {
@@ -2098,6 +2995,9 @@ private final class AdmissionWindowReader: AppTrackerWindowReading, Sendable {
         var additionalWindowIsTitled = false
         var additionalWindowTitleRead: AXWindowTitleRead?
         var subrole: String? = kAXStandardWindowSubrole as String
+        var isModal: Bool?
+        var isTopLevel: Bool?
+        var returnGate: LaunchInventoryReadGate?
         var elementPIDOffset: pid_t = 0
         var focused = false
         var minimized = false
@@ -2115,7 +3015,9 @@ private final class AdmissionWindowReader: AppTrackerWindowReading, Sendable {
         state.withLock {
             guard !cancellation.isCancelled else { return .init(result: .unread(.cannotComplete)) }
             guard $0.focused, let id = $0.windowID else { return .init(result: .none) }
-            return .init(result: .window(pid: NSRunningApplication.current.processIdentifier, windowID: id))
+            let pid = NSRunningApplication.current.processIdentifier
+            return .init(result: .window(pid: pid, windowID: id),
+                         windowElement: AXElementKey(e: AXUIElementCreateApplication(pid + $0.elementPIDOffset)))
         }
     }
 
@@ -2125,6 +3027,7 @@ private final class AdmissionWindowReader: AppTrackerWindowReading, Sendable {
             $0.reads += 1
             return $0
         }
+        values.returnGate?.wait()
         if let error = values.readError { return .unread(error) }
         guard rejected != .empty, let windowID = values.windowID else { return .success([]) }
         var windows = [AXWindowSnapshot(pid: pid, cgWindowID: windowID,
@@ -2135,7 +3038,8 @@ private final class AdmissionWindowReader: AppTrackerWindowReading, Sendable {
             subrole: rejected == .utility ? kAXFloatingWindowSubrole as String : values.subrole,
             isMinimized: values.minimized, isFocusedWindow: values.focused,
             element: AXUIElementCreateApplication(pid + values.elementPIDOffset),
-            isMinimizedRead: values.minimized, focusReadUptime: ProcessInfo.processInfo.systemUptime)]
+            isMinimizedRead: values.minimized, focusReadUptime: ProcessInfo.processInfo.systemUptime,
+            isModal: values.isModal, isTopLevel: values.isTopLevel)]
         if let additional = values.additionalWindowID {
             windows.append(AXWindowSnapshot(pid: pid, cgWindowID: additional,
                 titleRead: values.additionalWindowTitleRead ?? (values.additionalWindowIsTitled ? .value("Second Window") : .empty),
@@ -2283,6 +3187,14 @@ private final class FamilyFocusProcess: AppTrackerProcessProviding, Sendable {
 private struct FamilyFocusReader: AppTrackerWindowReading {
     let reader: AXWindowReader
     let afterSystemRead: @Sendable (AXSystemFocusedWindowObservation) -> Void
+    let afterLocalRead: (@Sendable (pid_t, AXFocusedWindowObservation) -> Void)?
+
+    init(reader: AXWindowReader, afterLocalRead: (@Sendable (pid_t, AXFocusedWindowObservation) -> Void)? = nil,
+         afterSystemRead: @escaping @Sendable (AXSystemFocusedWindowObservation) -> Void = { _ in }) {
+        self.reader = reader
+        self.afterLocalRead = afterLocalRead
+        self.afterSystemRead = afterSystemRead
+    }
 
     func windows(forPID pid: pid_t) -> [AXWindowSnapshot] { reader.windows(forPID: pid) }
     func windowReadResult(forPID pid: pid_t) -> AXWindowReadResult { reader.windowReadResult(forPID: pid) }
@@ -2293,7 +3205,9 @@ private struct FamilyFocusReader: AppTrackerWindowReading {
         reader.inventoryWindows(forPID: pid, messagingTimeout: messagingTimeout, cancellation: cancellation)
     }
     func focusedWindowRead(forPID pid: pid_t, messagingTimeout: TimeInterval, cancellation: OperationCancellation) -> AXFocusedWindowObservation {
-        reader.focusedWindowRead(forPID: pid, messagingTimeout: messagingTimeout, cancellation: cancellation)
+        let result = reader.focusedWindowRead(forPID: pid, messagingTimeout: messagingTimeout, cancellation: cancellation)
+        afterLocalRead?(pid, result)
+        return result
     }
     func systemFocusedWindowRead(messagingTimeout: TimeInterval, cancellation: OperationCancellation) -> AXSystemFocusedWindowObservation {
         let result = reader.systemFocusedWindowRead(messagingTimeout: messagingTimeout, cancellation: cancellation)
@@ -2306,6 +3220,7 @@ private final class FamilyFocusAccessibility: AccessibilityOperations, @unchecke
     struct State {
         var focused: CGWindowID? = 1001
         var systemError: AXError?
+        var childError: AXError?
         var systemReads = 0
         var blockAtRead: Int?
         var usedMainThread = false
@@ -2315,22 +3230,26 @@ private final class FamilyFocusAccessibility: AccessibilityOperations, @unchecke
         var beforeRead: (@Sendable (String) -> Void)?
         var systemTimeoutWrites = 0
         var replacedHelperWindow = false
+        var localFocusUnavailable = false
+        var localFocusedHelperWindow: CGWindowID = 3000
         var inventoryReads: [pid_t: Int] = [:]
     }
     let state = Mutex(State())
     let gate = DispatchSemaphore(value: 0)
-    let desktop = BehaviorDesktop(additionalWindows: 1)
+    let desktop: BehaviorDesktop
     let system = AXUIElementCreateApplication(-47000)
     let control = AXUIElementCreateApplication(-48000)
     let replacement = AXUIElementCreateApplication(-49000)
     let applications = Dictionary(uniqueKeysWithValues: [-41000, -42000, -44000].map { (pid_t($0), AXUIElementCreateApplication(pid_t($0))) })
 
-    init() {
+    init(additionalHelperWindow: Bool = false) {
+        desktop = BehaviorDesktop(additionalWindows: additionalHelperWindow ? 2 : 1)
         desktop.state.withLock {
             $0.windows.removeValue(forKey: 1002)
-            if let old = $0.windows[3000] {
-                $0.windows[3000] = WindowRecord(id: old.id, appID: AppID(rawValue: "HelperB"), pid: -44000,
-                    bundleIdentifier: "test.HelperB", title: old.title, bounds: old.bounds, status: .inactive, cgWindowID: 3000)
+            for id: CGWindowID in [3000, 3001] {
+                guard let old = $0.windows[id] else { continue }
+                $0.windows[id] = WindowRecord(id: old.id, appID: AppID(rawValue: "HelperB"), pid: -44000,
+                    bundleIdentifier: "test.HelperB", title: old.title, bounds: old.bounds, status: .inactive, cgWindowID: id)
             }
         }
     }
@@ -2380,7 +3299,10 @@ private final class FamilyFocusAccessibility: AccessibilityOperations, @unchecke
         if CFEqual(element, control) {
             if name == kAXRoleAttribute as String { return (.success, kAXTextFieldRole as CFString) }
             if name == kAXWindowAttribute as String {
-                return (.success, state.withLock { value in value.focused.flatMap { windowElement($0, replaced: value.replacedHelperWindow) } })
+                return state.withLock { value in
+                    if let error = value.childError { return (error, nil) }
+                    return (.success, value.focused.flatMap { windowElement($0, replaced: value.replacedHelperWindow) })
+                }
             }
             return (.noValue, nil)
         }
@@ -2393,7 +3315,15 @@ private final class FamilyFocusAccessibility: AccessibilityOperations, @unchecke
                 }
                 return (.success, windows.compactMap { windowElement($0.cgWindowID!, replaced: replaced) } as CFArray)
             }
-            if name == kAXFocusedWindowAttribute as String || name == kAXMainWindowAttribute as String {
+            if name == kAXFocusedWindowAttribute as String {
+                let (replaced, unread, focused) = state.withLock {
+                    ($0.replacedHelperWindow, $0.localFocusUnavailable && pid == -44000, $0.localFocusedHelperWindow)
+                }
+                if unread { return (.cannotComplete, nil) }
+                let window = pid == -44000 ? windows.first { $0.cgWindowID == focused } : windows.first
+                return (.success, window.flatMap { windowElement($0.cgWindowID!, replaced: replaced) })
+            }
+            if name == kAXMainWindowAttribute as String {
                 let replaced = state.withLock { $0.replacedHelperWindow }
                 return (.success, windows.first.flatMap { windowElement($0.cgWindowID!, replaced: replaced) })
             }
@@ -2773,7 +3703,8 @@ private final class InventoryDormantReader: AppTrackerWindowReading, Sendable {
 
 private final class InventoryDormantProber: AbsentSeatProbing, Sendable {
     let calls = Mutex(0)
-    func probe(_ request: AbsentSeatProbeRequest, messagingTimeout: TimeInterval) -> AbsentSeatProbeEvidence {
+    func probe(_ request: AbsentSeatProbeRequest, messagingTimeout: TimeInterval,
+               cancellation: OperationCancellation) -> AbsentSeatProbeEvidence? {
         calls.withLock { $0 += 1 }
         return AbsentSeatProbeEvidence(request: request, element: .alive(minimized: false),
             windowSpaceIDs: [], currentSpaceIDs: [1])

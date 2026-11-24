@@ -5,13 +5,11 @@ import Foundation
 final class SettingsCoordinator: ObservableObject {
     @Published private(set) var launchAtLoginState: LaunchAtLoginState?
 
-    private let store: AppSettingsStore
     private let launchAtLoginService: LaunchAtLoginServicing
     private var launchRefreshGeneration: UInt64 = 0
 
 
-    init(store: AppSettingsStore, launchAtLoginService: LaunchAtLoginServicing) {
-        self.store = store
+    init(launchAtLoginService: LaunchAtLoginServicing) {
         self.launchAtLoginService = launchAtLoginService
     }
 
@@ -29,7 +27,6 @@ final class SettingsCoordinator: ObservableObject {
         launchRefreshGeneration &+= 1
         do {
             try launchAtLoginService.setEnabled(enabled)
-            store.setLaunchAtLogin(enabled)
             launchAtLoginState = nil
             refreshLaunchAtLoginStateSoon()
             return .success(())

@@ -122,6 +122,7 @@ enum AXWindowFrameWriteFailure: Error, Equatable {
     case invalidGeometry
     case initialFrameUnavailable
     case initialFrameMismatch(expected: CGRect, actual: CGRect)
+    case windowIdentityUnavailable
     case windowIdentityChanged
     case capabilityQueryFailed(attribute: AXWindowFrameAttribute, error: AXError)
     case attributeNotSettable(AXWindowFrameAttribute)
@@ -138,6 +139,7 @@ enum AXWindowFrameWriteFailure: Error, Equatable {
         case .invalidGeometry,
              .initialFrameUnavailable,
              .initialFrameMismatch,
+             .windowIdentityUnavailable,
              .windowIdentityChanged,
              .capabilityQueryFailed,
              .attributeNotSettable,
@@ -222,11 +224,16 @@ protocol AppTrackerWindowReading: Sendable {
     func windowReadResult(forPID pid: pid_t) -> AXWindowReadResult
     func inventoryWindows(forPID pid: pid_t, messagingTimeout: TimeInterval) -> AXWindowReadResult
     func inventoryWindows(forPID pid: pid_t, messagingTimeout: TimeInterval, cancellation: OperationCancellation) -> AXWindowReadResult
+    func createdWindows(forPID pid: pid_t, elements: [AXElementKey], messagingTimeout: TimeInterval,
+                        cancellation: OperationCancellation) -> [AXWindowSnapshot]
     func focusedWindowRead(forPID pid: pid_t, messagingTimeout: TimeInterval, cancellation: OperationCancellation) -> AXFocusedWindowObservation
     func systemFocusedWindowRead(messagingTimeout: TimeInterval, cancellation: OperationCancellation) -> AXSystemFocusedWindowObservation
 }
 
 extension AppTrackerWindowReading {
+    func createdWindows(forPID pid: pid_t, elements: [AXElementKey], messagingTimeout: TimeInterval,
+                        cancellation: OperationCancellation) -> [AXWindowSnapshot] { [] }
+
     func systemFocusedWindowRead(messagingTimeout: TimeInterval, cancellation: OperationCancellation) -> AXSystemFocusedWindowObservation {
         .init(result: .unread(.notImplemented))
     }
@@ -295,6 +302,12 @@ struct NativeAccessibilityOperations: AccessibilityOperations {
 
 struct AXWindowReader: AppTrackerWindowReading, Sendable {
     private typealias AttributeRead = (error: AXError, value: CFTypeRef?)
+    private enum FocusedElementRead {
+        case window(AXUIElement, observedAt: TimeInterval)
+        case none(observedAt: TimeInterval)
+        case unread(AXError)
+    }
+
     private enum GeometryWrite {
         case size(CGSize)
         case frame(CGRect)
@@ -307,10 +320,9 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
 
     private static let geometryWriteAttributes = [kAXPositionAttribute, kAXSizeAttribute].map { $0 as String }
         + AXWindowIDBridge.fallbackAttributeNames
-    private static let inventoryAttributes = [
-        kAXMinimizedAttribute, kAXTitleAttribute, kAXPositionAttribute, kAXSizeAttribute,
-        kAXRoleAttribute, kAXSubroleAttribute,
-    ].map { $0 as String }
+    private static let inventoryGeometryAttributes = [kAXPositionAttribute, kAXSizeAttribute].map { $0 as String }
+    private static let inventoryWindowAttributes = inventoryGeometryAttributes + [kAXRoleAttribute, kAXSubroleAttribute].map { $0 as String }
+    private static let inventoryAttributes = [kAXMinimizedAttribute, kAXTitleAttribute].map { $0 as String } + inventoryWindowAttributes
 
     let accessibility: any AccessibilityOperations
     private var budget: OperationReadBudget?
@@ -328,6 +340,28 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         readWindows(forPID: pid, messagingTimeout: messagingTimeout, cancellation: cancellation)
     }
 
+    func createdWindows(forPID pid: pid_t, elements: [AXElementKey], messagingTimeout: TimeInterval,
+                        cancellation: OperationCancellation) -> [AXWindowSnapshot] {
+        guard messagingTimeout.isFinite, messagingTimeout > 0, !cancellation.isCancelled,
+              accessibility.isTrusted(), !elements.isEmpty else { return [] }
+        let application = accessibility.application(pid)
+        var reader = self
+        reader.readMessagingTimeout = messagingTimeout
+        reader.budget = budget?.limited(to: messagingTimeout * 2)
+            ?? OperationReadBudget(maximumDuration: messagingTimeout * 2, cancellation: cancellation)
+        var windows: [AXWindowSnapshot] = []
+        for element in elements {
+            guard !cancellation.isCancelled, reader.budget?.canContinue == true else { break }
+            guard !CFEqual(application, element.e) else { continue }
+            let result = reader.readInventorySnapshots(elements: [element.e], pid: pid, maxAttempts: 1,
+                                                       focusedElement: nil, focusReadUptime: nil)
+            guard let window = result.windowsOrEmpty.first, window.role == kAXWindowRole,
+                  let id = window.cgWindowID, id != 0 else { continue }
+            windows.append(window)
+        }
+        return windows
+    }
+
     func focusedWindowRead(forPID pid: pid_t, messagingTimeout: TimeInterval, cancellation: OperationCancellation) -> AXFocusedWindowObservation {
         guard messagingTimeout.isFinite, messagingTimeout > 0 else { return .init(result: .unread(.illegalArgument)) }
         guard accessibility.isTrusted() else { return .init(result: .unread(.apiDisabled)) }
@@ -335,16 +369,16 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         reader.readMessagingTimeout = messagingTimeout
         reader.budget = OperationReadBudget(maximumDuration: messagingTimeout * 2, cancellation: cancellation)
         let application = accessibility.application(pid)
-        var value: CFTypeRef?
-        let error = reader.copyAttributeValue(kAXFocusedWindowAttribute as CFString, from: application,
-                                             into: &value, maxAttempts: 1)
-        let observedAt = ProcessInfo.processInfo.systemUptime
-        guard reader.budget?.canContinue == true else { return .init(result: .unread(.cannotComplete)) }
-        if error == .noValue { return .init(result: .none, observedAt: observedAt) }
-        guard error == .success else { return .init(result: .unread(error)) }
-        guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return .init(result: .unread(.failure)) }
-        let element = value as! AXUIElement
-        guard accessibility.pid(element) == pid else { return .init(result: .unread(.invalidUIElement)) }
+        let focus = reader.readFocusedElement(forPID: pid, from: application, maxAttempts: 1)
+        let element: AXUIElement
+        let observedAt: TimeInterval
+        switch focus {
+        case .window(let focused, let sampleTime):
+            element = focused
+            observedAt = sampleTime
+        case .none(let sampleTime): return .init(result: .none, observedAt: sampleTime)
+        case .unread(let error): return .init(result: .unread(error))
+        }
         guard let remaining = reader.budget?.remaining, remaining > 0 else { return .init(result: .unread(.cannotComplete)) }
         reader.applyMessagingTimeout(min(messagingTimeout, remaining), to: element)
         guard let id = reader.cgWindowID(for: element, maxAttempts: 1), id != 0 else { return .init(result: .unread(.failure)) }
@@ -364,43 +398,57 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         guard reader.budget?.canContinue == true else { return .init(result: .unread(.cannotComplete)) }
         if error == .noValue { return .init(result: .none) }
         guard error == .success else { return .init(result: .unread(error)) }
-        guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return .init(result: .unread(.failure)) }
-        let focused = value as! AXUIElement
+        guard let focused = Self.validatedElement(value) else { return .init(result: .unread(.failure)) }
         guard let pid = accessibility.pid(focused) else { return .init(result: .unread(.invalidUIElement)) }
         var role: CFTypeRef?
         let roleError = reader.copyAttributeValue(kAXRoleAttribute as CFString, from: focused, into: &role, maxAttempts: 1)
         guard roleError == .success else { return .init(result: .unread(roleError)) }
-        let window: AXUIElement
+        let window: AXUIElement?
         if role as? String == kAXWindowRole as String {
             window = focused
         } else {
             var windowValue: CFTypeRef?
             let windowError = reader.copyAttributeValue(kAXWindowAttribute as CFString, from: focused, into: &windowValue, maxAttempts: 1)
-            if windowError == .noValue { return .init(result: .none) }
-            guard windowError == .success else { return .init(result: .unread(windowError)) }
-            guard let windowValue, CFGetTypeID(windowValue) == AXUIElementGetTypeID() else { return .init(result: .unread(.failure)) }
-            window = windowValue as! AXUIElement
+            switch windowError {
+            case .noValue: window = nil
+            case .success:
+                guard let element = Self.validatedElement(windowValue) else { return .init(result: .unread(.failure)) }
+                window = element
+            default: return .init(result: .unread(windowError))
+            }
         }
         guard reader.budget?.canContinue == true else { return .init(result: .unread(.cannotComplete)) }
-        guard accessibility.pid(window) == pid else { return .init(result: .unread(.invalidUIElement)) }
-        guard let remaining = reader.budget?.remaining, remaining > 0 else { return .init(result: .unread(.cannotComplete)) }
-        reader.applyMessagingTimeout(min(messagingTimeout, remaining), to: window)
-        guard let id = reader.cgWindowID(for: window, maxAttempts: 1), id != 0 else { return .init(result: .unread(.failure)) }
+        let observation: AXSystemFocusedWindowObservation
+        if let window {
+            guard accessibility.pid(window) == pid else { return .init(result: .unread(.invalidUIElement)) }
+            guard let remaining = reader.budget?.remaining, remaining > 0 else { return .init(result: .unread(.cannotComplete)) }
+            reader.applyMessagingTimeout(min(messagingTimeout, remaining), to: window)
+            guard let id = reader.cgWindowID(for: window, maxAttempts: 1), id != 0 else { return .init(result: .unread(.failure)) }
+            observation = .init(result: .window(pid: pid, windowID: id), windowElement: AXElementKey(e: window))
+        } else {
+            observation = .init(result: .none)
+        }
         guard reader.budget?.canContinue == true else { return .init(result: .unread(.cannotComplete)) }
         let (latestError, latest) = accessibility.copy(system, kAXFocusedUIElementAttribute as CFString)
         guard reader.budget?.canContinue == true else { return .init(result: .unread(.cannotComplete)) }
         guard latestError == .success else { return .init(result: .unread(latestError)) }
-        guard let latest, CFEqual(latest, focused), accessibility.pid(focused) == pid,
-              accessibility.pid(window) == pid else { return .init(result: .unread(.invalidUIElement)) }
-        return .init(result: .window(pid: pid, windowID: id), windowElement: AXElementKey(e: window))
+        guard let latest = Self.validatedElement(latest), CFEqual(latest, focused), accessibility.pid(focused) == pid,
+              window.map({ accessibility.pid($0) == pid }) ?? true else { return .init(result: .unread(.invalidUIElement)) }
+        guard reader.budget?.canContinue == true else { return .init(result: .unread(.cannotComplete)) }
+        return observation
+    }
+
+    static func validatedElement(_ value: CFTypeRef?) -> AXUIElement? {
+        guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(value, to: AXUIElement.self)
     }
 
     static func validatedElements(_ value: CFTypeRef?, budget: OperationReadBudget? = nil) -> [AXUIElement]? {
         guard let value, CFGetTypeID(value) == CFArrayGetTypeID(), let values = value as? [AnyObject] else { return nil }
         var result: [AXUIElement] = []
-        for element in values {
-            guard budget?.canContinue ?? true, CFGetTypeID(element) == AXUIElementGetTypeID() else { return nil }
-            result.append(unsafeBitCast(element, to: AXUIElement.self))
+        for value in values {
+            guard budget?.canContinue ?? true, let element = validatedElement(value) else { return nil }
+            result.append(element)
         }
         return result
     }
@@ -454,15 +502,19 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
             return .unread(budget?.canContinue == false ? .cannotComplete : .failure)
         }
 
-        var focusedValue: CFTypeRef?
-        let focusedError = copyAttributeValue(kAXFocusedWindowAttribute as CFString, from: appElement,
-                                             into: &focusedValue, maxAttempts: maxAttempts)
         let focusedElement: AXUIElement?
-        if focusedError == .success, let value = focusedValue, CFGetTypeID(value) == AXUIElementGetTypeID() {
-            focusedElement = value as! AXUIElement
-        } else { focusedElement = nil }
-        let focusReadUptime: TimeInterval? = focusedElement != nil || focusedError == .noValue
-            ? ProcessInfo.processInfo.systemUptime : nil
+        let focusReadUptime: TimeInterval?
+        switch readFocusedElement(forPID: pid, from: appElement, maxAttempts: maxAttempts) {
+        case .window(let element, let sampleTime):
+            focusedElement = element
+            focusReadUptime = sampleTime
+        case .none(let sampleTime):
+            focusedElement = nil
+            focusReadUptime = sampleTime
+        case .unread:
+            focusedElement = nil
+            focusReadUptime = nil
+        }
         let mainElement = elementAttribute(kAXMainWindowAttribute as CFString, from: appElement, maxAttempts: maxAttempts)
         for element in [focusedElement, mainElement].compactMap({ $0 }) {
             guard !elements.contains(where: { CFEqual($0, element) }) else { continue }
@@ -474,17 +526,29 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
             }
             elements = [element]
         }
+        return readInventorySnapshots(elements: elements, pid: pid, maxAttempts: maxAttempts,
+                                      focusedElement: focusedElement, focusReadUptime: focusReadUptime)
+    }
+
+    private func readInventorySnapshots(elements: [AXUIElement], pid: pid_t, maxAttempts: Int,
+                                        focusedElement: AXUIElement?, focusReadUptime: TimeInterval?) -> AXWindowReadResult {
         var snapshots: [AXWindowSnapshot] = []
         for element in elements {
             guard budget?.canContinue ?? true else { return .unread(.cannotComplete) }
             guard let ownerPID = accessibility.pid(element) else { return .unread(.cannotComplete) }
             guard ownerPID == pid else { continue }
             let batch = readInventoryAttributes(from: element)
-            func attribute(_ name: String) -> AttributeRead {
-                if let read = batch[name] { return read }
+            func attribute(_ name: String, recoveringTransientError: Bool = false) -> AttributeRead {
+                if let read = batch[name] {
+                    let malformed = read.error == .success && !isValidInventoryValue(read.value, attribute: name)
+                    let recoverable = recoveringTransientError && Self.isTransientInventoryError(read.error)
+                    if !malformed && !recoverable { return read }
+                }
                 var value: CFTypeRef?
                 let error = copyAttributeValue(name as CFString, from: element, into: &value, maxAttempts: maxAttempts)
-                return (error, error == .success ? value : nil)
+                guard error == .success else { return (error, nil) }
+                guard isValidInventoryValue(value, attribute: name) else { return (.failure, nil) }
+                return (.success, value)
             }
             let minimizedRead = attribute(kAXMinimizedAttribute as String)
             let minimized: Bool?
@@ -497,15 +561,25 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
             default:
                 return .unread(minimizedRead.error)
             }
-            let windowID = cgWindowID(for: element, maxAttempts: maxAttempts)
             let titleRead = attribute(kAXTitleAttribute as String)
             let title = AXWindowTitleRead.classify(result: titleRead.error, value: titleRead.value)
-            let position = attribute(kAXPositionAttribute as String).value
-            let bounds = position.flatMap { position in
-                frame(position: position, size: attribute(kAXSizeAttribute as String).value)
+            var values: [String: CFTypeRef] = [:]
+            for name in Self.inventoryWindowAttributes {
+                let read = attribute(name, recoveringTransientError: true)
+                switch read.error {
+                case .success: values[name] = read.value
+                case .attributeUnsupported, .noValue: break
+                default:
+                    guard minimized == true, Self.inventoryGeometryAttributes.contains(name),
+                          Self.isTransientInventoryError(read.error) else { return .unread(read.error) }
+                }
             }
-            let role = normalizedString(attribute(kAXRoleAttribute as String).value)
-            let subrole = normalizedString(attribute(kAXSubroleAttribute as String).value)
+            let windowID = cgWindowID(for: element, maxAttempts: maxAttempts)
+            let bounds = values[kAXPositionAttribute as String].flatMap { position in
+                frame(position: position, size: values[kAXSizeAttribute as String])
+            }
+            let role = normalizedString(values[kAXRoleAttribute as String])
+            let subrole = normalizedString(values[kAXSubroleAttribute as String])
             var isModal: Bool?
             var isTopLevel: Bool?
             if subrole == kAXDialogSubrole as String || subrole == kAXUnknownSubrole as String {
@@ -534,6 +608,20 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         return .success(snapshots)
     }
 
+    private static func isTransientInventoryError(_ error: AXError) -> Bool {
+        error == .cannotComplete || error == .failure
+    }
+
+    private func isValidInventoryValue(_ value: CFTypeRef?, attribute: String) -> Bool {
+        guard let value else { return false }
+        switch attribute {
+        case kAXPositionAttribute: return axValue(from: value).map(AXValueGetType) == .cgPoint
+        case kAXSizeAttribute: return axValue(from: value).map(AXValueGetType) == .cgSize
+        case kAXMinimizedAttribute: return CFGetTypeID(value) == CFBooleanGetTypeID()
+        default: return CFGetTypeID(value) == CFStringGetTypeID()
+        }
+    }
+
     private func readInventoryAttributes(from element: AXUIElement) -> [String: AttributeRead] {
         let attributes = Self.inventoryAttributes
         guard budget?.canContinue ?? true else {
@@ -548,10 +636,9 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
             guard let values, values.count == attributes.count else { return [:] }
             var result: [String: AttributeRead] = [:]
             for (attribute, value) in zip(attributes, values) {
-                let type = CFGetTypeID(value)
-                if type == CFNullGetTypeID() { continue }
+                if CFGetTypeID(value) == CFNullGetTypeID() { continue }
                 var error = AXError.failure
-                if type == AXValueGetTypeID(), AXValueGetValue(value as! AXValue, .axError, &error) {
+                if let axValue = axValue(from: value), AXValueGetValue(axValue, .axError, &error) {
                     result[attribute] = (error, nil)
                 } else {
                     result[attribute] = (.success, value)
@@ -681,8 +768,23 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
     func focusedWindow(forPID pid: pid_t, messagingTimeout: TimeInterval? = nil) -> AXUIElement? {
         let app = accessibility.application(pid)
         applyMessagingTimeout(messagingTimeout, to: app)
-        return elementAttribute(kAXFocusedWindowAttribute as CFString, from: app,
-                                maxAttempts: messagingTimeout == nil ? 2 : 1)
+        guard case .window(let element, _) = readFocusedElement(forPID: pid, from: app,
+            maxAttempts: messagingTimeout == nil ? 2 : 1) else { return nil }
+        return element
+    }
+
+    private func readFocusedElement(forPID pid: pid_t, from application: AXUIElement, maxAttempts: Int) -> FocusedElementRead {
+        var value: CFTypeRef?
+        let error = copyAttributeValue(kAXFocusedWindowAttribute as CFString, from: application, into: &value,
+                                       maxAttempts: maxAttempts)
+        let observedAt = ProcessInfo.processInfo.systemUptime
+        guard budget?.canContinue != false else { return .unread(.cannotComplete) }
+        if error == .noValue { return .none(observedAt: observedAt) }
+        guard error == .success else { return .unread(error) }
+        guard let element = Self.validatedElement(value) else { return .unread(.failure) }
+        guard accessibility.pid(element) == pid else { return .unread(.invalidUIElement) }
+        guard budget?.canContinue != false else { return .unread(.cannotComplete) }
+        return .window(element, observedAt: observedAt)
     }
 
     func stringAttribute(_ attribute: CFString, from element: AXUIElement, maxAttempts: Int = 2) -> String? {
@@ -748,11 +850,7 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         from element: AXUIElement,
         maxAttempts: Int = 2
     ) -> AXUIElement? {
-        guard let value = copyAttributeValue(attribute, from: element, maxAttempts: maxAttempts),
-              CFGetTypeID(value) == AXUIElementGetTypeID() else {
-            return nil
-        }
-        return unsafeBitCast(value, to: AXUIElement.self)
+        Self.validatedElement(copyAttributeValue(attribute, from: element, maxAttempts: maxAttempts))
     }
 
     func frame(of element: AXUIElement, maxAttempts: Int = 2) -> CGRect? {
@@ -964,7 +1062,7 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
 
     private func axValue(from value: CFTypeRef) -> AXValue? {
         guard CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
-        return unsafeBitCast(value, to: AXValue.self)
+        return unsafeDowncast(value, to: AXValue.self)
     }
 
     private func settableStatus(
@@ -1025,15 +1123,15 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
                 if budget?.canContinue == false { return .operationBudgetExhausted }
                 return attribute == .position ? .verificationUnavailable : .initialFrameUnavailable
             }
-            for (index, id) in sample.windowIDs.enumerated() where id == expectedWindowID {
-                guard current.windowIDs.indices.contains(index), current.windowIDs[index] == expectedWindowID else {
-                    return .windowIdentityChanged
-                }
-            }
             for (index, id) in current.windowIDs.enumerated() {
                 guard let id, id != expectedWindowID else { continue }
                 if !sample.windowIDs.indices.contains(index) || sample.windowIDs[index] != id {
                     return .windowIdentityChanged
+                }
+            }
+            for (index, id) in sample.windowIDs.enumerated() where id == expectedWindowID {
+                guard current.windowIDs.indices.contains(index), current.windowIDs[index] != nil else {
+                    return .windowIdentityUnavailable
                 }
             }
             guard measuredFramesAgree(current.frame, expectedFrame, tolerance: frameVerificationTolerance) else {
@@ -1408,6 +1506,7 @@ extension AXWindowFrameWriteFailure {
         case .initialFrameUnavailable: return "initialFrameUnavailable"
         case let .initialFrameMismatch(expected, actual):
             return "initialFrameMismatch(expected:\(WindowFrameMatchPolicy.signature(for: expected)),actual:\(WindowFrameMatchPolicy.signature(for: actual)))"
+        case .windowIdentityUnavailable: return "windowIdentityUnavailable"
         case .windowIdentityChanged: return "windowIdentityChanged"
         case let .capabilityQueryFailed(attribute, error): return "capabilityQueryFailed(\(attribute.diagnosticDescription),\(error.rawValue))"
         case let .attributeNotSettable(attribute): return "attributeNotSettable(\(attribute.diagnosticDescription))"

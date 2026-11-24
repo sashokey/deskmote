@@ -55,7 +55,7 @@ final class FinderP0Tests: XCTestCase {
         let staleActiveSnapshot = snapshot(windowID: id, status: .active)
 
         let afterMinimize = [
-            id.rawValue: OptimisticWindowState(status: .minimized, createdAt: Date())
+            id.rawValue: OptimisticWindowState(status: .minimized, createdAt: .now)
         ]
         XCTAssertEqual(
             planner.plan(intent: .toggle(id), snapshot: staleActiveSnapshot, optimisticStates: afterMinimize).kind,
@@ -63,7 +63,7 @@ final class FinderP0Tests: XCTestCase {
         )
 
         let afterActivate = [
-            id.rawValue: OptimisticWindowState(status: .active, createdAt: Date())
+            id.rawValue: OptimisticWindowState(status: .active, createdAt: .now)
         ]
         XCTAssertEqual(
             planner.plan(intent: .toggle(id), snapshot: staleActiveSnapshot, optimisticStates: afterActivate).kind,
@@ -75,7 +75,7 @@ final class FinderP0Tests: XCTestCase {
         let id = WindowID(rawValue: "cg-stale-optimistic")
         let planner = LifecycleActionPlanner(isAppFrontmost: { _ in false })
         let lingering = [
-            id.rawValue: OptimisticWindowState(status: .active, createdAt: Date())
+            id.rawValue: OptimisticWindowState(status: .active, createdAt: .now)
         ]
 
         for status in [WindowStatus.active, .inactive] {
@@ -104,9 +104,9 @@ final class FinderP0Tests: XCTestCase {
     func testMinimizeFeedbackAcceptsTemporaryDisappearance() {
         let id = WindowID(rawValue: "cg-2")
         var feedback = IntentFeedbackState()
-        feedback.begin(windowID: id.rawValue, action: .minimize, at: Date())
+        feedback.begin(windowID: id.rawValue, action: .minimize, at: .now)
 
-        feedback.reconcile(snapshot: snapshot(windowID: id, status: .disappeared), now: Date())
+        feedback.reconcile(snapshot: snapshot(windowID: id, status: .disappeared), now: .now)
 
         XCTAssertEqual(feedback.entriesByWindowID[id.rawValue]?.phase, .success)
     }
@@ -114,9 +114,9 @@ final class FinderP0Tests: XCTestCase {
     func testActivateFeedbackSucceedsImmediatelyWhenExecutionSucceeds() {
         let id = WindowID(rawValue: "cg-activate")
         var feedback = IntentFeedbackState()
-        feedback.begin(windowID: id.rawValue, action: .activate, at: Date())
+        feedback.begin(windowID: id.rawValue, action: .activate, at: .now)
 
-        feedback.markSucceededImmediatelyIfNeeded(windowID: id.rawValue, action: .activate, at: Date())
+        feedback.markSucceededImmediatelyIfNeeded(windowID: id.rawValue, action: .activate, at: .now)
 
         XCTAssertEqual(feedback.entriesByWindowID[id.rawValue]?.phase, .success)
     }
@@ -124,45 +124,16 @@ final class FinderP0Tests: XCTestCase {
     func testActivateFeedbackDoesNotFlipBackToFailureAfterInactiveObservation() {
         let id = WindowID(rawValue: "cg-activate")
         var feedback = IntentFeedbackState()
-        let now = Date()
+        let now = ContinuousClock.now
         feedback.begin(windowID: id.rawValue, action: .activate, at: now)
         feedback.markSucceededImmediatelyIfNeeded(windowID: id.rawValue, action: .activate, at: now)
 
         feedback.reconcile(
             snapshot: snapshot(windowID: id, status: .inactive),
-            now: now.addingTimeInterval(0.5)
+            now: now + .milliseconds(500)
         )
 
         XCTAssertEqual(feedback.entriesByWindowID[id.rawValue]?.phase, .success)
-    }
-
-    func testAdmissionGateRejectsUnknownAXOnlyCandidate() {
-        let gate = ObservationAdmissionGate()
-        let now = Date()
-        let observation = observation(
-            timestamp: now,
-            source: .accessibility,
-            pid: 2001,
-            title: "Unknown AX Window",
-            bounds: CGRect(x: 100, y: 100, width: 500, height: 400)
-        )
-
-        gate.beginRound(at: now)
-        let decision = gate.decide(observation: observation, snapshot: .empty)
-
-        XCTAssertEqual(decision.kind, .rejected)
-        XCTAssertEqual(decision.reason, "accessibility-orphan-inventory-required")
-    }
-
-    func testStrictAdmissionGateRequiresWindowEvidence() {
-        let gate = ObservationAdmissionGate(mode: .strict)
-        let now = Date()
-        gate.beginRound(at: now)
-        let signal = observation(timestamp: now, source: .accessibility, pid: 42,
-                                 bundleIdentifier: "test.window", title: "Workspace", bounds: nil)
-        let decision = gate.decide(observation: signal, snapshot: .empty)
-        XCTAssertEqual(decision.kind, .rejected)
-        XCTAssertEqual(decision.reason, "accessibility-orphan-inventory-required")
     }
 
     func testAXReadWithIncompleteMetadataCanStillMatchARecordedWindow() {
@@ -176,96 +147,6 @@ final class FinderP0Tests: XCTestCase {
         let matched = engine.identify(observation: ax)
         XCTAssertEqual(matched.kind, .knownWindow)
         XCTAssertEqual(matched.windowID, original.windowID)
-    }
-
-    func testAdmissionGateAcceptsInventoryCandidate() {
-        let gate = ObservationAdmissionGate()
-        let now = Date()
-        let observation = observation(
-            timestamp: now,
-            source: .appWindowInventory,
-            pid: 2101,
-            title: "Inventory Window",
-            bounds: CGRect(x: 100, y: 100, width: 500, height: 400)
-        )
-
-        gate.beginRound(at: now)
-        let decision = gate.decide(observation: observation, snapshot: .empty)
-
-        XCTAssertEqual(decision.kind, .accepted)
-        XCTAssertEqual(decision.reason, "app-window-inventory")
-    }
-
-    func testAdmissionGateRejectsCGOrphanWhenInventoryMainlineIsAvailable() {
-        let gate = ObservationAdmissionGate()
-        let now = Date()
-        let observation = observation(
-            timestamp: now,
-            source: .coreGraphics,
-            pid: 2201,
-            cgWindowID: 9001,
-            title: "CG Orphan",
-            bounds: CGRect(x: 100, y: 100, width: 500, height: 400)
-        )
-
-        gate.beginRound(at: now, inventoryMainlineAvailable: true)
-        let decision = gate.decide(observation: observation, snapshot: .empty)
-
-        XCTAssertEqual(decision.kind, .rejected)
-        XCTAssertEqual(decision.reason, "cg-orphan-inventory-required")
-    }
-
-    func testAdmissionGateAcceptsCGWhenInventoryMainlineIsUnavailable() {
-        let gate = ObservationAdmissionGate()
-        let now = Date()
-        let observation = observation(
-            timestamp: now,
-            source: .coreGraphics,
-            pid: 2301,
-            cgWindowID: 9002,
-            title: "CG Fallback",
-            bounds: CGRect(x: 100, y: 100, width: 500, height: 400)
-        )
-
-        gate.beginRound(at: now, inventoryMainlineAvailable: false)
-        let decision = gate.decide(observation: observation, snapshot: .empty)
-
-        XCTAssertEqual(decision.kind, .accepted)
-        XCTAssertEqual(decision.reason, "cg-permission-fallback")
-    }
-
-    func testAdmissionGateAcceptsCGWhenItMatchesExistingInventoryWindow() {
-        let gate = ObservationAdmissionGate()
-        let now = Date()
-        let id = WindowID(rawValue: "inventory-window")
-        let snapshot = DockSnapshot(
-            windows: [
-                id: WindowRecord(
-                    id: id,
-                    appID: AppID(rawValue: "com.example.app"),
-                    pid: 2401,
-                    bundleIdentifier: "com.example.app",
-                    title: "Existing",
-                    bounds: CGRect(x: 100, y: 100, width: 500, height: 400),
-                    status: .inactive
-                )
-            ],
-            orderedWindowIDs: [id]
-        )
-        let observation = observation(
-            timestamp: now,
-            source: .coreGraphics,
-            pid: 2401,
-            cgWindowID: 9003,
-            title: "Existing",
-            bounds: CGRect(x: 104, y: 103, width: 500, height: 400)
-        )
-
-        gate.beginRound(at: now, inventoryMainlineAvailable: true)
-        let decision = gate.decide(observation: observation, snapshot: snapshot)
-
-        XCTAssertEqual(decision.kind, .accepted)
-        XCTAssertEqual(decision.reason, "matches-existing-window")
     }
 
     func testIdentityRulesNormalizeTitlesBeforeApplyingAppPolicy() {
@@ -307,6 +188,128 @@ final class FinderP0Tests: XCTestCase {
 
         XCTAssertEqual(cgDecision.windowID, inventoryDecision.windowID)
         XCTAssertEqual(cgDecision.reason, "cg-bound-to-inventory")
+    }
+
+    func testIdentityKeepsDifferentExplicitCGWindowsSeparateAfterInventoryBinding() {
+        let identity = WindowIdentityEngine()
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        let bounds = CGRect(x: 100, y: 100, width: 500, height: 400)
+        let inventory = observation(timestamp: now, source: .appWindowInventory, pid: 2501,
+                                    title: "Editor", bounds: bounds)
+        let first = observation(timestamp: now.addingTimeInterval(0.1), source: .coreGraphics, pid: 2501,
+                                cgWindowID: 9101, title: "Editor", bounds: bounds)
+        let second = observation(timestamp: now.addingTimeInterval(0.1), source: .coreGraphics, pid: 2501,
+                                 cgWindowID: 9102, title: "Editor", bounds: bounds)
+
+        let inventorySeat = identity.identify(observation: inventory).windowID
+        XCTAssertEqual(identity.identify(observation: first).windowID, inventorySeat)
+        let secondSeat = identity.identify(observation: second).windowID
+        XCTAssertNotEqual(secondSeat, inventorySeat)
+        XCTAssertEqual(identity.identify(observation: first).windowID, inventorySeat)
+        XCTAssertEqual(identity.identify(observation: second).windowID, secondSeat)
+    }
+
+    func testIdentityDoesNotReplaceAnExplicitLiveSnapshotWindowByCaptionAndFrame() {
+        let identity = WindowIdentityEngine()
+        let bounds = CGRect(x: 100, y: 100, width: 500, height: 400)
+        var record = windowRecord(id: WindowID(rawValue: "cg-9101"), pid: 2501,
+            bundleIdentifier: "com.example.app", title: "Editor", bounds: bounds, status: .inactive)
+        record.cgWindowID = 9101
+        let snapshot = retainedSnapshot(record)
+        let incoming = observation(source: .coreGraphics, pid: 2501, cgWindowID: 9102, title: "Editor", bounds: bounds)
+
+        XCTAssertNotEqual(identity.identify(observation: incoming, snapshot: snapshot).windowID, record.id)
+    }
+
+    func testIdentityBridgesMinimizedWindowWithCorroboratingCaptionAndFrame() {
+        let identity = WindowIdentityEngine()
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        let bounds = CGRect(x: 100, y: 100, width: 500, height: 400)
+        let first = observation(timestamp: now, source: .coreGraphics, pid: 2501,
+                                cgWindowID: 9101, title: "Editor", bounds: bounds)
+        let minimized = observation(timestamp: now.addingTimeInterval(1), kind: .minimized, source: .accessibility,
+                                    pid: 2501, title: "Editor", bounds: bounds, isMinimized: true)
+        let restored = observation(timestamp: now.addingTimeInterval(2), kind: .restored, source: .coreGraphics,
+                                   pid: 2501, cgWindowID: 9102, title: "Editor", bounds: bounds)
+
+        let seat = identity.identify(observation: first).windowID
+        XCTAssertEqual(identity.identify(observation: minimized).windowID, seat)
+        let replacement = identity.identify(observation: restored)
+        XCTAssertEqual(replacement.windowID, seat)
+        XCTAssertEqual(replacement.reason, "restored-via-bridge")
+        let returnedOldNumber = observation(timestamp: now.addingTimeInterval(2.1), source: .coreGraphics, pid: 2501,
+                                           cgWindowID: 9101, title: "Editor", bounds: bounds)
+        XCTAssertNotEqual(identity.identify(observation: returnedOldNumber).windowID, seat)
+        XCTAssertEqual(identity.identify(observation: restored).windowID, seat)
+    }
+
+    func testIdentityDoesNotTreatAnOrdinaryAppearanceAsReplacementForAnExplicitMinimizedWindow() {
+        let identity = WindowIdentityEngine()
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        let bounds = CGRect(x: 100, y: 100, width: 500, height: 400)
+        let first = observation(timestamp: now, source: .coreGraphics, pid: 2501,
+                                cgWindowID: 9101, title: "Editor", bounds: bounds)
+        let minimized = observation(timestamp: now.addingTimeInterval(1), kind: .minimized, source: .accessibility,
+                                    pid: 2501, cgWindowID: 9101, title: "Editor", bounds: bounds, isMinimized: true)
+        let second = observation(timestamp: now.addingTimeInterval(2), source: .coreGraphics, pid: 2501,
+                                 cgWindowID: 9102, title: "Editor", bounds: bounds)
+
+        let seat = identity.identify(observation: first).windowID
+        XCTAssertEqual(identity.identify(observation: minimized).windowID, seat)
+        XCTAssertNotEqual(identity.identify(observation: second).windowID, seat)
+        XCTAssertEqual(identity.identify(observation: minimized).windowID, seat)
+    }
+
+    func testIdentityBridgesExplicitRestorationAfterEarlyVisibleAXObservationOfTheOldNumber() {
+        let identity = WindowIdentityEngine()
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        let bounds = CGRect(x: 100, y: 100, width: 500, height: 400)
+        let first = observation(timestamp: now, source: .coreGraphics, pid: 2501,
+                                cgWindowID: 9101, title: "Editor", bounds: bounds)
+        let minimized = observation(timestamp: now.addingTimeInterval(1), kind: .minimized, source: .accessibility,
+                                    pid: 2501, cgWindowID: 9101, title: "Editor", bounds: bounds, isMinimized: true)
+        let earlyAX = observation(timestamp: now.addingTimeInterval(1.5), kind: .unchanged, source: .accessibility,
+                                  pid: 2501, cgWindowID: 9101, title: "Editor", bounds: bounds)
+        let restored = observation(timestamp: now.addingTimeInterval(2), kind: .restored, source: .coreGraphics,
+                                   pid: 2501, cgWindowID: 9102, title: "Editor", bounds: bounds)
+
+        let seat = identity.identify(observation: first).windowID
+        XCTAssertEqual(identity.identify(observation: minimized).windowID, seat)
+        XCTAssertEqual(identity.identify(observation: earlyAX).windowID, seat)
+        XCTAssertEqual(identity.identify(observation: restored).windowID, seat)
+    }
+
+    func testIdentityBindsTheFirstNativeNumberOfAProvisionalMinimizedWindow() {
+        let identity = WindowIdentityEngine()
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        let bounds = CGRect(x: 100, y: 100, width: 500, height: 400)
+        let provisional = observation(timestamp: now, source: .accessibility, pid: 2501, title: "Editor", bounds: bounds)
+        let minimized = observation(timestamp: now.addingTimeInterval(1), kind: .minimized, source: .accessibility,
+                                    pid: 2501, title: "Editor", bounds: bounds, isMinimized: true)
+        let appeared = observation(timestamp: now.addingTimeInterval(2), source: .coreGraphics, pid: 2501,
+                                   cgWindowID: 9101, title: "Editor", bounds: bounds)
+
+        let seat = identity.identify(observation: provisional).windowID
+        XCTAssertEqual(identity.identify(observation: minimized).windowID, seat)
+        XCTAssertEqual(identity.identify(observation: appeared).windowID, seat)
+    }
+
+    func testIdentityRejectsMinimizedBridgeWithConflictingFacts() {
+        let now = Date(timeIntervalSinceReferenceDate: 100)
+        let bounds = CGRect(x: 100, y: 100, width: 500, height: 400)
+        for (title, newBounds) in [("Editor", CGRect(x: 100, y: 100, width: 650, height: 450)),
+                                  ("Editor|100:100:500:400", bounds)] {
+            let identity = WindowIdentityEngine()
+            let first = observation(timestamp: now, source: .coreGraphics, pid: 2501,
+                                    cgWindowID: 9101, title: "Editor", bounds: bounds)
+            let minimized = observation(timestamp: now.addingTimeInterval(1), kind: .minimized, source: .accessibility,
+                                        pid: 2501, title: "Editor", bounds: bounds, isMinimized: true)
+            let differentWindow = observation(timestamp: now.addingTimeInterval(2), kind: .restored, source: .coreGraphics,
+                                              pid: 2501, cgWindowID: 9102, title: title, bounds: newBounds)
+            let seat = identity.identify(observation: first).windowID
+            XCTAssertEqual(identity.identify(observation: minimized).windowID, seat)
+            XCTAssertNotEqual(identity.identify(observation: differentWindow).windowID, seat, title)
+        }
     }
 
     func testIdentityDoesNotGuessCGBindingForAmbiguousSameTitleWindows() {
@@ -803,62 +806,6 @@ final class FinderP0Tests: XCTestCase {
         XCTAssertEqual(decision.kind, .newWindow)
     }
 
-    func testRoundAnomalyFuseRejectsCandidateExplosion() {
-        let fuse = ObservationRoundAnomalyFuse()
-        let snapshot = snapshot(windowCount: 2)
-        var observations: [SystemObservation] = []
-
-        for index in 0..<60 {
-            observations.append(
-                observation(
-                    source: .accessibility,
-                    pid: Int32(3000 + index),
-                    title: "System Surface \(index)",
-                    bounds: CGRect(
-                        x: CGFloat(index * 10),
-                        y: CGFloat(index * 8),
-                        width: 180,
-                        height: 120
-                    )
-                )
-            )
-        }
-
-        let decision = fuse.decide(observations: observations, snapshot: snapshot)
-
-        XCTAssertEqual(decision.kind, ObservationRoundAdmissionKind.rejected)
-        XCTAssertEqual(decision.reason, "count-spike")
-        XCTAssertEqual(decision.baselineCount, 2)
-        XCTAssertEqual(decision.candidateCount, 60)
-    }
-
-    func testRoundAnomalyFuseAcceptsPlausibleRound() {
-        let fuse = ObservationRoundAnomalyFuse()
-        let snapshot = snapshot(windowCount: 2)
-        var observations: [SystemObservation] = []
-
-        for index in 0..<5 {
-            observations.append(
-                observation(
-                    source: .accessibility,
-                    pid: Int32(4000 + index),
-                    title: "Real Window \(index)",
-                    bounds: CGRect(
-                        x: CGFloat(index * 20),
-                        y: CGFloat(index * 16),
-                        width: 500,
-                        height: 400
-                    )
-                )
-            )
-        }
-
-        let decision = fuse.decide(observations: observations, snapshot: snapshot)
-
-        XCTAssertEqual(decision.kind, ObservationRoundAdmissionKind.accepted)
-        XCTAssertEqual(decision.reason, "plausible-round")
-    }
-
     func testWindowEligibilityFiltersTransparentWindows() {
         let policy = DockWindowEligibilityPolicy()
 
@@ -1343,8 +1290,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "codex-finder-test-alpha-20260505",
                 role: "AXWindow",
                 subrole: "AXStandardWindow",
-                bounds: bounds,
-                isMinimized: false
+                bounds: bounds
             )
         )
         XCTAssertFalse(
@@ -1352,8 +1298,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "Finder",
                 role: "AXWindow",
                 subrole: "AXStandardWindow",
-                bounds: bounds,
-                isMinimized: false
+                bounds: bounds
             )
         )
         XCTAssertFalse(
@@ -1361,8 +1306,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "Preview",
                 role: "AXWindow",
                 subrole: "AXDialog",
-                bounds: bounds,
-                isMinimized: false
+                bounds: bounds
             )
         )
         XCTAssertTrue(
@@ -1370,8 +1314,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "Documents",
                 role: "AXWindow",
                 subrole: nil,
-                bounds: bounds,
-                isMinimized: false
+                bounds: bounds
             )
         )
         XCTAssertFalse(
@@ -1379,31 +1322,20 @@ final class FinderP0Tests: XCTestCase {
                 title: "Downloads",
                 role: "AXWindow",
                 subrole: "AXStandardWindow",
-                bounds: nil,
-                isMinimized: false
+                bounds: nil
             )
         )
     }
 
-    func testFinderTrackableAdmitsMinimizedDialogSubroleOnly() {
+    func testFinderTrackableRejectsWindowsWithoutDialogEvidence() {
         let bounds = CGRect(x: 297, y: 611, width: 1227, height: 504)
 
-        XCTAssertTrue(
-            FinderWindowRules.isTrackable(
-                title: "Backup",
-                role: "AXWindow",
-                subrole: "AXDialog",
-                bounds: bounds,
-                isMinimized: true
-            )
-        )
         XCTAssertFalse(
             FinderWindowRules.isTrackable(
                 title: "Backup",
                 role: "AXWindow",
                 subrole: "AXDialog",
-                bounds: bounds,
-                isMinimized: false
+                bounds: bounds
             )
         )
         XCTAssertFalse(
@@ -1411,8 +1343,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "Backup",
                 role: "AXSheet",
                 subrole: "AXDialog",
-                bounds: bounds,
-                isMinimized: true
+                bounds: bounds
             )
         )
         XCTAssertFalse(
@@ -1420,8 +1351,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "Finder",
                 role: "AXWindow",
                 subrole: "AXDialog",
-                bounds: bounds,
-                isMinimized: true
+                bounds: bounds
             )
         )
         XCTAssertFalse(
@@ -1429,8 +1359,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "Backup",
                 role: "AXWindow",
                 subrole: "AXDialog",
-                bounds: CGRect(x: 0, y: 0, width: 30, height: 30),
-                isMinimized: true
+                bounds: CGRect(x: 0, y: 0, width: 30, height: 30)
             )
         )
         XCTAssertFalse(
@@ -1438,8 +1367,7 @@ final class FinderP0Tests: XCTestCase {
                 title: "Backup",
                 role: "AXWindow",
                 subrole: "AXFloatingWindow",
-                bounds: bounds,
-                isMinimized: true
+                bounds: bounds
             )
         )
     }
@@ -1473,7 +1401,7 @@ final class FinderP0Tests: XCTestCase {
         }
     }
 
-    func testAppTrackerEligibilityAdmitsMinimizedFinderDialogButNotOtherApps() {
+    func testFinderEligibilityRequiresANonmodalTopLevelDialog() {
         let eligibility = AppTrackerWindowEligibility()
         let bounds = CGRect(x: 297, y: 611, width: 1227, height: 504)
         let finder = AppTrackerWindowEligibility.Application(
@@ -1482,49 +1410,63 @@ final class FinderP0Tests: XCTestCase {
             activationPolicy: .regular,
             executablePath: "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
         )
-        let other = AppTrackerWindowEligibility.Application(
-            bundleIdentifier: "com.apple.TextEdit",
-            appName: "TextEdit",
-            activationPolicy: .regular,
-            executablePath: "/System/Applications/TextEdit.app/Contents/MacOS/TextEdit"
-        )
+        let cases: [(String, String, Bool?, Bool?, Bool)] = [
+            (kAXWindowRole, kAXDialogSubrole, false, true, true),
+            (kAXWindowRole, kAXDialogSubrole, false, false, false),
+            (kAXWindowRole, kAXDialogSubrole, true, true, false),
+            (kAXWindowRole, kAXDialogSubrole, nil, true, false),
+            (kAXWindowRole, kAXDialogSubrole, false, nil, false),
+            (kAXSheetRole, kAXDialogSubrole, false, true, false),
+            (kAXWindowRole, kAXUnknownSubrole, nil, true, false),
+            (kAXWindowRole, kAXUnknownSubrole, false, true, true),
+        ]
+        for minimized in [false, true] {
+            for (role, subrole, modal, topLevel, expected) in cases {
+                XCTAssertEqual(eligibility.isEligible(title: "Backup", role: role, subrole: subrole, bounds: bounds,
+                    alpha: 1, isMinimized: minimized, isBelowNormalLayer: false, application: finder,
+                    isModal: modal, isTopLevel: topLevel, isNativeRoot: true), expected,
+                    "\(role) \(subrole), modal \(String(describing: modal)), parent \(String(describing: topLevel)), minimized \(minimized)")
+            }
+        }
+    }
 
-        XCTAssertTrue(
-            eligibility.isEligible(
-                title: "Backup",
-                role: kAXWindowRole as String,
-                subrole: kAXDialogSubrole as String,
-                bounds: bounds,
-                alpha: 1,
-                isMinimized: true,
-                isBelowNormalLayer: false,
-                application: finder
-            )
-        )
-        XCTAssertFalse(
-            eligibility.isEligible(
-                title: "Backup",
-                role: kAXWindowRole as String,
-                subrole: kAXDialogSubrole as String,
-                bounds: bounds,
-                alpha: 1,
-                isMinimized: false,
-                isBelowNormalLayer: false,
-                application: finder
-            )
-        )
-        XCTAssertFalse(
-            eligibility.isEligible(
-                title: "Untitled",
-                role: kAXWindowRole as String,
-                subrole: kAXDialogSubrole as String,
-                bounds: bounds,
-                alpha: 1,
-                isMinimized: true,
-                isBelowNormalLayer: false,
-                application: other
-            )
-        )
+    func testFinderKeepsFoldersTitledLikeTheAppWhenAXAndCoreGraphicsConfirmAWindow() {
+        let eligibility = AppTrackerWindowEligibility()
+        let finder = AppTrackerWindowEligibility.Application(bundleIdentifier: FinderWindowRules.bundleIdentifier,
+            appName: "Gestionnaire de fichiers", activationPolicy: .regular, executablePath: nil)
+        let bounds = CGRect(x: 10, y: 10, width: 400, height: 300)
+        for title in ["Finder", "  GESTIONNAIRE DE FICHIERS  "] {
+            XCTAssertTrue(eligibility.isEligible(title: title, role: kAXWindowRole as String,
+                subrole: kAXStandardWindowSubrole as String, bounds: bounds, alpha: 1, isMinimized: false,
+                isBelowNormalLayer: false, application: finder, isNativeRoot: true))
+            XCTAssertFalse(eligibility.isEligible(title: title, role: kAXMenuRole as String,
+                subrole: kAXStandardWindowSubrole as String, bounds: bounds, alpha: 1, isMinimized: false,
+                isBelowNormalLayer: false, application: finder, isNativeRoot: true))
+        }
+    }
+
+    func testFinderDiagnosticKeepsAStandardFolderNamedFinderWithCGCorroboration() {
+        let bounds = CGRect(x: 10, y: 10, width: 400, height: 300)
+        let element = AXUIElementCreateApplication(-41000)
+        func window(role: String = kAXWindowRole) -> AXWindowSnapshot {
+            AXWindowSnapshot(pid: -41000, cgWindowID: 77, titleRead: .value("Finder"), bounds: bounds,
+                role: role, subrole: kAXStandardWindowSubrole, isMinimized: false, isFocusedWindow: false, element: element)
+        }
+        func observation(pid: pid_t = -41000, windowID: CGWindowID = 77, frame: CGRect? = nil,
+                         kind: SystemObservation.ObservationKind = .appeared) -> SystemObservation {
+            SystemObservation(timestamp: Date(), kind: kind, source: .coreGraphics, pid: pid,
+                bundleIdentifier: FinderWindowRules.bundleIdentifier, cgWindowID: windowID, title: nil,
+                appName: "Finder", bounds: frame ?? bounds, isMinimized: false, isFocusedWindow: false)
+        }
+        XCTAssertTrue(FinderWindowRules.isTrackableForObservation(window(), applicationName: "Finder",
+            cgObservations: [observation()]))
+        for evidence in [[], [observation(pid: -42000)], [observation(windowID: 88)],
+                         [observation(frame: bounds.offsetBy(dx: 300, dy: 0))], [observation(kind: .disappeared)]] {
+            XCTAssertFalse(FinderWindowRules.isTrackableForObservation(window(), applicationName: "Finder",
+                cgObservations: evidence))
+        }
+        XCTAssertFalse(FinderWindowRules.isTrackableForObservation(window(role: kAXMenuRole), applicationName: "Finder",
+            cgObservations: [observation()]))
     }
 
     func testStripItemsMergeNativeTabGroupWithIdenticalFrame() {
@@ -1678,7 +1620,7 @@ final class FinderP0Tests: XCTestCase {
             )
         }
 
-        let now = Date()
+        let now = ContinuousClock.now
         func superseded(predicted: WindowStatus, snapshot: DockSnapshot,
                         optimisticStates: [String: OptimisticWindowState] = [:]) -> Bool {
             OptimisticWindowState.supersededByActiveSibling(
@@ -1736,14 +1678,14 @@ final class FinderP0Tests: XCTestCase {
                 orderedWindowIDs: records.map(\.id)
             )
         }
-        let now = Date()
+        let now = ContinuousClock.now
         let handoffSnapshot = makeSnapshot([
             record(w1, pid: 1, status: .inactive), record(w2, pid: 1, status: .active),
         ])
         let restoreOrigin = OptimisticWindowState(status: .active, createdAt: now, focusHandoffGrace: true)
 
         XCTAssertFalse(OptimisticWindowState.supersededByActiveSibling(
-            windowID: w1.rawValue, state: restoreOrigin, now: now,
+            windowID: w1.rawValue, state: restoreOrigin, now: now + .milliseconds(1500),
             optimisticStates: [w1.rawValue: restoreOrigin],
             snapshot: handoffSnapshot, handoffGraceEnabled: true
         ))
@@ -1755,7 +1697,7 @@ final class FinderP0Tests: XCTestCase {
         ))
         XCTAssertTrue(OptimisticWindowState.supersededByActiveSibling(
             windowID: w1.rawValue, state: restoreOrigin,
-            now: now.addingTimeInterval(OptimisticWindowState.handoffSupersessionGrace + 0.1),
+            now: now + .milliseconds(1500) + .nanoseconds(1),
             optimisticStates: [w1.rawValue: restoreOrigin],
             snapshot: handoffSnapshot, handoffGraceEnabled: true
         ))
@@ -1783,7 +1725,7 @@ final class FinderP0Tests: XCTestCase {
     }
 
     func testSystemPredictionFalsifiedOnlyClearsSystemPredictions() {
-        let now = Date()
+        let now = ContinuousClock.now
         let prediction = OptimisticWindowState(
             status: .active, createdAt: now, focusHandoffGrace: true, systemPredicted: true
         )
@@ -1810,7 +1752,7 @@ final class FinderP0Tests: XCTestCase {
         var host = WindowRecord(id: hostID, appID: AppID(rawValue: "test.host"), pid: 1,
             bundleIdentifier: "test.host", title: "Host", bounds: nil, status: .inactive,
             applicationOrigin: origin, processGeneration: hostGeneration)
-        let now = Date()
+        let now = ContinuousClock.now
         let activation = OptimisticWindowState(status: .active, createdAt: now)
         let planner = LifecycleActionPlanner(isAppFrontmost: { $0 == owner.pid })
         func snapshot() -> DockSnapshot {
@@ -1845,7 +1787,7 @@ final class FinderP0Tests: XCTestCase {
             )
         }
         let planner = LifecycleActionPlanner(isAppFrontmost: { _ in true })
-        let optimisticW2Active = ["cg-inflight-2": OptimisticWindowState(status: .active, createdAt: Date())]
+        let optimisticW2Active = ["cg-inflight-2": OptimisticWindowState(status: .active, createdAt: .now)]
 
         XCTAssertTrue(OptimisticWindowState.siblingActivationInFlight(
             windowID: w1.rawValue, optimisticStates: optimisticW2Active,
@@ -1861,7 +1803,7 @@ final class FinderP0Tests: XCTestCase {
         ))
         XCTAssertFalse(OptimisticWindowState.siblingActivationInFlight(
             windowID: w1.rawValue,
-            optimisticStates: ["cg-inflight-1": OptimisticWindowState(status: .active, createdAt: Date())],
+            optimisticStates: ["cg-inflight-1": OptimisticWindowState(status: .active, createdAt: .now)],
             snapshot: makeSnapshot([record(w1, pid: 1, status: .active)])
         ))
         XCTAssertEqual(
@@ -1879,9 +1821,9 @@ final class FinderP0Tests: XCTestCase {
             ).kind,
             .minimizeWindow
         )
-        let base = Date()
+        let base = ContinuousClock.now
         var both = ["cg-inflight-2": OptimisticWindowState(status: .active, createdAt: base)]
-        both["cg-inflight-1"] = OptimisticWindowState(status: .active, createdAt: base.addingTimeInterval(-1.0))
+        both["cg-inflight-1"] = OptimisticWindowState(status: .active, createdAt: base - .seconds(1))
         XCTAssertEqual(
             planner.plan(
                 intent: .toggle(w1),
@@ -1891,7 +1833,7 @@ final class FinderP0Tests: XCTestCase {
             .activateWindow
         )
         var ownNewer = ["cg-inflight-2": OptimisticWindowState(status: .active, createdAt: base)]
-        ownNewer["cg-inflight-1"] = OptimisticWindowState(status: .active, createdAt: base.addingTimeInterval(1.0))
+        ownNewer["cg-inflight-1"] = OptimisticWindowState(status: .active, createdAt: base + .seconds(1))
         XCTAssertEqual(
             planner.plan(
                 intent: .toggle(w1),
@@ -1958,32 +1900,6 @@ final class FinderP0Tests: XCTestCase {
             ],
             orderedWindowIDs: [windowID]
         )
-    }
-
-    private func snapshot(windowCount: Int) -> DockSnapshot {
-        var windows: [WindowID: WindowRecord] = [:]
-        var orderedWindowIDs: [WindowID] = []
-
-        for index in 0..<windowCount {
-            let windowID = WindowID(rawValue: "cg-baseline-\(index)")
-            orderedWindowIDs.append(windowID)
-            windows[windowID] = WindowRecord(
-                id: windowID,
-                appID: AppID(rawValue: "com.example.baseline"),
-                pid: Int32(1000 + index),
-                bundleIdentifier: "com.example.baseline",
-                title: "Baseline \(index)",
-                bounds: CGRect(
-                    x: CGFloat(index * 20),
-                    y: CGFloat(index * 20),
-                    width: 500,
-                    height: 400
-                ),
-                status: .inactive
-            )
-        }
-
-        return DockSnapshot(windows: windows, orderedWindowIDs: orderedWindowIDs)
     }
 
     private func retainedSnapshot(_ records: WindowRecord...) -> DockSnapshot {

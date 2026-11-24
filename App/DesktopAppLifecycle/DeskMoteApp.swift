@@ -8,7 +8,7 @@ struct DeskMoteApp: App {
     init() {
         #if DESKMOTE_WIDGET
         let location = AppInstallLocation(bundleURL: Bundle.main.bundleURL, isReadOnlyVolume: PermissionService().isReadOnlyVolume)
-        if !location.isTransient { Task.detached(priority: .utility) { WidgetRecovery.run() } }
+        if !location.isTransient { DispatchQueue.global(qos: .utility).async { WidgetRecovery.run() } }
         #endif
     }
 

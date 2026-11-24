@@ -19,8 +19,16 @@ protocol TaskbarPopupPresenting: AnyObject {
     var onPresent: ((NSPanel) -> Void)? { get set }
     var onDismiss: (() -> Void)? { get set }
     func present(content: NSView, frame: CGRect, anchorWindow: NSWindow?)
+    func updateFrame(_ frame: CGRect)
     func makeKey()
     func dismiss()
+}
+
+extension TaskbarPopupPresenting {
+    func updateFrame(_ frame: CGRect) {
+        guard let panel, panel.frame != frame else { return }
+        panel.setFrame(frame, display: true)
+    }
 }
 
 @MainActor
@@ -184,8 +192,11 @@ final class TaskbarWindowListView: NSGlassEffectView, NSTableViewDataSource, NST
     private let cellIdentifier = NSUserInterfaceItemIdentifier("window-cell")
     let tableView: NSTableView = TaskbarWindowTable()
     let scrollView = NSScrollView()
+    var canPerformActions: () -> Bool = { true }
     var onHover: ((Bool) -> Void)?
-    private(set) var isPointerInside = false
+    var isPointerInside: Bool { isMouseInside || fileDragRow != nil }
+    private var isMouseInside = false
+    private weak var fileDragRow: TaskbarWindowListRow?
     private var tracking: NSTrackingArea?
 
     init(windows: [TaskbarWindowPresentation], availableHeight: CGFloat,
@@ -253,8 +264,14 @@ final class TaskbarWindowListView: NSGlassEffectView, NSTableViewDataSource, NST
         guard windows.indices.contains(row) else { return nil }
         let item = windows[row]
         let image = iconProvider(item)
-        let close: () -> Void = { [weak self] in self?.closeWindow(item) }
-        let fileHover: () -> Void = { [weak self] in self?.fileHoverWindow(item) }
+        let close: () -> Void = { [weak self] in
+            guard let self, self.canPerformActions() else { return }
+            self.closeWindow(item)
+        }
+        let fileHover: () -> Void = { [weak self] in
+            guard let self, self.canPerformActions() else { return }
+            self.fileHoverWindow(item)
+        }
         let cell: TaskbarWindowListRow
         if let reusable = tableView.makeView(withIdentifier: cellIdentifier, owner: self) as? TaskbarWindowListRow {
             cell = reusable
@@ -264,7 +281,7 @@ final class TaskbarWindowListView: NSGlassEffectView, NSTableViewDataSource, NST
                                        close: close, fileHover: fileHover)
             cell.identifier = cellIdentifier
         }
-        cell.onDragPresence = { [weak self] inside in self?.setPointerPresence(inside) }
+        cell.onDragPresence = { [weak self] row, inside in self?.setDragPresence(for: row, inside: inside) }
         cell.onHighlightChanged = { [weak self] selected in
             self?.tableView.rowView(atRow: row, makeIfNecessary: false)?.isSelected = selected
         }
@@ -284,10 +301,11 @@ final class TaskbarWindowListView: NSGlassEffectView, NSTableViewDataSource, NST
 
     @objc private func activateClickedWindow() {
         let index = tableView.clickedRow
-        if windows.indices.contains(index) { activateWindow(windows[index]) }
+        if canPerformActions(), windows.indices.contains(index) { activateWindow(windows[index]) }
     }
 
     func cancelPendingActions() {
+        fileDragRow = nil
         tableView.enumerateAvailableRowViews { rowView, _ in
             (rowView.view(atColumn: 0) as? TaskbarWindowListRow)?.cancelFileHover()
         }
@@ -321,17 +339,49 @@ final class TaskbarWindowListView: NSGlassEffectView, NSTableViewDataSource, NST
         super.updateTrackingAreas()
     }
 
-    private func setPointerPresence(_ inside: Bool) {
-        isPointerInside = inside
-        onHover?(inside)
+    private func updatePointerPresence(_ update: () -> Void) {
+        guard canPerformActions() else { return }
+        let wasInside = isPointerInside
+        update()
+        if isPointerInside != wasInside { onHover?(isPointerInside) }
     }
 
-    override func mouseEntered(with event: NSEvent) { setPointerPresence(true) }
-    override func mouseExited(with event: NSEvent) { setPointerPresence(false) }
+    private func setDragPresence(for row: TaskbarWindowListRow, inside: Bool) {
+        updatePointerPresence {
+            if inside {
+                let previous = fileDragRow
+                fileDragRow = row
+                if previous !== row { previous?.cancelFileHover() }
+            } else if fileDragRow === row {
+                fileDragRow = nil
+            }
+        }
+    }
+
+    private func setMousePresence(inside: Bool) {
+        if let containsCurrentMouse, containsCurrentMouse != inside { return }
+        updatePointerPresence { isMouseInside = inside }
+    }
+
+    override func mouseEntered(with event: NSEvent) { setMousePresence(inside: true) }
+    override func mouseExited(with event: NSEvent) { setMousePresence(inside: false) }
 }
 
 @MainActor
 final class TaskbarWindowListRow: NSTableCellView {
+    private enum FileDragLocation {
+        case screen(CGPoint)
+        case detached(CGPoint)
+
+        @MainActor
+        func point(in window: NSWindow?) -> CGPoint? {
+            switch self {
+            case let .screen(point): return window?.convertPoint(fromScreen: point)
+            case let .detached(point): return window == nil ? point : nil
+            }
+        }
+    }
+
     private(set) var item: TaskbarWindowPresentation
     var title: String {
         didSet {
@@ -343,11 +393,12 @@ final class TaskbarWindowListRow: NSTableCellView {
     private(set) var close: () -> Void
     private(set) var fileHover: () -> Void
     let closeButton = NSButton()
-    var onDragPresence: ((Bool) -> Void)?
+    var onDragPresence: ((TaskbarWindowListRow, Bool) -> Void)?
     var onHighlightChanged: ((Bool) -> Void)?
     private var hovered = false
     private var tracking: NSTrackingArea?
     private let delayedActivation: TaskbarDelayedAction
+    private var fileDrag: (sequence: Int, location: FileDragLocation)?
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -442,22 +493,57 @@ final class TaskbarWindowListRow: NSTableCellView {
 
     @objc private func closeWindow() { close() }
 
-    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingPasteboard.availableType(from: [.fileURL]) != nil else { return [] }
-        onDragPresence?(true)
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation { draggingUpdated(sender) }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard sender.draggingPasteboard.availableType(from: [.fileURL]) != nil else {
+            endFileDrag(sender)
+            return []
+        }
+        let sequence = sender.draggingSequenceNumber
+        let isNewDrag = fileDrag?.sequence != sequence
+        if isNewDrag { delayedActivation.cancel() }
+        let location = sender.draggingLocation
+        let destination = sender.draggingDestinationWindow ?? window
+        fileDrag = (sequence, destination.map { .screen($0.convertPoint(toScreen: location)) } ?? .detached(location))
+        if isNewDrag { onDragPresence?(self, true) }
         scheduleFileHover()
         return .generic
     }
 
     func scheduleFileHover() {
-        delayedActivation.schedule(target: item.id, after: .milliseconds(600)) { [weak self] in self?.fileHover() }
+        let target = item.id
+        delayedActivation.schedule(target: target, after: .milliseconds(600)) { [weak self] in
+            guard let self else { return }
+            if let drag = self.fileDrag {
+                self.enclosingScrollView?.layoutSubtreeIfNeeded()
+                guard !Task.isCancelled else { return }
+                guard let location = drag.location.point(in: self.window),
+                      self.visibleRect.contains(self.convert(location, from: nil)) else {
+                    self.cancelFileHover()
+                    return
+                }
+            }
+            self.fileHover()
+        }
     }
 
-    func cancelFileHover() { delayedActivation.cancel() }
-    override func draggingExited(_ sender: (any NSDraggingInfo)?) { cancelFileHover(); onDragPresence?(false) }
-    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+    func cancelFileHover() {
+        delayedActivation.cancel()
+        guard fileDrag != nil else { return }
+        fileDrag = nil
+        onDragPresence?(self, false)
+    }
+
+    private func endFileDrag(_ sender: (any NSDraggingInfo)?) {
+        if let sender, let fileDrag, sender.draggingSequenceNumber != fileDrag.sequence { return }
         cancelFileHover()
-        onDragPresence?(false)
+    }
+
+    override func draggingExited(_ sender: (any NSDraggingInfo)?) { endFileDrag(sender) }
+    override func draggingEnded(_ sender: any NSDraggingInfo) { endFileDrag(sender) }
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        endFileDrag(sender)
         return false
     }
 }

@@ -45,7 +45,7 @@ After `Re-run all jobs`, a resume must match successful validation and the versi
 
 ### Dev diagnostics and performance
 
-Build a separate Debug base app with `PRODUCT_BUNDLE_IDENTIFIER=io.github.sashokey.deskmote.dev`. Keep both production and Dev self-identities out of inventory and helper ownership. Enable `DOCK_INVENTORY_LOG` and `DOCK_CLICK_TRACE` only for an agreed functional check. Keep their bounded journals in the Dev app's local log directory and use one running copy for desktop acceptance.
+Build a separate Debug app with `DESKMOTE_VARIANT=full` and the app bundle identifier `io.github.sashokey.deskmote.dev`. Use a reduced variant only when explicitly requested. Set each embedded target's bundle identifier under the Dev app's namespace and use the matching Finder XPC service name. Verify that the full Dev app links Command Shift, Natural Switch and Battery Run, and that the signed bundle contains both app extensions and the Finder XPC service. Keep both production and Dev self-identities out of inventory and helper ownership. Enable `DOCK_INVENTORY_LOG` and `DOCK_CLICK_TRACE` only for an agreed functional check. Keep their bounded journals in the Dev app's local log directory and use one running copy for desktop acceptance.
 
 Compare CPU time and physical memory footprint on the same configuration, with matching diagnostics, displays and open windows. Use equal intervals for idle, window switching and Space switching. Mark phase boundaries and repeat before attributing small differences. Compare Release with Release to isolate the effect of a patch. A logged Debug run measures the combined cost of Debug and diagnostics.
 
@@ -108,7 +108,9 @@ Report line coverage for `DeskMote.app` alone. Test sources and duplicated appli
 
 Publish changes directly to `master`. Use `vN` as the Git tag, release title, displayed version and ZIP version. Start at `v1` and increase `N` by one at every release, including corrections. The application and both extensions use `N.0.0` for `CFBundleShortVersionString` and `N` for `CFBundleVersion`.
 
-Set `version`, `draft`, `prerelease` and `notes` in `.github/release.json` on `master`. Check the release run for the published commit. The workflow waits for both variants to pass, then attaches only `DeskMote-vN.zip` to the release. Verify that the tag points to the tested SHA and that the release and artifact have the expected ZIP. A failed publication leaves its verified package and draft available for recovery. Retry the failed jobs or use `resume_run_id` for the original release run when its retained artifact and tag match the request.
+Set `version`, `draft`, `prerelease` and `notes` in `.github/release.json` on `master`. Check the release run for the published commit. The workflow waits for both variants to pass, then attaches only `DeskMote-vN.zip` to the release. Verify that the tag points to the tested SHA and that the release and artifact have the expected ZIP. A failed publication retains its verified package and any existing draft for recovery. Retry the failed jobs or use `resume_run_id` for the original release run when its retained artifact and tag match the request.
+
+Keep the release tag at the tested commit from creation through the workflow's final verification. Defer any separate operations on that tag until publication finishes. GitHub checks the ref and writes the release in separate requests. If publication fails, check the tag and release before retrying.
 
 Run this from a checkout with the repository configured as `origin`, using the published tag.
 
@@ -117,13 +119,13 @@ tag=v1
 release_checkout="../DeskMote-$tag"
 git clone --branch "$tag" --single-branch "$(git remote get-url origin)" "$release_checkout"
 cd "$release_checkout"
-test "$(git rev-parse HEAD)" = "$(git rev-parse --verify "refs/tags/$tag^{commit}")" &&
-test -z "$(git status --porcelain)" &&
-test "$(python3 -c 'import json; print(json.load(open(".github/release.json"))["version"])')" = "$tag" &&
-bash Scripts/build.sh full
+release_revision="$(git rev-parse --verify "refs/tags/$tag^{commit}")" &&
+local_app="$(bash Scripts/build.sh full --local "$tag")" &&
+test "$(plutil -extract DeskMoteSourceRevision raw -o - "$local_app/Contents/Info.plist")" = "$release_revision" &&
+printf '%s\n' "$local_app"
 ```
 
-Local and CI builds use the same Xcode, compiler options and ad hoc signature. The script signs the extensions before signing the app and verifies the final bundle. Compare the displayed revision with the published tag. Keep the local copy on the Mac.
+Local and CI builds use the same Xcode, compiler options and ad hoc signature. The script signs the extensions before signing the app and verifies that `DeskMoteSourceRevision` in `DeskMote.app/Contents/Info.plist` matches the checkout commit. For the published ZIP, compare the same key in the extracted app with `git rev-parse --verify "refs/tags/$tag^{commit}"`. Keep the local copy on the Mac.
 
 ## Taskbar reference and boundaries
 
@@ -162,6 +164,8 @@ Keep explanations for transient or read-only installations, sustained permission
 An embedded accessory process may own a visible window while a regular application provides its identity. Admit that helper only when exactly one running regular host contains its canonical bundle below Contents, both executables remain inside their own bundle's Contents/MacOS directory, and both processes have valid Apple-anchored signatures with the same Team ID. Verify code identifiers and process generations. Unknown, ambiguous, unsigned, mismatched, or escaped paths do not establish ownership. Do not add application-name exceptions or privacy permissions.
 
 Keep the native window PID, bundle origin, generation, AX element and CG identity. Use the verified host only for presentation/grouping and ordinary Quit, validating both identities before Quit. Window activation, minimize, restore and close still target the native owner. Cache the binding after admission. Reuse existing focus/event refreshes and remove it on helper or host termination and tracker shutdown. Signing checks run during background admission, not rendering or focus polling.
+
+Recheck the live foreground when accepting family focus evidence. When the verified helper itself is frontmost and system AX focus is unread, accept a fresh local `AXFocusedWindow` only for the exact accepted PID, generation, AX element and CG window. Give a successful system AX result priority. Use one active window selection for all panels and for click planning. Retire stale activation predictions when their commands are superseded or fail, and keep an eligible Close handoff while a newer activation is pending.
 
 AX lists may expose another process's elements. Skip confirmed foreign owners rather than relabeling them. Unread ownership is a failed inventory read, not confirmation that windows disappeared. Independently switchable nonmodal AXDialog windows require a confirmed application-level parent and a reasonable frame. Sheets, modal dialogs, unknown dialog metadata and floating utility windows remain excluded.
 
@@ -206,6 +210,8 @@ During a group drag, reuse text measurements and move only the dragged frames wh
 On application activation, cancel only initial height-adjustment writers that have not consumed their active-owner validation gate. Once the first size write is authorized, finish the bounded, geometry-verified adjustment even if focus changes. Focus loss must not roll an already applied size back to the original full height or discard restoration metadata. Stop, permission recovery, retired display contexts and external geometry retain their separate cancellation/restoration rules.
 
 Maintain an already confirmed height adjustment if the same window returns to its known native frame while its application is inactive. Keep the active-application requirement in the pending validation for initial adjustments. Only maintenance of a confirmed managed frame may continue in the background, including across an activation notification during validation. Recheck process generation, display context, the native CG/AX frame and window capabilities before writing. Preserve manual geometry and leave previously unmanaged inactive windows untouched. Use the existing observation and fallback paths without another timer or input observation.
+
+Evaluate height-adjustment candidates in CG order on each display. Continue after a synchronous rejection and retain the display reservation for a confirmed eligible front session. Preserve the existing write and retry limits. An unread final AX window ID blocks the write and preserves the last confirmed restoration pair. A positively confirmed replacement revokes that pair.
 
 Bottom-docked tiles may extend horizontally beyond their owning display. Keep the majority-overlap requirement, minimum dimensions, bottom alignment, top bound and second aligned edge. Horizontal containment is not required. Reuse the maximized detector's menu-reserved visible frame when a secondary display reports its entire screen as visible. A full-height window moved partly beyond either side must still clear the taskbar, preserving its top, left and width. Keep the tiles kill switch, application-independent detection, native AX validation and restoration of the latest accepted frame.
 

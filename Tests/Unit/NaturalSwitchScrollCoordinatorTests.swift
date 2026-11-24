@@ -29,8 +29,9 @@ final class MonitorFixture: DeviceMonitoring {
 
     func stop() { stops += 1 }
 
-    func connect(_ ids: [UInt64]) {
-        devices = ids.map { HIDDevice(id: $0, properties: ["Transport": "USB", "PrimaryUsagePage": 1, "PrimaryUsage": 2]) }
+    func connectMice(_ count: Int) {
+        let mouse = HIDDevice(properties: ["Transport": "USB", "PrimaryUsagePage": 1, "PrimaryUsage": 2])
+        devices = Array(repeating: mouse, count: count)
         onChange?()
     }
 }
@@ -82,14 +83,14 @@ struct ScrollCoordinatorTests {
 
     @Test func mousePresenceStaysDisabledUntilLastDisconnects() {
         let monitor = MonitorFixture()
-        monitor.connect([1])
+        monitor.connectMice(1)
         let scroll = ScrollingFixture(true)
         let coordinator = ScrollCoordinator(monitor: monitor, scrolling: scroll, onFailure: { _ in Issue.record("Unexpected failure") })
         coordinator.start()
-        monitor.connect([1, 2])
-        monitor.connect([2])
+        monitor.connectMice(2)
+        monitor.connectMice(1)
         #expect(scroll.writes == [false])
-        monitor.connect([])
+        monitor.connectMice(0)
         #expect(scroll.writes == [false, true])
     }
 
@@ -109,7 +110,7 @@ struct ScrollCoordinatorTests {
 
     @Test func trackpadDoesNotDisableNaturalScrolling() {
         let monitor = MonitorFixture()
-        monitor.devices = [HIDDevice(id: 1, properties: ["Transport": "Bluetooth", "PrimaryUsagePage": 13, "PrimaryUsage": 5])]
+        monitor.devices = [HIDDevice(properties: ["Transport": "Bluetooth", "PrimaryUsagePage": 13, "PrimaryUsage": 5])]
         let scroll = ScrollingFixture(false)
         let coordinator = ScrollCoordinator(monitor: monitor, scrolling: scroll, onFailure: { _ in Issue.record("Unexpected failure") })
         coordinator.start()
@@ -123,7 +124,7 @@ struct ScrollCoordinatorTests {
         coordinator.start()
         coordinator.setSleeping(true)
         coordinator.setSessionActive(false)
-        monitor.connect([1])
+        monitor.connectMice(1)
         coordinator.setSleeping(false)
         #expect(scroll.writes.isEmpty)
         coordinator.setSessionActive(true)
@@ -133,12 +134,12 @@ struct ScrollCoordinatorTests {
 
     @Test func quitLeavesSettingAndStopsFutureWrites() {
         let monitor = MonitorFixture()
-        monitor.connect([1])
+        monitor.connectMice(1)
         let scroll = ScrollingFixture(true)
         let coordinator = ScrollCoordinator(monitor: monitor, scrolling: scroll, onFailure: { _ in Issue.record("Unexpected failure") })
         coordinator.start()
         coordinator.stop()
-        monitor.connect([])
+        monitor.connectMice(0)
         coordinator.setSleeping(false)
         #expect(scroll.writes == [false])
         #expect(monitor.starts == 1)

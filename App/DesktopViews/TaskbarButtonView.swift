@@ -1,5 +1,13 @@
 import AppKit
 
+extension NSView {
+    var containsCurrentMouse: Bool? {
+        guard let window else { return nil }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return isMousePoint(point, in: visibleRect)
+    }
+}
+
 @MainActor
 final class TaskbarButtonView: NSButton {
     enum ActionTargets: Equatable {
@@ -135,6 +143,7 @@ final class TaskbarButtonView: NSButton {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        guard containsCurrentMouse != false else { return }
         super.mouseEntered(with: event)
         hovered = true
         updateAppearance(animated: true)
@@ -142,6 +151,7 @@ final class TaskbarButtonView: NSButton {
     }
 
     override func mouseExited(with event: NSEvent) {
+        guard containsCurrentMouse != true else { return }
         super.mouseExited(with: event)
         hovered = false
         updateAppearance(animated: true)

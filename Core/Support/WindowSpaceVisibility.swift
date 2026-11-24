@@ -40,12 +40,20 @@ struct WindowSpaceRequest: Equatable, Sendable {
 }
 
 struct WindowSpaceSnapshot: Equatable, Sendable {
+    private struct DisplayTransfer: Equatable, Sendable {
+        let source: String
+        let destination: String
+        var confirmed = false
+    }
+
     var layouts: [String: SpaceLayoutSnapshot]
     var memberships: [WindowSpaceIdentity: Set<Int>]
     private var requestedIdentities: [UInt32: Set<WindowSpaceIdentity>] = [:]
     private var retiredWindowNumbers: [UInt32] = []
     private var requiresFreshMembership = false
     private var unconfirmedMemberships: Set<WindowSpaceIdentity> = []
+    private var externalDisplayUUIDs: [WindowSpaceIdentity: String] = [:]
+    private var displayTransfers: [WindowSpaceIdentity: DisplayTransfer] = [:]
     private var lastVisibleUtilitySpaces: [WindowSpaceIdentity: Int] = [:]
     private var utilitiesAwaitingLayout: Set<WindowSpaceIdentity> = []
     private var pendingUtilityMemberships: [WindowSpaceIdentity: Set<Int>] = [:]
@@ -58,6 +66,24 @@ struct WindowSpaceSnapshot: Equatable, Sendable {
     func permitsProjection(on displayUUID: String?) -> Bool {
         guard let displayUUID, !layouts.isEmpty else { return true }
         return layouts[displayUUID] != nil || layouts["Main"] != nil
+    }
+
+    func matchesExternalDisplay(_ identity: WindowSpaceIdentity?, displayUUID: String?) -> Bool {
+        guard let identity, let displayUUID, let previous = externalDisplayUUIDs[identity] else { return true }
+        return previous == displayUUID
+    }
+
+    func transfers(in requests: [WindowSpaceRequest], attachedDisplays: Set<String>? = nil) -> [WindowSpaceRequest] {
+        requests.filter { request in
+            guard let transfer = displayTransfers[request.identity], !transfer.confirmed else { return false }
+            return request.displayUUID == transfer.destination && attachedDisplays?.contains(transfer.destination) != false
+        }
+    }
+
+    func clearingConfirmedTransfers() -> Self {
+        var next = self
+        next.displayTransfers = displayTransfers.filter { !$0.value.confirmed }
+        return next
     }
 
     func shows(_ identity: WindowSpaceIdentity?, on displayUUID: String?) -> Bool {
@@ -94,9 +120,12 @@ struct WindowSpaceSnapshot: Equatable, Sendable {
     }
 
     func updating(with observation: WindowSpaceSnapshot?, requests: [WindowSpaceRequest],
-                  afterSpaceChange: Bool = false, attachedDisplays: Set<String>? = nil) -> Self {
+                  afterSpaceChange: Bool = false, attachedDisplays: Set<String>? = nil,
+                  targetedTransferRead: Bool = false) -> Self {
         let identities = Set(requests.map(\.identity))
-        var next = self
+        let observation = observation.flatMap { $0.layouts.isEmpty ? nil : $0 }
+        let canRetainConfirmedTransfer = !afterSpaceChange && (observation.map { $0.layouts == layouts } ?? true)
+        var next = canRetainConfirmedTransfer ? self : clearingConfirmedTransfers()
         let previouslyRequested = layouts.isEmpty ? Set<WindowSpaceIdentity>() :
             Set(requestedIdentities.values.flatMap { $0 })
         let retired = Set(memberships.keys).union(unconfirmedMemberships).union(previouslyRequested).subtracting(identities)
@@ -111,24 +140,70 @@ struct WindowSpaceSnapshot: Equatable, Sendable {
         next.lastVisibleUtilitySpaces = lastVisibleUtilitySpaces.filter { identities.contains($0.key) }
         next.utilitiesAwaitingLayout.formIntersection(identities)
         next.pendingUtilityMemberships = pendingUtilityMemberships.filter { identities.contains($0.key) }
-        let observation = observation.flatMap { $0.layouts.isEmpty ? nil : $0 }
+        next.externalDisplayUUIDs = Dictionary(requests.compactMap { request in
+            guard !request.isUtility, !request.isParked, let displayUUID = request.displayUUID else { return nil }
+            return (request.identity, displayUUID)
+        }, uniquingKeysWith: { first, _ in first })
+        let priorTransfers = next.displayTransfers
+        next.displayTransfers = Dictionary(requests.compactMap { request in
+            guard !request.isUtility, let transfer = priorTransfers[request.identity],
+                  transfer.destination == request.displayUUID else { return nil }
+            return (request.identity, transfer)
+        }, uniquingKeysWith: { first, _ in first })
+        for (identity, destination) in next.externalDisplayUUIDs {
+            if let source = externalDisplayUUIDs[identity], source != destination {
+                next.displayTransfers[identity] = DisplayTransfer(source: source, destination: destination)
+                next.memberships.removeValue(forKey: identity)
+                next.unconfirmedMemberships.insert(identity)
+            }
+        }
         if let observation { next.layouts = observation.layouts }
         if afterSpaceChange, observation != nil { next.requiresFreshMembership = true }
         for request in requests {
             let identity = request.identity
             let spaces = observation?.memberships[identity]
+            if let transfer = next.displayTransfers[identity] {
+                let reachesDestination = spaces.map { membership in
+                    next.layout(on: transfer.destination).map { !membership.isDisjoint(with: $0.orderedSpaceIDs) } == true
+                } == true && attachedDisplays?.contains(transfer.destination) != false
+                if reachesDestination {
+                    if targetedTransferRead {
+                        next.displayTransfers[identity]?.confirmed = true
+                    } else {
+                        next.displayTransfers.removeValue(forKey: identity)
+                    }
+                } else {
+                    guard transfer.confirmed else { continue }
+                    if let spaces, !spaces.isEmpty, let source = next.layout(on: transfer.source),
+                       spaces.isSubset(of: source.orderedSpaceIDs) { continue }
+                }
+            }
             if request.isUtility, !request.isParked, request.isOnActiveSpace == true,
                afterSpaceChange, observation == nil {
                 next.utilitiesAwaitingLayout.insert(identity)
             }
             if request.isUtility, !request.isParked, !afterSpaceChange || observation != nil,
-               let visibleSpace = next.layout(on: request.displayUUID)?.currentSpaceID {
+               let currentLayout = next.layout(on: request.displayUUID) {
+                let visibleSpace = currentLayout.currentSpaceID
+                let displayLayoutChanged = layoutChanged(on: request.displayUUID, to: next.layouts)
+                let currentSpaceChanged = layout(on: request.displayUUID).map { $0.currentSpaceID != visibleSpace } == true
                 let inventoryConfirms = request.isOnDesktop && (spaces?.contains(visibleSpace) == true ||
-                    (!afterSpaceChange && !layoutChanged(on: request.displayUUID, to: next.layouts)))
+                    (!afterSpaceChange && !displayLayoutChanged))
                 if request.isOnActiveSpace ?? inventoryConfirms {
-                    next.lastVisibleUtilitySpaces[identity] = visibleSpace
-                    next.utilitiesAwaitingLayout.remove(identity)
-                    next.pendingUtilityMemberships.removeValue(forKey: identity)
+                    if request.isOnActiveSpace == true, !currentSpaceChanged,
+                       afterSpaceChange || next.utilitiesAwaitingLayout.contains(identity),
+                       let spaces, !spaces.contains(visibleSpace),
+                       spaces.intersection(currentLayout.orderedSpaceIDs).count == 1 {
+                        next.utilitiesAwaitingLayout.insert(identity)
+                        next.pendingUtilityMemberships[identity] = spaces
+                    } else if next.pendingUtilityMemberships[identity] == nil || currentSpaceChanged ||
+                                spaces?.contains(visibleSpace) == true {
+                        next.lastVisibleUtilitySpaces[identity] = visibleSpace
+                        if currentSpaceChanged || request.isOnActiveSpace != true {
+                            next.utilitiesAwaitingLayout.remove(identity)
+                        }
+                        next.pendingUtilityMemberships.removeValue(forKey: identity)
+                    }
                 }
             }
 

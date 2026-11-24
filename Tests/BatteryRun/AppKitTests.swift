@@ -29,7 +29,7 @@ let appKitTests = [
             }
             let url = URL(fileURLWithPath: ".build/charging-window-\(UUID().uuidString).json")
             var current = reading(60, date: date, charging: false)
-            let monitor = BatteryMonitor(stateURL: url, readSample: { current })
+            let monitor = BatteryMonitor(stateURL: url, readSample: { _ in current })
             let controller = BatteryWindowController(monitor: monitor)
             controller.refreshBatteryData(nil)
 
@@ -66,7 +66,7 @@ let appKitTests = [
         try MainActor.assumeIsolated {
             let url = URL(fileURLWithPath: ".build/power-window-\(UUID().uuidString).json")
             var current = historyCurrent(63)
-            let monitor = BatteryMonitor(stateURL: url, readSample: { current })
+            let monitor = BatteryMonitor(stateURL: url, readSample: { _ in current }, loadHistory: { nil })
             let controller = BatteryWindowController(monitor: monitor)
             controller.refreshBatteryData(nil)
             guard let window = controller.window else { throw TestFailure.failed("missing window") }
@@ -132,7 +132,7 @@ let appKitTests = [
             }
             var current = reading(10)
             var reads = 0
-            let monitor = BatteryMonitor(stateURL: url, readSample: {
+            let monitor = BatteryMonitor(stateURL: url, readSample: { _ in
                 reads += 1
                 return current
             })
@@ -284,18 +284,23 @@ let appKitTests = [
         try MainActor.assumeIsolated {
             let url = URL(fileURLWithPath: ".build/window-\(UUID().uuidString).json")
             let reading = historyCurrent(71)
-            let monitor = BatteryMonitor(stateURL: url, readSample: { reading })
+            let monitor = BatteryMonitor(stateURL: url, readSample: { _ in reading }, bootDate: nil, loadHistory: {
+                PowerHistory(from: "2024-01-01 12:30:00 +0000 Wake Wake from sleep Using Batt (Charge: 75%)",
+                             before: reading.date)
+            })
             let controller = BatteryWindowController(monitor: monitor)
             controller.refreshBatteryData(nil)
             try expect(controller.window != nil, "the app must provide a native window")
             try expect(monitor.sample == reading, "refresh must read the battery source")
             try expect(visibleText(in: controller.dashboard).contains("71%"), "measured charge must reach the native dashboard")
+            try expect(drainBatteryHistory(until: { visibleText(in: controller.dashboard).contains("8h 52m") }),
+                       "manual refresh must also publish the recovered history forecast")
         }
     },
     TestCase(name: "AppKit observes monitor updates without a manual window refresh") {
         try MainActor.assumeIsolated {
             let url = URL(fileURLWithPath: ".build/automatic-window-\(UUID().uuidString).json")
-            let monitor = BatteryMonitor(stateURL: url, readSample: { historyCurrent(63) })
+            let monitor = BatteryMonitor(stateURL: url, readSample: { _ in historyCurrent(63) })
             let controller = BatteryWindowController(monitor: monitor)
             monitor.refresh()
             let expected = "63%"
@@ -313,7 +318,7 @@ let appKitTests = [
             let start = BatterySample(date: current.date.addingTimeInterval(-7200), percent: 90, onBattery: true)
             let history = DischargeSession(start: start, origin: .history)
             try SessionStore.save(SessionTracker(session: history, lastSample: start), to: url)
-            let monitor = BatteryMonitor(stateURL: url, readSample: { current })
+            let monitor = BatteryMonitor(stateURL: url, readSample: { _ in current })
             monitor.refresh()
             let controller = BatteryWindowController(monitor: monitor)
             guard let window = controller.window,

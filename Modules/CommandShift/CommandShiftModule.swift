@@ -11,7 +11,7 @@ public final class CommandShiftModule {
 
     public var onInterruption: ((Bool) -> Void)?
     private let notifications = NSWorkspace.shared.notificationCenter
-    private let monitor = KeyboardMonitor(initialInput: { ShortcutRecognizer.currentInput() }) {
+    private let monitor = KeyboardMonitor(readInput: { ShortcutRecognizer.currentInput() }) {
         let status = SystemInputSources.selectNext()
         if status != 0 {
             Alerts.error("Couldn’t Switch Input Source",
@@ -23,10 +23,10 @@ public final class CommandShiftModule {
     private var sessionInactive = false
 
     public init() {
-        monitor.onPermissionLoss = { [weak self] in
+        monitor.onInterruption = { [weak self] state in
             guard let self else { return }
             self.stop()
-            self.onInterruption?(true)
+            self.onInterruption?(state == .permissionRequired)
         }
     }
 

@@ -1,4 +1,36 @@
+import Synchronization
 import XCTest
+
+@MainActor
+final class FullscreenProbeWorkerCancellationTests: XCTestCase {
+    func testStoppedWindowedProbeSkipsTheSeparateSpaceRead() async {
+        let enteredAX = Mutex(false)
+        let releaseAX = DispatchSemaphore(value: 0)
+        let spaceReads = Mutex(0)
+        let worker = FullscreenProbeWorker(read: { _ in
+            enteredAX.withLock { $0 = true }
+            _ = releaseAX.wait(timeout: .now() + 3)
+            return FullscreenAXProbe(verdict: .windowed, overlayWindowID: nil)
+        }, readSpace: { _ in
+            spaceReads.withLock { $0 += 1 }
+            return false
+        }, deliver: { _, _ in XCTFail("Stopped probe delivered a result") })
+        defer { releaseAX.signal(); worker.stop() }
+        worker.request(FullscreenProbeRequest(pid: -51230, screenFrame: .zero, generation: 1,
+                                              spaceGeneration: nil, finalConfirmation: false, source: "test"))
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !enteredAX.withLock({ $0 }), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertTrue(enteredAX.withLock { $0 })
+        let pending = worker.pendingWorkForTesting
+        worker.stop()
+        releaseAX.signal()
+        for task in pending { await task.value }
+
+        XCTAssertEqual(spaceReads.withLock { $0 }, 0)
+    }
+}
 
 final class FullscreenClassificationTests: XCTestCase {
     private func isFullscreen(role: String?, isAXFullscreen: Bool, windowFrame: CGRect?,

@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import Synchronization
 #if DEBUG
 import os
 #endif
@@ -14,7 +15,7 @@ struct WindowLiftCGCandidate: Equatable, Sendable {
 }
 
 struct WindowLiftCGScanResult: Sendable {
-    let candidatesByScreenIndex: [Int: WindowLiftCGCandidate]
+    let candidatesByScreenIndex: [Int: [WindowLiftCGCandidate]]
     let onScreenFrames: [WindowLiftAvoidance.WindowKey: CGRect]
     let liveWindowKeys: Set<WindowLiftAvoidance.WindowKey>?
 }
@@ -38,7 +39,7 @@ enum WindowLiftCGWindowProbe {
         let onScreenCapture = system.windowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
         var onScreenFrames: [WindowLiftAvoidance.WindowKey: CGRect] = [:]
         var onScreenKeys: Set<WindowLiftAvoidance.WindowKey> = []
-        var candidates: [Int: WindowLiftCGCandidate] = [:]
+        var candidates: [Int: [WindowLiftCGCandidate]] = [:]
         let screenFrames = contexts.map(\.displayWindowServerFrame)
 
         for info in onScreenCapture ?? [] {
@@ -47,17 +48,14 @@ enum WindowLiftCGWindowProbe {
             guard let quartzFrame = windowBounds(in: info) else { continue }
             onScreenFrames[key] = quartzFrame
 
-            guard candidates.count < contexts.count,
-                  key.pid != selfPID, quartzFrame.width >= 80, quartzFrame.height >= 40,
+            guard key.pid != selfPID, quartzFrame.width >= 80, quartzFrame.height >= 40,
                   isVisibleAtNormalLayer(info),
-                  let index = WindowLiftAvoidance.displayContextIndex(for: quartzFrame, screenCGFrames: screenFrames),
-                  candidates[index] == nil else { continue }
-            let candidate = WindowLiftCGCandidate(key: key, quartzFrame: quartzFrame)
+                  let index = WindowLiftAvoidance.displayContextIndex(for: quartzFrame, screenCGFrames: screenFrames) else { continue }
             let isTracked = trackedKeys.contains(key)
             if WindowLiftAvoidance.qualifiesForLiftProbe(
                 quartzFrame: quartzFrame, isTracked: isTracked, context: contexts[index], includesTiles: includesTiles
             ) {
-                candidates[index] = candidate
+                candidates[index, default: []].append(WindowLiftCGCandidate(key: key, quartzFrame: quartzFrame))
             }
         }
 
@@ -104,27 +102,6 @@ enum WindowLiftCGWindowProbe {
         return frames
     }
 
-    static func frontmostLargeWindow(
-        in list: [[String: Any]],
-        on displayWindowServerFrame: CGRect,
-        excludingPID selfPID: pid_t
-    ) -> WindowLiftCGCandidate? {
-        for info in list {
-            guard isVisibleAtNormalLayer(info),
-                  let key = windowKey(in: info),
-                  key.pid != selfPID,
-                  let bounds = windowBounds(in: info),
-                  bounds.intersects(displayWindowServerFrame),
-                  bounds.width > displayWindowServerFrame.width * 0.7,
-                  bounds.width >= 80,
-                  bounds.height >= 40 else {
-                continue
-            }
-            return WindowLiftCGCandidate(key: key, quartzFrame: bounds)
-        }
-        return nil
-    }
-
     private static func isVisibleAtNormalLayer(_ info: [String: Any]) -> Bool {
         number(in: info, key: kCGWindowLayer)?.intValue == 0
             && (number(in: info, key: kCGWindowAlpha)?.doubleValue ?? 1) > 0
@@ -132,8 +109,8 @@ enum WindowLiftCGWindowProbe {
 
     private static func windowKey(in info: [String: Any]) -> WindowLiftAvoidance.WindowKey? {
         guard let pid = number(in: info, key: kCGWindowOwnerPID)?.int32Value,
-              let windowID = number(in: info, key: kCGWindowNumber)?.uint32Value,
-              windowID != 0 else {
+              let windowID = nativeWindowNumber(in: info),
+              windowID != kCGNullWindowID else {
             return nil
         }
         return WindowLiftAvoidance.WindowKey(pid: pid, cgWindowID: windowID)
@@ -181,6 +158,8 @@ final class WindowLiftAvoidanceController {
     private enum ValidationStage: String {
         case candidateMoved
         case processIdentityUnavailable
+        case processIdentityChanged
+        case windowIdentityChanged
         case handleUnavailable
         case roleUnavailable
         case unsupportedRole
@@ -193,7 +172,8 @@ final class WindowLiftAvoidanceController {
 
         var preservesConfirmedLift: Bool {
             switch self {
-            case .candidateMoved, .handleUnavailable, .roleUnavailable, .frameUnavailable, .capabilityUnavailable:
+            case .candidateMoved, .processIdentityUnavailable, .handleUnavailable, .roleUnavailable,
+                 .frameUnavailable, .frameMismatch, .capabilityUnavailable:
                 true
             default:
                 false
@@ -202,19 +182,35 @@ final class WindowLiftAvoidanceController {
     }
 
     private struct ValidationFrames {
-        #if DEBUG
         let cg: CGRect
         let ax: CGRect?
-        #else
-        @inline(__always)
-        init(cg: CGRect, ax: CGRect?) {}
-        #endif
+
+        var agreedFrame: CGRect? {
+            guard let ax, WindowLiftAvoidance.geometrySamplesAgree(cg, comparedTo: ax) else { return nil }
+            return ax
+        }
+    }
+
+    private final class FirstNativeWrite: Sendable {
+        enum State {
+            case awaitingAttempt, processUnavailable, identityChanged, attempted
+
+            var retainsConfirmation: Bool { self == .awaitingAttempt || self == .processUnavailable }
+        }
+
+        private let state = Mutex(State.awaitingAttempt)
+        var current: State { state.withLock { $0 } }
+
+        func record(_ result: State) {
+            state.withLock { if $0 == .awaitingAttempt { $0 = result } }
+        }
     }
 
     private struct WriteWindowIdentity: Sendable {
         let key: WindowLiftAvoidance.WindowKey
         let generation: ProcessGeneration
         let system: any WindowSystemAccess
+        let firstWrite: FirstNativeWrite
 
         var processMatches: Bool { system.generation(key.pid) == generation }
     }
@@ -223,6 +219,11 @@ final class WindowLiftAvoidanceController {
         case ready(AXWindowHandle)
         case transient(ValidationStage, ValidationFrames? = nil)
         case unsupported(ValidationStage)
+    }
+
+    private enum WriteAdmission {
+        case accepted(ManagedFrames)
+        case rejected(OperationOutcome)
     }
 
     private struct WriteAnomaly {
@@ -298,8 +299,11 @@ final class WindowLiftAvoidanceController {
     }
     private struct PendingValidation {
         let generation: UInt64
-        let confirmedLift: ConfirmedLift?
-        var requiresActiveApplication: Bool { confirmedLift == nil }
+        var previousLift: ConfirmedLift?
+        let firstWrite: FirstNativeWrite
+        var isAdmitted = false
+        var confirmedLift: ConfirmedLift? { firstWrite.current.retainsConfirmation ? previousLift : nil }
+        var requiresActiveApplication: Bool { !isAdmitted && previousLift == nil }
     }
     private var pendingValidations: [WindowLiftAvoidance.WindowKey: PendingValidation] = [:]
     #if DEBUG
@@ -485,6 +489,11 @@ final class WindowLiftAvoidanceController {
             return nil
         }
         for key in stalled {
+            if let validation = pendingValidations.removeValue(forKey: key),
+               case let .writing(attempt) = states[key], validation.generation == attempt.generation,
+               resumeConfirmedLift(validation.confirmedLift, for: key) {
+                continue
+            }
             clearManagedSession(
                 for: key,
                 cancelWriter: false,
@@ -912,10 +921,10 @@ final class WindowLiftAvoidanceController {
         for key: WindowLiftAvoidance.WindowKey,
         context: WindowLiftAvoidanceContext,
         observationGeneration: UInt64
-    ) -> Bool {
-        guard pendingRestorations[key] == nil else { return true }
-        guard let state = states[key], let frames = managedFrames[key] else { return false }
-        guard acceptObservation(for: key, generation: observationGeneration) else { return true }
+    ) -> TrackedObservation? {
+        guard pendingRestorations[key] == nil else { return .rejected }
+        guard let state = states[key], let frames = managedFrames[key] else { return nil }
+        guard acceptObservation(for: key, generation: observationGeneration) else { return trackedReservation(for: state) }
 
         let appKitFrame = WindowLiftAvoidance.appKitCoordinates(
             fromQuartz: quartzFrame,
@@ -931,9 +940,9 @@ final class WindowLiftAvoidanceController {
         #endif
 
         if case let .writing(attempt) = state,
-           pendingValidations[key]?.generation == attempt.generation,
+           let validation = pendingValidations[key], validation.generation == attempt.generation, !validation.isAdmitted,
            classification == .external {
-            return true
+            return .retained
         }
 
         let observedAt = uptime()
@@ -948,7 +957,7 @@ final class WindowLiftAvoidanceController {
                 forMaximizedReturn: appKitFrame, from: frames.nativeAppKit
             )
             if classification == .native || maximizedTarget != nil {
-                guard hostContexts().contains(context) else { return true }
+                guard hostContexts().contains(context) else { return .rejected }
                 confirmedLift = ConfirmedLift(session: session, frames: frames)
             }
             if let maximizedTarget {
@@ -997,7 +1006,8 @@ final class WindowLiftAvoidanceController {
             operationGeneration: observationGeneration,
             confirmedLift: confirmedLift
         )
-        return true
+        if transition.action == .clear { return .cleared }
+        return trackedReservation(for: states[key])
     }
 
     func reconcileContexts(_ contexts: [WindowLiftAvoidanceContext]) {
@@ -1036,23 +1046,48 @@ final class WindowLiftAvoidanceController {
             )
             guard restoreTask == nil else { return }
         }
-        let reconciledKeys = reconcileTrackedFrames(
+        let trackedObservations = reconcileTrackedFrames(
             result.onScreenFrames,
             contexts: contexts,
             observationGeneration: observationGeneration
         )
+        let writingContexts: [WindowLiftAvoidanceContext] = writeTasks.keys.compactMap { key in
+            guard case let .writing(attempt) = states[key], attempt.generation >= observationGeneration else { return nil }
+            return sessionContexts[key]
+        }
 
         let screenCGFrames = contexts.map(\.displayWindowServerFrame)
         for (index, context) in contexts.enumerated() {
-            guard let candidate = result.candidatesByScreenIndex[index],
-                  WindowLiftAvoidance.displayContextIndex(for: candidate.quartzFrame, screenCGFrames: screenCGFrames) == index,
-                  !reconciledKeys.contains(candidate.key) else { continue }
-            if handleScanCandidate(
-                candidate,
-                context: context,
-                observationGeneration: observationGeneration
-            ) {
-                return
+            guard !writingContexts.contains(context) else { continue }
+            displayCandidates: for candidate in result.candidatesByScreenIndex[index] ?? [] {
+                guard WindowLiftAvoidance.displayContextIndex(for: candidate.quartzFrame, screenCGFrames: screenCGFrames) == index else {
+                    continue
+                }
+                if let observation = trackedObservations[candidate.key] {
+                    switch observation {
+                    case .retained:
+                        if sessionContexts[candidate.key] == context { break displayCandidates }
+                    case .cleared:
+                        let frame = WindowLiftAvoidance.appKitCoordinates(
+                            fromQuartz: candidate.quartzFrame, primaryDisplayHeight: context.primaryDisplayHeight
+                        )
+                        if let plan = initialLiftTransition(for: candidate.key, frame: frame, context: context,
+                                                           generation: observationGeneration),
+                           case .write = plan.transition.action {
+                            break displayCandidates
+                        }
+                    case .rejected:
+                        break
+                    }
+                    continue
+                }
+                if handleScanCandidate(
+                    candidate,
+                    context: context,
+                    observationGeneration: observationGeneration
+                ) {
+                    return
+                }
             }
         }
     }
@@ -1073,36 +1108,18 @@ final class WindowLiftAvoidanceController {
             fromQuartz: candidate.quartzFrame,
             primaryDisplayHeight: context.primaryDisplayHeight
         )
-        var carriedStandoffRounds: Int?
+        #if DEBUG
         if let suppressed = suppressedFrames[candidate.key] {
-            #if DEBUG
             let classification = WindowLiftAvoidance.classifyObservedLiftFrame(
                 of: appKitFrame,
                 unadjustedWindowFrame: suppressed.unadjustedWindowFrame,
                 intendedWindowFrame: suppressed.intendedWindowFrame
             )
             traceClassification(classification, for: candidate.key)
-            #endif
-            switch suppressed.decision(
-                for: appKitFrame, geometry: context.geometry,
-                includesTiles: includesTiles, at: uptime()
-            ) {
-            case .hold:
-                return false
-            case .restart:
-                break
-            case let .reassert(rounds):
-                carriedStandoffRounds = rounds
-            }
         }
-        guard let intendedWindowFrame = context.geometry.desiredClearanceFrame(
-                  for: appKitFrame,
-                  includesTiles: includesTiles
-              ),
-              let app = system.app(candidate.key.pid),
-              app.isActive,
-              !app.isTerminated,
-              app.activationPolicy == .regular || app.activationPolicy == .accessory else {
+        #endif
+        guard let plan = initialLiftTransition(for: candidate.key, frame: appKitFrame, context: context,
+                                              generation: observationGeneration) else {
             return false
         }
         if suppressedFrames[candidate.key] != nil {
@@ -1117,62 +1134,78 @@ final class WindowLiftAvoidanceController {
             #endif
         }
 
-        let operationGeneration = observationGeneration
-        let event: WindowLiftAvoidance.Event
-        if let carriedStandoffRounds, states[candidate.key] == nil {
-            event = .detourReturnObserved(
-                generation: operationGeneration,
-                at: uptime(),
-                nativeFrame: appKitFrame,
-                targetFrame: intendedWindowFrame,
-                standoffRounds: carriedStandoffRounds
-            )
+        if let detourTarget = plan.detourTarget {
             managedFrames[candidate.key] = ManagedFrames(
-                nativeAppKit: appKitFrame, targetAppKit: intendedWindowFrame,
+                nativeAppKit: appKitFrame, targetAppKit: detourTarget,
                 primaryDisplayHeight: context.primaryDisplayHeight,
                 processGeneration: system.generation(candidate.key.pid),
                 restoresSettledTarget: false
             )
-        } else {
-            event = .maximizedDetected(
-                generation: operationGeneration,
-                at: uptime(),
-                nativeFrame: appKitFrame,
-                targetFrame: intendedWindowFrame
-            )
         }
-        let transition = WindowLiftAvoidance.reduce(
-            state: states[candidate.key] ?? .idle,
-            event: event
-        )
         apply(
-            transition,
+            plan.transition,
             for: candidate,
             context: context,
-            operationGeneration: operationGeneration
+            operationGeneration: observationGeneration
         )
-        return true
+        return pendingValidations[candidate.key]?.generation == observationGeneration
+    }
+
+    private func initialLiftTransition(for key: WindowLiftAvoidance.WindowKey, frame: CGRect,
+                                       context: WindowLiftAvoidanceContext, generation: UInt64)
+        -> (transition: WindowLiftAvoidance.Transition, detourTarget: CGRect?)? {
+        let observedAt = uptime()
+        let decision = suppressedFrames[key]?.decision(
+            for: frame, geometry: context.geometry, includesTiles: includesTiles, at: observedAt
+        )
+        guard decision != .hold,
+              let target = context.geometry.desiredClearanceFrame(for: frame, includesTiles: includesTiles),
+              let app = system.app(key.pid), app.isActive, !app.isTerminated,
+              app.activationPolicy == .regular || app.activationPolicy == .accessory else { return nil }
+        let state = states[key]
+        if state == nil, case let .reassert(rounds)? = decision {
+            let transition = WindowLiftAvoidance.reduce(state: .idle,
+                event: .detourReturnObserved(generation: generation, at: observedAt,
+                    nativeFrame: frame, targetFrame: target, standoffRounds: rounds))
+            return (transition, target)
+        }
+        let transition = WindowLiftAvoidance.reduce(state: state ?? .idle,
+            event: .maximizedDetected(generation: generation, at: observedAt, nativeFrame: frame, targetFrame: target))
+        return (transition, nil)
+    }
+
+    private enum TrackedObservation {
+        case retained
+        case cleared
+        case rejected
+    }
+
+    private func trackedReservation(for state: WindowLiftAvoidance.SessionState?) -> TrackedObservation {
+        switch state {
+        case .writing, .lifted:
+            return .retained
+        default:
+            return .rejected
+        }
     }
 
     private func reconcileTrackedFrames(
         _ quartzFrames: [WindowLiftAvoidance.WindowKey: CGRect],
         contexts: [WindowLiftAvoidanceContext],
         observationGeneration: UInt64
-    ) -> Set<WindowLiftAvoidance.WindowKey> {
-        var reconciled: Set<WindowLiftAvoidance.WindowKey> = []
+    ) -> [WindowLiftAvoidance.WindowKey: TrackedObservation] {
+        var observations: [WindowLiftAvoidance.WindowKey: TrackedObservation] = [:]
         for key in Array(states.keys) {
             guard let quartzFrame = quartzFrames[key],
                   let context = sessionContexts[key], contexts.contains(context) else { continue }
-            if handleTrackedObservation(
+            observations[key] = handleTrackedObservation(
                 quartzFrame,
                 for: key,
                 context: context,
                 observationGeneration: observationGeneration
-            ) {
-                reconciled.insert(key)
-            }
+            )
         }
-        return reconciled
+        return observations
     }
 
     private func acceptObservation(
@@ -1252,9 +1285,14 @@ final class WindowLiftAvoidanceController {
               attempt.generation == generation else {
             return
         }
-        guard let currentProcess = system.generation(key.pid),
-              managedFrames[key]?.processGeneration.map({ $0 == currentProcess }) ?? true else {
+        let firstWrite = FirstNativeWrite()
+        pendingValidations[key] = PendingValidation(generation: generation, previousLift: confirmedLift, firstWrite: firstWrite)
+        guard let currentProcess = system.generation(key.pid) else {
             finishOperation(for: key, generation: generation, outcome: .transientValidation(.processIdentityUnavailable))
+            return
+        }
+        if let previousProcess = managedFrames[key]?.processGeneration, previousProcess != currentProcess {
+            finishOperation(for: key, generation: generation, outcome: .transientValidation(.processIdentityChanged))
             return
         }
         let frames = ManagedFrames(
@@ -1267,12 +1305,12 @@ final class WindowLiftAvoidanceController {
         managedFrames[key] = frames
         let nativeQuartz = frames.nativeQuartz
         let targetQuartz = frames.targetQuartz
-        pendingValidations[key] = PendingValidation(generation: generation, confirmedLift: confirmedLift)
 
         let animate = usesAnimatedLift
         let reader = self.reader
         let probe = windowProbe
-        let writeIdentity = WriteWindowIdentity(key: key, generation: currentProcess, system: system)
+        let writeIdentity = WriteWindowIdentity(key: key, generation: currentProcess, system: system, firstWrite: firstWrite)
+        let previousRestoration = confirmedLift?.frames
         var drains = writeDrainTasks.removeValue(forKey: key).map { Array($0.values) } ?? []
         if let previousWriter = writeTasks.removeValue(forKey: key) {
             previousWriter.cancel()
@@ -1289,16 +1327,17 @@ final class WindowLiftAvoidanceController {
                 return
             }
 
-            let mayBegin = await MainActor.run { [weak self] in
-                self?.canContinueOperation(
+            let validationInterruption = await MainActor.run { [weak self] () -> OperationOutcome? in
+                guard let self else { return .cancelled }
+                return self.validationInterruption(
                     for: key,
                     generation: generation,
                     context: context
-                ) ?? false
+                )
             }
-            guard mayBegin, !Task.isCancelled else {
+            guard validationInterruption == nil, !Task.isCancelled else {
                 await MainActor.run { [weak self] in
-                    self?.finishOperation(for: key, generation: generation, outcome: .cancelled,
+                    self?.finishOperation(for: key, generation: generation, outcome: validationInterruption ?? .cancelled,
                                           diagnosticReason: "beforeValidation")
                 }
                 return
@@ -1344,15 +1383,25 @@ final class WindowLiftAvoidanceController {
             }
 
             let element = AXElementKey(e: handle.element)
-            let admittedFrames = await MainActor.run { [weak self] in
+            let admission = await MainActor.run { [weak self] in
                 self?.admitAXWrite(
                     for: key,
                     generation: generation,
                     context: context,
                     element: element
-                )
+                ) ?? .rejected(.cancelled)
             }
-            guard let admittedFrames, !Task.isCancelled else {
+            let admittedFrames: ManagedFrames
+            switch admission {
+            case let .accepted(frames):
+                admittedFrames = frames
+            case let .rejected(outcome):
+                await MainActor.run { [weak self] in
+                    self?.finishOperation(for: key, generation: generation, outcome: outcome, diagnosticReason: "beforeWrite")
+                }
+                return
+            }
+            guard !Task.isCancelled else {
                 await MainActor.run { [weak self] in
                     self?.finishOperation(for: key, generation: generation, outcome: .cancelled,
                                           diagnosticReason: "beforeWrite")
@@ -1360,7 +1409,7 @@ final class WindowLiftAvoidanceController {
                 return
             }
 
-            let outcome = await Self.write(
+            let writeOutcome = await Self.write(
                 reader: reader,
                 element: element.e,
                 unadjustedWindowFrame: nativeQuartz,
@@ -1374,8 +1423,19 @@ final class WindowLiftAvoidanceController {
                     await self?.canRecoverAdmittedWrite(for: key, generation: generation, context: context) ?? false
                 }
             )
+            let firstWriteState = firstWrite.current
+            let outcome: OperationOutcome
+            switch firstWriteState {
+            case .processUnavailable where previousRestoration != nil:
+                outcome = .transientValidation(.processIdentityUnavailable)
+            case .identityChanged where previousRestoration != nil:
+                outcome = .transientValidation(.windowIdentityChanged)
+            default:
+                outcome = writeOutcome
+            }
             await MainActor.run { [weak self] in
-                self?.finishOperation(for: key, generation: generation, outcome: outcome, restorationFrames: admittedFrames)
+                self?.finishOperation(for: key, generation: generation, outcome: outcome, restorationFrames: admittedFrames,
+                    retiredRestoration: firstWriteState.retainsConfirmation ? nil : previousRestoration)
             }
         }
         writeTasks[key] = task
@@ -1448,15 +1508,16 @@ final class WindowLiftAvoidanceController {
         guard let confirmedAXFrame = reader.frame(of: element, messagingTimeout: windowLiftAXMessagingTimeout) else {
             return .transient(.frameUnavailable, ValidationFrames(cg: confirmedCGFrame, ax: nil))
         }
+        let frames = ValidationFrames(cg: confirmedCGFrame, ax: confirmedAXFrame)
         switch reader.frameSettableStatus(of: element, messagingTimeout: windowLiftAXMessagingTimeout).size {
         case .settable: break
         case .notSettable: return .unsupported(.sizeNotSettable)
-        case .unread: return .transient(.capabilityUnavailable)
+        case .unread: return .transient(.capabilityUnavailable, frames)
         }
         guard WindowLiftAvoidance.geometrySamplesAgree(initialCGFrame: candidate.quartzFrame,
             confirmedCGFrame: confirmedCGFrame, confirmedAXFrame: confirmedAXFrame) else {
             return .transient(WindowLiftAvoidance.geometrySamplesAgree(confirmedCGFrame, comparedTo: candidate.quartzFrame)
-                ? .frameMismatch : .candidateMoved, ValidationFrames(cg: confirmedCGFrame, ax: confirmedAXFrame))
+                ? .frameMismatch : .candidateMoved, frames)
         }
         return isInitial ? .transient(.frameMismatch) : .ready(handle)
     }
@@ -1473,15 +1534,26 @@ final class WindowLiftAvoidanceController {
         let (result, attemptedFrame) = await AsyncWorkScope.performBlocking(on: geometryQueue, cancellation: cancellation) {
             let reader = reader.withOperationBudget(budget)
             var attemptedFrame: CGRect?
+            var processUnread = false
             let result = reader.setSize(size, for: elementKey.e,
                 messagingTimeout: windowLiftAXMessagingTimeout,
                 frameVerificationTolerance: WindowLiftAvoidance.frameVerificationTolerance,
                 onlyIfCurrentMatches: expectedFrame, expectedWindowID: writeIdentity.key.cgWindowID,
-                onAttempt: { attemptedFrame = $0 },
+                onAttempt: {
+                    writeIdentity.firstWrite.record(.attempted)
+                    attemptedFrame = $0
+                },
                 checkWriteAdmission: {
                     guard !cancellation.isCancelled, budget.canContinue else { return .operationBudgetExhausted }
-                    return writeIdentity.processMatches ? nil : .windowIdentityChanged
+                    guard let current = writeIdentity.system.generation(writeIdentity.key.pid) else {
+                        processUnread = true
+                        return .windowIdentityChanged
+                    }
+                    return current == writeIdentity.generation ? nil : .windowIdentityChanged
                 })
+            if case .failure(.windowIdentityChanged, _) = result {
+                writeIdentity.firstWrite.record(processUnread ? .processUnavailable : .identityChanged)
+            }
             return (result, attemptedFrame)
         } ?? (AXWindowFrameWriteResult.failure(reason: .initialFrameUnavailable, rollback: .notRequested), nil)
         if let attemptedFrame {
@@ -1510,6 +1582,7 @@ final class WindowLiftAvoidanceController {
     ) async -> OperationOutcome {
         let elementKey = AXElementKey(e: element)
         var managedWriteFrames = WindowLiftWriteFrames()
+        var liftRetryCount = initialReliftCount
 
         func writeSize(_ size: CGSize, matching expectedFrame: CGRect, budget: OperationReadBudget,
                        rollbackOnExpiry: Bool = true) async -> AXWindowFrameWriteResult {
@@ -1518,6 +1591,17 @@ final class WindowLiftAvoidanceController {
                 managedWriteFrames: managedWriteFrames, writeIdentity: writeIdentity, rollbackOnExpiry: rollbackOnExpiry)
             managedWriteFrames = frames
             return result
+        }
+
+        func recoveryDecision(for reason: AXWindowFrameWriteFailure) -> WindowLiftAvoidance.AnimationWriteFailureDecision {
+            animationFailureDecision(
+                for: reason,
+                unadjustedWindowFrame: unadjustedWindowFrame,
+                intendedWindowFrame: intendedWindowFrame,
+                liftRetryCount: liftRetryCount,
+                lastAcknowledgedFrame: managedWriteFrames.acknowledged ?? unadjustedWindowFrame,
+                primaryDisplayHeight: primaryDisplayHeight
+            )
         }
 
         func cancelWrite(after result: AXWindowFrameWriteResult? = nil) async -> OperationOutcome {
@@ -1554,14 +1638,7 @@ final class WindowLiftAvoidanceController {
                 )
 
             case let .failure(reason, rollback):
-                let decision = animationFailureDecision(
-                    for: reason,
-                    unadjustedWindowFrame: unadjustedWindowFrame,
-                    intendedWindowFrame: intendedWindowFrame,
-                    liftRetryCount: initialReliftCount,
-                    lastAcknowledgedFrame: unadjustedWindowFrame,
-                    primaryDisplayHeight: primaryDisplayHeight
-                )
+                let decision = recoveryDecision(for: reason)
                 #if DEBUG
                 let anomalies = [WriteAnomaly(
                     reason: reason,
@@ -1638,7 +1715,6 @@ final class WindowLiftAvoidanceController {
         var nextDeadline = animationStartedAt + frameInterval
         var expectedFrame = unadjustedWindowFrame
         var confirmedIntermediateFrame: CGRect?
-        var liftRetryCount = initialReliftCount
         var anomalies: [WriteAnomaly] = []
         var finalStallRetries = 0
         let maxFinalStallRetries = 3
@@ -1748,14 +1824,7 @@ final class WindowLiftAvoidanceController {
                     )
 
                 case let .failure(reason, rollback):
-                    let decision = animationFailureDecision(
-                        for: reason,
-                        unadjustedWindowFrame: unadjustedWindowFrame,
-                        intendedWindowFrame: intendedWindowFrame,
-                        liftRetryCount: liftRetryCount,
-                        lastAcknowledgedFrame: expectedFrame,
-                        primaryDisplayHeight: primaryDisplayHeight
-                    )
+                    let decision = recoveryDecision(for: reason)
                     switch decision {
                     case let .complete(actualFrame):
                         return await completedOrRolledBack(
@@ -1906,14 +1975,7 @@ final class WindowLiftAvoidanceController {
                 expectedFrame = actualFrame
                 if Task.isCancelled { return await cancelWrite() }
             case let .failure(reason, rollback):
-                let decision = animationFailureDecision(
-                    for: reason,
-                    unadjustedWindowFrame: unadjustedWindowFrame,
-                    intendedWindowFrame: intendedWindowFrame,
-                    liftRetryCount: liftRetryCount,
-                    lastAcknowledgedFrame: expectedFrame,
-                    primaryDisplayHeight: primaryDisplayHeight
-                )
+                let decision = recoveryDecision(for: reason)
                 if case let .continueFromActual(actualFrame) = decision {
                     expectedFrame = actualFrame
                 } else {
@@ -2296,23 +2358,28 @@ final class WindowLiftAvoidanceController {
         return .finished(.notRequested)
     }
 
-    private func canContinueOperation(
+    private func validationInterruption(
         for key: WindowLiftAvoidance.WindowKey,
         generation: UInt64,
         context: WindowLiftAvoidanceContext
-    ) -> Bool {
-        guard let validation = pendingValidations[key], validation.generation == generation,
+    ) -> OperationOutcome? {
+        guard !Task.isCancelled, !isPermissionFrozen,
+              let validation = pendingValidations[key], validation.generation == generation, !validation.isAdmitted,
               pendingRestorations[key] == nil,
               let expected = managedFrames[key]?.processGeneration,
-              system.generation(key.pid) == expected,
               hostContexts().contains(context),
               let app = system.app(key.pid), !app.isTerminated,
               !validation.requiresActiveApplication || app.isActive,
               case let .writing(attempt) = states[key],
               attempt.generation == generation else {
-            return false
+            return .cancelled
         }
-        return true
+        guard let current = system.generation(key.pid) else { return .transientValidation(.processIdentityUnavailable) }
+        guard current == expected else {
+            pendingValidations[key]?.previousLift = nil
+            return .transientValidation(.processIdentityChanged)
+        }
+        return nil
     }
 
     private func admitAXWrite(
@@ -2320,26 +2387,31 @@ final class WindowLiftAvoidanceController {
         generation: UInt64,
         context: WindowLiftAvoidanceContext,
         element: AXElementKey
-    ) -> ManagedFrames? {
-        guard canContinueOperation(for: key, generation: generation, context: context),
-              var frames = managedFrames[key] else { return nil }
+    ) -> WriteAdmission {
+        if let interruption = validationInterruption(for: key, generation: generation, context: context) {
+            return .rejected(interruption)
+        }
+        guard var frames = managedFrames[key] else { return .rejected(.cancelled) }
         if pendingRestorations.contains(where: { source, pending in
             source.pid == key.pid && pending.expectedElement == element
                 && (pending.processGeneration == nil || pending.processGeneration == frames.processGeneration)
-        }) { return nil }
+        }) { return .rejected(.cancelled) }
         if let confirmedLift = pendingValidations[key]?.confirmedLift,
-           confirmedLift.frames.expectedElement != element { return nil }
+           confirmedLift.frames.expectedElement != element {
+            pendingValidations[key]?.previousLift = nil
+            return .rejected(.transientValidation(.windowIdentityChanged))
+        }
         frames.expectedElement = element
         managedFrames[key] = frames
-        pendingValidations.removeValue(forKey: key)
-        return frames
+        pendingValidations[key]?.isAdmitted = true
+        return .accepted(frames)
     }
 
     private func canRecoverAdmittedWrite(
         for key: WindowLiftAvoidance.WindowKey, generation: UInt64, context: WindowLiftAvoidanceContext
     ) -> Bool {
         guard isEnabled, ensureTrustedOrFreeze(), pendingRestorations[key] == nil,
-              pendingValidations[key] == nil, case let .writing(attempt) = states[key],
+              pendingValidations[key]?.isAdmitted == true, case let .writing(attempt) = states[key],
               attempt.generation == generation,
               let expectedProcess = managedFrames[key]?.processGeneration,
               system.generation(key.pid) == expectedProcess,
@@ -2348,11 +2420,32 @@ final class WindowLiftAvoidanceController {
         return true
     }
 
+    private func resumeConfirmedLift(_ confirmedLift: ConfirmedLift?, for key: WindowLiftAvoidance.WindowKey,
+                                     observedFrame: CGRect? = nil) -> Bool {
+        guard let confirmedLift, let expectedProcess = confirmedLift.frames.processGeneration else { return false }
+        if let current = system.generation(key.pid), current != expectedProcess { return false }
+        let frames = confirmedLift.frames
+        if let observedFrame,
+           !WindowLiftAvoidance.measuredFramesAgree(observedFrame, frames.settledQuartz ?? frames.targetQuartz),
+           !WindowLiftAvoidance.measuredFramesAgree(observedFrame, frames.nativeQuartz) {
+            let appKitFrame = WindowLiftAvoidance.appKitCoordinates(fromQuartz: observedFrame,
+                primaryDisplayHeight: frames.primaryDisplayHeight)
+            guard sessionContexts[key]?.geometry.taskbarClearanceFrame(
+                forMaximizedReturn: appKitFrame, from: frames.nativeAppKit
+            ) != nil else { return false }
+        }
+        observationWatermarks[key] = nextGeneration
+        managedFrames[key] = frames
+        store(.lifted(confirmedLift.session), for: key)
+        return true
+    }
+
     private func finishOperation(
         for key: WindowLiftAvoidance.WindowKey,
         generation: UInt64,
         outcome: OperationOutcome,
         restorationFrames: ManagedFrames? = nil,
+        retiredRestoration: ManagedFrames? = nil,
         diagnosticReason: String? = nil
     ) {
         var interruptedWriteFrames = WindowLiftWriteFrames()
@@ -2375,9 +2468,14 @@ final class WindowLiftAvoidanceController {
         default:
             break
         }
+        let retiredQueuedRestoration = retiredRestoration.map {
+            pendingRestorations[key]?.hasSameRestorationPlan(as: $0) == true
+        } ?? false
+        if retiredQueuedRestoration { pendingRestorations.removeValue(forKey: key) }
         let needsInterruptedRestoration = !interruptedWriteFrames.isEmpty
         if var frames = restorationFrames,
-           needsInterruptedRestoration || (settledQuartz != nil && (pendingRestorations[key] != nil || !canMutateSessions())) {
+           needsInterruptedRestoration ||
+           (settledQuartz != nil && (retiredQueuedRestoration || pendingRestorations[key] != nil || !canMutateSessions())) {
             let queued = pendingRestorations[key]
             if queued?.hasSameRestorationPlan(as: frames) != false {
                 frames.restoresSettledTarget = settledQuartz != nil || queued?.restoresSettledTarget == true
@@ -2406,12 +2504,14 @@ final class WindowLiftAvoidanceController {
 
         switch outcome {
         case .cancelled:
+            if validation?.isAdmitted == true, resumeConfirmedLift(validation?.confirmedLift, for: key) { return }
             #if DEBUG
             reportDiagnostic("cancelled", for: key, generation: generation, detail: "reason=\(diagnosticReason ?? "taskCancelled")")
             #endif
             clearManagedSession(for: key, cancelWriter: false, reason: "cancelled")
 
         case let .cancelledWrite(rollback, _):
+            if resumeConfirmedLift(validation?.confirmedLift, for: key) { return }
             #if DEBUG
             reportDiagnostic("cancelled", for: key, generation: generation,
                              detail: "reason=writeCancelled rollback=\(rollback.diagnosticDescription)")
@@ -2419,16 +2519,11 @@ final class WindowLiftAvoidanceController {
             clearManagedSession(for: key, cancelWriter: false, reason: "cancelled")
 
         case let .transientValidation(stage, samples):
-            if stage.preservesConfirmedLift, let confirmedLift = validation?.confirmedLift,
-               let expectedProcess = confirmedLift.frames.processGeneration,
-               system.generation(key.pid) == expectedProcess {
+            if stage.preservesConfirmedLift, resumeConfirmedLift(validation?.confirmedLift, for: key, observedFrame: samples?.agreedFrame) {
                 #if DEBUG
                 reportDiagnostic("validation transient", for: key, generation: generation, cg: samples?.cg, ax: samples?.ax,
                     detail: "stage=\(stage.rawValue) decision=keepConfirmedLift")
                 #endif
-                observationWatermarks[key] = nextGeneration
-                managedFrames[key] = confirmedLift.frames
-                store(.lifted(confirmedLift.session), for: key)
                 return
             }
             #if DEBUG
@@ -2458,6 +2553,7 @@ final class WindowLiftAvoidanceController {
             store(transition.state, for: key)
 
         case let .externalFrame(actualQuartzFrame, anomalies):
+            if resumeConfirmedLift(validation?.confirmedLift, for: key, observedFrame: actualQuartzFrame) { return }
             #if DEBUG
             reportDiagnostic("write interrupted", for: key, generation: generation, ax: actualQuartzFrame,
                              detail: "reason=externalFrame decision=preserve")
@@ -2506,6 +2602,7 @@ final class WindowLiftAvoidanceController {
             store(transition.state, for: key)
 
         case let .failed(reason, rollback, progress, liftRetryCount, _, anomalies):
+            if resumeConfirmedLift(validation?.confirmedLift, for: key) { return }
             #if DEBUG
             reportDiagnostic("write failed", for: key, generation: generation, level: .error,
                 detail: "reason=\(reason.diagnosticDescription) rollback=\(rollback.diagnosticDescription) progress=\(progress) retries=\(liftRetryCount)")

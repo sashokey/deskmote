@@ -74,6 +74,121 @@ final class ProcessLivenessTests: XCTestCase {
         }
     }
 
+    func testStaleGenerationReadCannotDeleteAConcurrentlyRememberedSerial() {
+        let start = Mutex(timeval(tv_sec: 100, tv_usec: 5))
+        let shouldBlock = Mutex(false)
+        let captured = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let observed = Mutex<String?>(nil)
+        let cache = ProcessGenerationCache<String>(startTime: { _ in
+            let time = start.withLock { $0 }
+            let block = shouldBlock.withLock {
+                let block = $0
+                $0 = false
+                return block
+            }
+            if block {
+                captured.signal()
+                guard release.wait(timeout: .now() + 5) == .success else { return nil }
+            }
+            return time
+        })
+        cache.remember("previous serial", for: 42)
+        shouldBlock.withLock { $0 = true }
+        DispatchQueue.global().async {
+            let value = cache.value(for: 42)
+            observed.withLock { $0 = value }
+            finished.signal()
+        }
+        XCTAssertEqual(captured.wait(timeout: .now() + 5), .success)
+        start.withLock { $0 = timeval(tv_sec: 200, tv_usec: 10) }
+        cache.remember("new serial", for: 42)
+        release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        XCTAssertNil(observed.withLock { $0 })
+        XCTAssertEqual(cache.value(for: 42), "new serial")
+    }
+
+    func testStaleRememberCannotReplaceOrDeleteAConcurrentlyRememberedSerial() {
+        let initialTimes: [timeval?] = [timeval(tv_sec: 100, tv_usec: 5), nil]
+        for initialTime in initialTimes {
+            let start = Mutex(initialTime)
+            let shouldBlock = Mutex(true)
+            let captured = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            let finished = DispatchSemaphore(value: 0)
+            let timedOut = Mutex(false)
+            let cache = ProcessGenerationCache<String>(startTime: { _ in
+                let time = start.withLock { $0 }
+                let block = shouldBlock.withLock {
+                    let block = $0
+                    $0 = false
+                    return block
+                }
+                if block {
+                    captured.signal()
+                    if release.wait(timeout: .now() + 5) == .timedOut { timedOut.withLock { $0 = true } }
+                }
+                return time
+            })
+            DispatchQueue.global().async {
+                cache.remember("previous serial", for: 42)
+                finished.signal()
+            }
+            XCTAssertEqual(captured.wait(timeout: .now() + 5), .success)
+            start.withLock { $0 = timeval(tv_sec: 200, tv_usec: 10) }
+            cache.remember("new serial", for: 42)
+            release.signal()
+            XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+            XCTAssertFalse(timedOut.withLock { $0 })
+            XCTAssertEqual(cache.value(for: 42), "new serial")
+        }
+    }
+
+    func testRememberRecoversFromConcurrentEvictionOnlyWhileItsGenerationIsCurrent() {
+        for generationChangesAgain in [false, true] {
+            let start = Mutex(timeval(tv_sec: 100, tv_usec: 5))
+            let shouldBlock = Mutex(false)
+            let captured = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            let finished = DispatchSemaphore(value: 0)
+            let timedOut = Mutex(false)
+            let cache = ProcessGenerationCache<String>(startTime: { _ in
+                let time = start.withLock { $0 }
+                let block = shouldBlock.withLock {
+                    let block = $0
+                    $0 = false
+                    return block
+                }
+                if block {
+                    captured.signal()
+                    if release.wait(timeout: .now() + 5) == .timedOut { timedOut.withLock { $0 = true } }
+                }
+                return time
+            })
+            cache.remember("first serial", for: 42)
+            start.withLock { $0 = timeval(tv_sec: 200, tv_usec: 10) }
+            shouldBlock.withLock { $0 = true }
+            DispatchQueue.global().async {
+                cache.remember("second serial", for: 42)
+                finished.signal()
+            }
+
+            XCTAssertEqual(captured.wait(timeout: .now() + 5), .success)
+            XCTAssertNil(cache.value(for: 42))
+            XCTAssertEqual(cache.countForTesting, 0)
+            if generationChangesAgain {
+                start.withLock { $0 = timeval(tv_sec: 300, tv_usec: 15) }
+            }
+            release.signal()
+            XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+            XCTAssertFalse(timedOut.withLock { $0 })
+            XCTAssertEqual(cache.countForTesting, generationChangesAgain ? 0 : 1)
+            XCTAssertEqual(cache.value(for: 42), generationChangesAgain ? nil : "second serial")
+        }
+    }
+
 
     func testCurrentProcessIsAlive() {
         let pid = getpid()

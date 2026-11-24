@@ -69,10 +69,17 @@ struct DischargeSession: Codable, Equatable, Sendable {
 }
 
 struct SessionTracker: Codable, Sendable {
+    private enum ObservedForecastOrigin: String, Codable, Sendable {
+        case wake
+        case unplug
+    }
+
     var session: DischargeSession?
     var lastSample: BatterySample?
     var historyFloor: Date?
     private(set) var forecastStart: BatterySample?
+    private var observedForecastOrigin: ObservedForecastOrigin?
+    var forecastHistoryCheckpoint: Date?
     private(set) var wakeHistoryFloor: Date?
     private(set) var wakeAfterClockRollback: Bool?
     var needsWakeHistory: Bool { wakeHistoryFloor != nil }
@@ -80,7 +87,8 @@ struct SessionTracker: Codable, Sendable {
     private var hasContinuousObservation = false
 
     private enum CodingKeys: String, CodingKey {
-        case session, lastSample, historyFloor, forecastStart, forecastFloor, wakeHistoryFloor, wakeAfterClockRollback
+        case session, lastSample, historyFloor, forecastStart, forecastFloor, forecastHistoryCheckpoint
+        case wakeHistoryFloor, wakeAfterClockRollback, observedForecastOrigin
     }
 
     init(session: DischargeSession? = nil, lastSample: BatterySample? = nil, historyFloor: Date? = nil) {
@@ -91,10 +99,14 @@ struct SessionTracker: Codable, Sendable {
 
     mutating func markObservationGap() {
         hasContinuousObservation = false
+        if forecastStart != nil, forecastHistoryCheckpoint == nil {
+            forecastHistoryCheckpoint = lastSample?.date
+        }
     }
 
     mutating func discardForecast(through date: Date) {
         forecastStart = nil
+        observedForecastOrigin = nil
         let next = Date(timeIntervalSinceReferenceDate: date.timeIntervalSinceReferenceDate.nextUp)
         forecastFloor = max(forecastFloor ?? .distantPast, next)
     }
@@ -102,6 +114,8 @@ struct SessionTracker: Codable, Sendable {
     mutating func markWake(at date: Date) {
         markObservationGap()
         forecastStart = nil
+        observedForecastOrigin = nil
+        forecastHistoryCheckpoint = nil
         let logSecond = PowerHistory.logSecond(containing: date)
         let rollback = lastSample.map { date < $0.date } == true || wakeHistoryFloor.map { logSecond < $0 } == true
         wakeAfterClockRollback = rollback ? true : nil
@@ -117,19 +131,38 @@ struct SessionTracker: Codable, Sendable {
         reconcile(history: PowerHistory(from: history, before: current.date), current: current, bootDate: bootDate)
     }
 
-    mutating func reconcile(history: PowerHistory, current: BatterySample, bootDate: Date? = nil) {
+    @discardableResult
+    mutating func reconcile(
+        history: PowerHistory, current: BatterySample, bootDate: Date? = nil, allowsForecastRecovery: Bool = true
+    ) -> Date? {
         update(current, bootDate: bootDate)
-        guard current.isValid, current.onBattery else { return }
-        let forecast = history.recoverForecast(
-            at: current, bootDate: bootDate, historyFloor: historyFloor, forecastFloor: forecastFloor, saved: forecastStart
+        guard current.isValid, current.onBattery else { return nil }
+        let forecastIsObservedWake = observedForecastOrigin == .wake || (
+            observedForecastOrigin == nil &&
+            forecastStart.map { PowerHistory.logSecond(containing: $0.date) == wakeHistoryFloor } == true
         )
-        forecastStart = forecast.start
-        forecastFloor = forecast.floor
-        if forecastStart != nil {
-            wakeHistoryFloor = nil
-            wakeAfterClockRollback = nil
+        if allowsForecastRecovery {
+            let forecast = history.recoverForecast(
+                at: current, bootDate: bootDate, historyFloor: historyFloor, forecastFloor: forecastFloor,
+                saved: forecastStart, savedRequiresFullWakeMatch: forecastIsObservedWake
+            )
+            if forecast.start != forecastStart {
+                observedForecastOrigin = nil
+            } else if forecastIsObservedWake {
+                observedForecastOrigin = .wake
+            }
+            forecastStart = forecast.start
+            forecastFloor = forecast.floor
+            if forecastStart != nil {
+                wakeHistoryFloor = nil
+                wakeAfterClockRollback = nil
+            }
         }
-        let (recovered, interruption) = history.recoverSession(at: current, since: historyFloor, replacing: session)
+        let (recovered, interruption, forecastInterruption) = history.recoverSession(
+            at: current, since: historyFloor, replacing: session, forecast: allowsForecastRecovery ? nil : forecastStart,
+            forecastRequiresFullWakeMatch: forecastIsObservedWake
+        )
+        if let forecastInterruption { discardForecast(through: forecastInterruption) }
         if let interruption {
             historyFloor = interruption
             session = recovered ?? DischargeSession(start: current, origin: .monitoring)
@@ -137,18 +170,22 @@ struct SessionTracker: Codable, Sendable {
                   session.map({ recovered.start.date < $0.start.date }) ?? true {
             session = recovered
         }
+        return interruption ?? forecastInterruption
     }
 
     mutating func update(_ sample: BatterySample, bootDate: Date? = nil, wakeDate: Date? = nil) {
         if let wakeDate { markWake(at: wakeDate) }
         guard sample.isValid else { return }
         if let lastSample, sample.date < lastSample.date { return }
+        let previousForecast = forecastStart
         if let bootDate, let forecastStart, forecastStart.date < bootDate {
             self.forecastStart = nil
         }
         defer {
             lastSample = sample
             hasContinuousObservation = true
+            if forecastStart == nil { observedForecastOrigin = nil }
+            if !sample.onBattery || forecastStart != previousForecast { forecastHistoryCheckpoint = nil }
         }
         guard sample.onBattery else {
             session = nil
@@ -161,8 +198,10 @@ struct SessionTracker: Codable, Sendable {
         if increased { forecastStart = nil }
         if let wakeDate, wakeDate <= sample.date {
             forecastStart = BatterySample(date: wakeDate, percent: sample.percent, onBattery: true)
+            observedForecastOrigin = .wake
         } else if observed {
             forecastStart = sample
+            observedForecastOrigin = .unplug
             wakeHistoryFloor = nil
             wakeAfterClockRollback = nil
         }

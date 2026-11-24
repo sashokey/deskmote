@@ -51,7 +51,6 @@ extension PanelCoordinator {
             repairAllSpacesMembershipIfNeeded()
         } else {
             lastHideWasForFullscreen = visibilityState.hideReasons.contains(.fullscreen)
-            taskbarView?.taskbarContent.prepareForHiding()
             orderDockSurfaceOut()
             for panel in [dockPanel] { panel?.alphaValue = 1 }
         }

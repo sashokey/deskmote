@@ -13,23 +13,24 @@ private final class PanelInventory: WindowInventoryTracking {
 
 @MainActor
 final class PanelLifecycleTests: XCTestCase {
-    func testScreenOrchestratorDoesNotStartAFullscreenTimerForEachPanel() {
-        let topology = ScreenTopologySnapshot(
-            physicalDisplayCount: 2, identifiedDisplayUUIDs: ["left", "right"], attributionTable: .empty
-        )
-        let orchestrator = TaskbarScreenOrchestrator(
-            runtime: AppRuntime(tracker: PanelInventory()), stripOrderStore: StripOrderStore(),
-            displayTopologyStore: DisplayTopologyStore(initialSnapshot: topology),
-            spaceStore: TaskbarSpaceStore(read: { _ in nil }, pollInterval: 0),
-            overlaySpaceHost: nil, topologySnapshotProvider: { topology }, startCoordinator: { panel in
-                panel.setupFullscreenMonitor()
-                return true
-            }
-        )
-        defer { orchestrator.suspendAndRelease() }
-        orchestrator.start()
-        XCTAssertEqual(orchestrator.units.count, 2)
-        XCTAssertTrue(orchestrator.units.allSatisfy { $0.coordinator.fullscreenReconcileTimer == nil })
+    private final class DetachedDockPanel: NSPanel {
+        var onOrderOut: (() -> Void)?
+
+        override func orderOut(_ sender: Any?) { onOrderOut?() }
+        override func close() {}
+    }
+
+    @MainActor
+    private final class CGWindows {
+        var windows: [[String: Any]]?
+        private(set) var captures = 0
+
+        init(_ windows: [[String: Any]]?) { self.windows = windows }
+
+        func capture() -> [[String: Any]]? {
+            captures += 1
+            return windows
+        }
     }
 
     func testSpaceChangeSharesOneFreshFullscreenCGCaptureAcrossPanels() throws {
@@ -39,8 +40,108 @@ final class PanelLifecycleTests: XCTestCase {
             [kCGWindowNumber as String: 10, kCGWindowOwnerPID as String: -42,
              kCGWindowLayer as String: 0, kCGWindowBounds as String: frame.dictionaryRepresentation]
         }
-        var windows: [[String: Any]]? = [window(on: leftFrame)]
-        var captures = 0
+        let cg = CGWindows([window(on: leftFrame)])
+        let uptime = Mutex<TimeInterval>(10)
+        var overlayVisibilityReads = 0
+        let overlay = OverlaySpaceHost(operations: .init(
+            create: { 7 }, prepare: { _ in },
+            isVisible: { _ in overlayVisibilityReads += 1; return true },
+            addWindows: { _, _ in }, spaces: { _ in [7] }, release: { _ in }
+        ))
+        XCTAssertTrue(overlay.pin(windowNumbers: [10]))
+        overlayVisibilityReads = 0
+        let topology = ScreenTopologySnapshot(
+            physicalDisplayCount: 2, identifiedDisplayUUIDs: ["left", "right"], attributionTable: .empty
+        )
+        let notifications = NotificationCenter()
+        let orchestrator = TaskbarScreenOrchestrator(
+            runtime: AppRuntime(tracker: PanelInventory()), stripOrderStore: StripOrderStore(),
+            displayTopologyStore: DisplayTopologyStore(initialSnapshot: topology),
+            spaceStore: TaskbarSpaceStore(read: { _ in nil }, notifications: NotificationCenter(), pollInterval: 0),
+            overlaySpaceHost: overlay, topologySnapshotProvider: { topology },
+            startCoordinator: { panel in
+                let isLeft = panel.fixedDisplayUUID == "left"
+                panel.fullscreenFrameProvider = {
+                    if !isLeft { uptime.withLock { $0 += 1 } }
+                    return isLeft ? leftFrame : rightFrame
+                }
+                panel.fullscreenCGWindowObservationProvider = { _ in nil }
+                return true
+            },
+            captureFullscreenCGWindows: cg.capture,
+            workspaceNotifications: notifications,
+            frontmostApplicationPID: { nil },
+            fullscreenUptime: { uptime.withLock { $0 } }
+        )
+        defer { orchestrator.suspendAndRelease() }
+        orchestrator.start()
+        let left = try XCTUnwrap(orchestrator.units.first(where: { $0.key == "left" })?.coordinator)
+        let right = try XCTUnwrap(orchestrator.units.first(where: { $0.key == "right" })?.coordinator)
+        let spaceChanged = NSWorkspace.activeSpaceDidChangeNotification
+
+        notifications.post(name: spaceChanged, object: nil)
+        XCTAssertEqual(cg.captures, 1)
+        XCTAssertEqual(overlayVisibilityReads, 1)
+        XCTAssertFalse(left.visibilityState.isVisible)
+        XCTAssertTrue(right.visibilityState.isVisible)
+
+        cg.windows = nil
+        notifications.post(name: spaceChanged, object: nil)
+        XCTAssertEqual(cg.captures, 2)
+        XCTAssertFalse(left.visibilityState.isVisible)
+        XCTAssertTrue(right.visibilityState.isVisible)
+
+        cg.windows = [window(on: rightFrame)]
+        notifications.post(name: spaceChanged, object: nil)
+        XCTAssertEqual(cg.captures, 3)
+        XCTAssertFalse(right.visibilityState.isVisible)
+
+        left.fullscreenFrameProvider = { nil }
+        right.fullscreenFrameProvider = { nil }
+        notifications.post(name: spaceChanged, object: nil)
+        XCTAssertEqual(cg.captures, 3)
+        XCTAssertEqual(overlayVisibilityReads, 4)
+
+        left.fullscreenFrameProvider = { leftFrame }
+        right.fullscreenFrameProvider = { rightFrame }
+        orchestrator.suspendAndRelease()
+        notifications.post(name: spaceChanged, object: nil)
+        XCTAssertEqual(cg.captures, 3)
+        XCTAssertEqual(overlayVisibilityReads, 4)
+    }
+
+    func testOtherDisplayFocusUsesFrontmostLocalWindowForFullscreen() {
+        let panel = coordinator(placement: .fixed(displayUUID: "left"))
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        let overlapping = CGRect(x: 590, y: 15, width: 490, height: 470)
+        let localWindow = CGRect(x: 20, y: 20, width: 530, height: 420)
+        func window(_ id: Int, _ frame: CGRect) -> [String: Any] {
+            [kCGWindowNumber as String: id, kCGWindowOwnerPID as String: -42,
+             kCGWindowLayer as String: 0, kCGWindowAlpha as String: 1,
+             kCGWindowBounds as String: frame.dictionaryRepresentation]
+        }
+        var windows = [window(10, overlapping), window(11, screen)]
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenCGWindowsProvider = { windows }
+        panel.fullscreenProbeGeneration = 1
+        let request = FullscreenProbeRequest(pid: 42, screenFrame: screen, generation: 1, spaceGeneration: nil,
+                                             finalConfirmation: false, source: "test", displayUUID: "left")
+        let probe = FullscreenAXProbe(verdict: .notOnThisScreen, overlayWindowID: nil, spaceVerdict: false)
+
+        panel.receiveFullscreenProbe(probe, request: request)
+
+        XCTAssertFalse(panel.visibilityState.isVisible)
+        windows = [window(10, overlapping), window(12, localWindow), window(11, screen)]
+        panel.receiveFullscreenProbe(probe, request: request)
+        XCTAssertTrue(panel.visibilityState.isVisible)
+    }
+
+    func testPeriodicFullscreenFallbackSharesOneCaptureAcrossDisplays() async {
+        let leftFrame = CGRect(x: 0, y: 0, width: 600, height: 500)
+        let rightFrame = leftFrame.offsetBy(dx: 600, dy: 0)
+        let cg = CGWindows([[kCGWindowNumber as String: 10, kCGWindowOwnerPID as String: -42,
+            kCGWindowLayer as String: 0, kCGWindowBounds as String: leftFrame.dictionaryRepresentation]])
         let topology = ScreenTopologySnapshot(
             physicalDisplayCount: 2, identifiedDisplayUUIDs: ["left", "right"], attributionTable: .empty
         )
@@ -50,49 +151,347 @@ final class PanelLifecycleTests: XCTestCase {
             spaceStore: TaskbarSpaceStore(read: { _ in nil }, notifications: NotificationCenter(), pollInterval: 0),
             overlaySpaceHost: nil, topologySnapshotProvider: { topology },
             startCoordinator: { panel in
-                let frame = panel.fixedDisplayUUID == "left" ? leftFrame : rightFrame
-                panel.fullscreenFrameProvider = { frame }
+                panel.fullscreenFrameProvider = { nil }
+                panel.fullscreenCGWindowsProvider = { XCTFail("Unbatched capture"); return nil }
+                panel.fullscreenCGWindowObservationProvider = { _ in nil }
+                panel.fullscreenProbeWorker = FullscreenProbeWorker(read: { _ in
+                    FullscreenAXProbe(verdict: .notOnThisScreen, overlayWindowID: nil)
+                }, deliver: { [weak panel] request, probe in
+                    panel?.receiveFullscreenProbe(probe, request: request)
+                })
                 return true
             },
-            captureFullscreenCGWindows: {
-                captures += 1
-                return windows
-            }
+            captureFullscreenCGWindows: cg.capture,
+            workspaceNotifications: NotificationCenter(),
+            frontmostApplicationPID: { nil }
         )
         defer { orchestrator.suspendAndRelease() }
         orchestrator.start()
-        let left = try XCTUnwrap(orchestrator.units.first(where: { $0.key == "left" })?.coordinator)
-        let right = try XCTUnwrap(orchestrator.units.first(where: { $0.key == "right" })?.coordinator)
-        let notifications = NSWorkspace.shared.notificationCenter
-        let spaceChanged = NSWorkspace.activeSpaceDidChangeNotification
+        for unit in orchestrator.units {
+            let frame = unit.key == "left" ? leftFrame : rightFrame
+            unit.coordinator.fullscreenFrameProvider = { frame }
+        }
 
-        notifications.post(name: spaceChanged, object: nil)
-        XCTAssertEqual(captures, 1)
-        XCTAssertFalse(left.visibilityState.isVisible)
-        XCTAssertTrue(right.visibilityState.isVisible)
+        orchestrator.reconcileFullscreenState()
+        for unit in orchestrator.units {
+            while let work = unit.coordinator.fullscreenProbeWorker?.pendingWorkForTesting.first { await work.value }
+        }
 
-        windows = nil
-        notifications.post(name: spaceChanged, object: nil)
-        XCTAssertEqual(captures, 2)
-        XCTAssertFalse(left.visibilityState.isVisible)
-        XCTAssertTrue(right.visibilityState.isVisible)
+        XCTAssertEqual(cg.captures, 1)
+        XCTAssertEqual(orchestrator.units.map(\.coordinator.visibilityState.isVisible), [false, true])
+    }
 
-        windows = [window(on: rightFrame)]
-        notifications.post(name: spaceChanged, object: nil)
-        XCTAssertEqual(captures, 3)
-        XCTAssertFalse(right.visibilityState.isVisible)
+    func testFullscreenFallbackRejectsCGWindowsFromAReplacementDisplay() {
+        let panel = coordinator(placement: .fixed(displayUUID: "left"))
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 600, y: 0, width: 600, height: 500)
+        let cg = CGWindows([[kCGWindowNumber as String: 10, kCGWindowOwnerPID as String: -42,
+            kCGWindowLayer as String: 0, kCGWindowBounds as String: screen.dictionaryRepresentation]])
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenDisplayUUIDProvider = { "right" }
+        panel.fullscreenCGWindowsProvider = cg.capture
+        panel.fullscreenProbeGeneration = 1
+        let request = FullscreenProbeRequest(pid: 42, screenFrame: screen, generation: 1, spaceGeneration: nil,
+                                             finalConfirmation: false, source: "test", displayUUID: "left")
+        let probe = FullscreenAXProbe(verdict: .notOnThisScreen, overlayWindowID: nil, spaceVerdict: false)
 
-        left.fullscreenFrameProvider = { nil }
-        right.fullscreenFrameProvider = { nil }
-        notifications.post(name: spaceChanged, object: nil)
-        XCTAssertEqual(captures, 3)
+        panel.receiveFullscreenProbe(probe, request: request)
+
+        XCTAssertTrue(panel.visibilityState.isVisible)
+        XCTAssertEqual(cg.captures, 0)
+        panel.fullscreenDisplayUUIDProvider = { "left" }
+        panel.receiveFullscreenProbe(probe, request: request)
+        XCTAssertFalse(panel.visibilityState.isVisible)
+        XCTAssertEqual(cg.captures, 1)
+    }
+
+    func testImmediateSpaceFallbackRejectsWindowsFromAReplacementDisplay() {
+        let panel = coordinator(placement: .fixed(displayUUID: "left"))
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 600, y: 0, width: 600, height: 500)
+        let cg = CGWindows([[kCGWindowNumber as String: 10, kCGWindowOwnerPID as String: -42,
+            kCGWindowLayer as String: 0, kCGWindowBounds as String: screen.dictionaryRepresentation]])
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenDisplayUUIDProvider = { "right" }
+        panel.fullscreenCGWindowsProvider = cg.capture
+
+        panel.handleSpaceChange()
+
+        XCTAssertTrue(panel.visibilityState.isVisible)
+        XCTAssertEqual(cg.captures, 0)
+    }
+
+    func testSpaceWorkerRejectsFullscreenVerdictFromAReplacementDisplay() async throws {
+        let panel = coordinator(placement: .fixed(displayUUID: "left"))
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 600, y: 0, width: 600, height: 500)
+        let spaceReads = Mutex<[String]>([])
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenDisplayUUIDProvider = { "right" }
+        panel.fullscreenCGWindowsProvider = { nil }
+        panel.fullscreenSpaceProvider = { uuid in
+            spaceReads.withLock { $0.append(uuid) }
+            return true
+        }
+        panel.setupFullscreenMonitor { _ in .unknown }
+        let worker = try XCTUnwrap(panel.fullscreenProbeWorker)
+
+        panel.handleSpaceChange()
+        while let work = worker.pendingWorkForTesting.first { await work.value }
+
+        XCTAssertTrue(panel.visibilityState.isVisible)
+        XCTAssertEqual(spaceReads.withLock { $0 }, ["left"])
+    }
+
+    func testPrimaryFullscreenResultRequiresUnchangedPhysicalUUID() {
+        let cases: [(String?, String?, Bool)] = [
+            (nil, "left", true), ("left", "right", true), ("left", nil, true), ("left", "left", false)
+        ]
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        for (requestedUUID, currentUUID, expectedVisible) in cases {
+            let panel = coordinator()
+            panel.fullscreenFrameProvider = { screen }
+            panel.fullscreenDisplayUUIDProvider = { currentUUID }
+            panel.fullscreenProbeGeneration = 1
+            let request = FullscreenProbeRequest(pid: 42, screenFrame: screen, generation: 1, spaceGeneration: nil,
+                                                 finalConfirmation: false, source: "test", displayUUID: requestedUUID)
+
+            panel.receiveFullscreenProbe(
+                FullscreenAXProbe(verdict: .unknown, overlayWindowID: nil, spaceVerdict: true), request: request
+            )
+
+            XCTAssertEqual(panel.visibilityState.isVisible, expectedVisible)
+            panel.tearDown()
+        }
+    }
+
+    func testPrimaryFullscreenWorkerCanUseSLSMainWithoutAPhysicalUUID() async throws {
+        let panel = coordinator()
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        let reads = Mutex<[String]>([])
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenDisplayUUIDProvider = { nil }
+        panel.fullscreenSpaceProvider = { uuid in
+            reads.withLock { $0.append(uuid) }
+            return true
+        }
+        panel.setupFullscreenMonitor { _ in .unknown }
+        let worker = try XCTUnwrap(panel.fullscreenProbeWorker)
+
+        panel.reconcileFullscreenState()
+        while let work = worker.pendingWorkForTesting.first { await work.value }
+
+        XCTAssertEqual(reads.withLock { $0 }, ["Main"])
+        XCTAssertFalse(panel.visibilityState.isVisible)
+    }
+
+    func testSpaceChangeIgnoresLargeWindowMostlyOnAnotherDisplay() {
+        let panel = coordinator()
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        let overlapping = CGRect(x: 590, y: 15, width: 490, height: 470)
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenCGWindowsProvider = {
+            [overlapping, screen].enumerated().map { offset, frame in
+                [kCGWindowNumber as String: offset + 10, kCGWindowOwnerPID as String: -42,
+                 kCGWindowLayer as String: 0, kCGWindowAlpha as String: 1,
+                 kCGWindowBounds as String: frame.dictionaryRepresentation]
+            }
+        }
+
+        panel.handleSpaceChange()
+
+        XCTAssertFalse(panel.visibilityState.isVisible)
+    }
+
+    func testOverlayExitRevealsTaskbarWithSLSDisabledBeforePeriodicCheck() async throws {
+        try await assertOverlayExitRevealsTaskbarWithSLSDisabled(axKeepsFocus: true)
+    }
+
+    func testOverlayExitWithoutAXFocusRevealsTaskbarWithSLSDisabledBeforePeriodicCheck() async throws {
+        try await assertOverlayExitRevealsTaskbarWithSLSDisabled(axKeepsFocus: false)
+    }
+
+    private func assertOverlayExitRevealsTaskbarWithSLSDisabled(axKeepsFocus: Bool) async throws {
+        let panel = coordinator(placement: .fixed(displayUUID: "left"), usesSLS: false)
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        let otherDisplay = screen.offsetBy(dx: 600, dy: 0)
+        var windows: [[String: Any]] = [[kCGWindowNumber as String: 10, kCGWindowOwnerPID as String: -42,
+            kCGWindowLayer as String: 0, kCGWindowAlpha as String: 1, kCGWindowBounds as String: screen.dictionaryRepresentation]]
+        let spaceReads = Mutex(0)
+        let axHasFocus = Mutex(true)
+        var overlayIsVisible = true
+        var described: [CGWindowID] = []
+        panel.lastActiveApplicationPID = 42
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenCGWindowsProvider = { windows }
+        panel.fullscreenCGWindowObservationProvider = {
+            if overlayIsVisible { return (true, screen) }
+            described.append($0)
+            return (false, nil)
+        }
+        panel.fullscreenSpaceProvider = { _ in spaceReads.withLock { $0 += 1 }; return true }
+        panel.setupFullscreenMonitor { _ in
+            guard axHasFocus.withLock({ $0 }) else { return .unknown }
+            return .window(role: kAXWindowRole as String, isFullscreen: false, frame: otherDisplay, id: nil, layer: 0)
+        }
+        let worker = try XCTUnwrap(panel.fullscreenProbeWorker)
+
+        panel.triggerAsyncFullscreenCheck(source: "initial-ax")
+        while let work = worker.pendingWorkForTesting.first { await work.value }
+        XCTAssertFalse(panel.visibilityState.isVisible)
+
+        let watch = try XCTUnwrap(panel.overlayWindowWatchTimer)
+        axHasFocus.withLock { $0 = axKeepsFocus }
+        windows = []
+        overlayIsVisible = false
+        watch.fire()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !panel.visibilityState.isVisible, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+
+        XCTAssertTrue(panel.visibilityState.isVisible)
+        XCTAssertEqual(described, [10])
+        XCTAssertEqual(spaceReads.withLock { $0 }, 0)
+    }
+
+    func testMissingCGSnapshotCannotRevealCGConfirmedFullscreenAfterAXFocusIsLost() {
+        let panel = coordinator(placement: .fixed(displayUUID: "left"), usesSLS: false)
+        defer { panel.tearDown() }
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        let cg = CGWindows([[kCGWindowNumber as String: 10, kCGWindowOwnerPID as String: -42,
+            kCGWindowLayer as String: 0, kCGWindowBounds as String: screen.dictionaryRepresentation]])
+        panel.fullscreenFrameProvider = { screen }
+        panel.fullscreenCGWindowsProvider = cg.capture
+        panel.fullscreenProbeGeneration = 1
+        let request = FullscreenProbeRequest(pid: 42, screenFrame: screen, generation: 1, spaceGeneration: nil,
+                                             finalConfirmation: false, source: "test", displayUUID: "left")
+        let otherDisplay = FullscreenAXProbe(verdict: .notOnThisScreen, overlayWindowID: nil)
+        let unknown = FullscreenAXProbe(verdict: .unknown, overlayWindowID: nil)
+        panel.receiveFullscreenProbe(otherDisplay, request: request)
+        XCTAssertFalse(panel.visibilityState.isVisible)
+
+        cg.windows = nil
+        panel.receiveFullscreenProbe(unknown, request: request)
+        XCTAssertFalse(panel.visibilityState.isVisible)
+        cg.windows = [[kCGWindowBounds as String: "invalid"]]
+        panel.receiveFullscreenProbe(unknown, request: request)
+        XCTAssertFalse(panel.visibilityState.isVisible)
+
+        cg.windows = []
+        panel.receiveFullscreenProbe(unknown, request: request)
+        XCTAssertTrue(panel.visibilityState.isVisible)
+    }
+
+    func testAXConfirmationPreservesCGFullscreenOnlyForTheSameOverlay() {
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        let cases: [(CGWindowID?, Bool)] = [(10, true), (11, false), (nil, false)]
+        for (axOverlayID, expectedVisible) in cases {
+            let panel = coordinator(placement: .fixed(displayUUID: "left"), usesSLS: false)
+            let cg = CGWindows([[kCGWindowNumber as String: 10, kCGWindowOwnerPID as String: -42,
+                kCGWindowLayer as String: 0, kCGWindowBounds as String: screen.dictionaryRepresentation]])
+            panel.fullscreenFrameProvider = { screen }
+            panel.fullscreenDisplayUUIDProvider = { "left" }
+            panel.fullscreenCGWindowsProvider = cg.capture
+            panel.fullscreenProbeGeneration = 1
+            let request = FullscreenProbeRequest(pid: 42, screenFrame: screen, generation: 1, spaceGeneration: nil,
+                                                 finalConfirmation: false, source: "test", displayUUID: "left")
+            panel.receiveFullscreenProbe(
+                FullscreenAXProbe(verdict: .notOnThisScreen, overlayWindowID: nil), request: request
+            )
+            XCTAssertFalse(panel.visibilityState.isVisible)
+
+            panel.receiveFullscreenProbe(
+                FullscreenAXProbe(verdict: .fullscreen, overlayWindowID: axOverlayID), request: request
+            )
+            XCTAssertFalse(panel.visibilityState.isVisible)
+            cg.windows = []
+            panel.receiveFullscreenProbe(
+                FullscreenAXProbe(verdict: .unknown, overlayWindowID: nil), request: request
+            )
+
+            XCTAssertEqual(panel.visibilityState.isVisible, expectedVisible)
+            panel.tearDown()
+        }
+    }
+
+    func testStoppedPanelCannotAcquireAnActivationHold() {
+        let panel = coordinator()
+        panel.visibilityState.setFullscreen(true)
+        panel.lastActiveApplicationPID = 42
+        panel.handleAppActivated(pid: 42)
+        XCTAssertNotNil(panel.fullscreenSpaceHoldTimer)
+
+        panel.tearDown()
+        panel.handleAppActivated(pid: 43)
+        panel.setupFullscreenMonitor()
+
+        XCTAssertEqual(panel.lastActiveApplicationPID, 42)
+        XCTAssertNil(panel.fullscreenProbeWorker)
+        XCTAssertNil(panel.fullscreenSpaceHold)
+        XCTAssertNil(panel.fullscreenSpaceHoldTimer)
+    }
+
+    func testVisibilityHideCancelsInteractionsOnceBeforeOrderingOut() {
+        let coordinator = coordinator()
+        defer { coordinator.tearDown() }
+        let panel = DetachedDockPanel(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: true)
+        let popup = BehaviorPopup()
+        let view = TaskbarView(frame: .zero, popup: popup, contextMenu: BehaviorMenu())
+        coordinator.dockPanel = panel
+        coordinator.taskbarView = view
+        var effects: [String] = []
+        popup.onDismiss = { effects.append("cancel interaction") }
+        panel.onOrderOut = { effects.append("order out") }
+
+        coordinator.applyPanelVisibility()
+
+        XCTAssertEqual(effects, ["cancel interaction", "order out"])
+    }
+
+    func testRelayoutWithoutAScreenCancelsInteractionsBeforeOrderingOut() {
+        let coordinator = coordinator()
+        defer { coordinator.tearDown() }
+        let panel = DetachedDockPanel(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: true)
+        let popup = BehaviorPopup()
+        coordinator.dockPanel = panel
+        coordinator.taskbarView = TaskbarView(frame: .zero, popup: popup, contextMenu: BehaviorMenu())
+        var effects: [String] = []
+        popup.onDismiss = { effects.append("cancel interaction") }
+        panel.onOrderOut = { effects.append("order out") }
+
+        coordinator.relayout()
+
+        XCTAssertEqual(effects, ["cancel interaction", "order out"])
+    }
+
+    func testFullscreenAXProbeRejectsFocusedWindowOwnedByAnotherProcess() {
+        let desktop = BehaviorDesktop()
+        let reads = Mutex<[String]>([])
+        desktop.state.withLock {
+            $0.publishedFocusedWindows[-41000] = 2001
+            $0.publishedFocusedWindows[-42000] = 2001
+            $0.beforeRead = { attribute in reads.withLock { $0.append(attribute) } }
+        }
+        let screen = CGRect(x: 0, y: 30, width: 1920, height: 1050)
+        let reader = AXWindowReader(accessibility: desktop)
+
+        let foreign = PanelCoordinator.readFullscreenAXObservation(pid: -41000, reader: reader, system: desktop)
+        XCTAssertEqual(foreign.probe(on: screen).verdict, .unknown)
+        XCTAssertEqual(reads.withLock { $0 }, [kAXFocusedWindowAttribute as String])
+
+        let owned = PanelCoordinator.readFullscreenAXObservation(pid: -42000, reader: reader, system: desktop)
+        XCTAssertEqual(owned.probe(on: screen).verdict, .fullscreen)
     }
 
     func testSharedFullscreenReadClassifiesTheSameObservationSeparatelyForEachScreen() async {
         let reads = Mutex(0)
         let left = CGRect(x: 0, y: 0, width: 600, height: 500)
         let right = left.offsetBy(dx: left.width, dy: 0)
-        let batch = FullscreenAXReadBatch { _ in
+        let batch = FullscreenReadBatch { _ in
             reads.withLock { $0 += 1 }
             return .window(role: kAXWindowRole as String, isFullscreen: false, frame: left, id: 10, layer: 0)
         }
@@ -111,7 +510,7 @@ final class PanelLifecycleTests: XCTestCase {
         let now = Mutex<TimeInterval>(10)
         let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
         let window = CGRect(x: 20, y: 20, width: 500, height: 400)
-        let batch = FullscreenAXReadBatch(uptime: { now.withLock { $0 } }) { _ in
+        let batch = FullscreenReadBatch(uptime: { now.withLock { $0 } }) { _ in
             reads.withLock { count in
                 count += 1
                 return count == 1
@@ -125,13 +524,34 @@ final class PanelLifecycleTests: XCTestCase {
         XCTAssertEqual(reads.withLock { $0 }, 2)
     }
 
-    private func coordinator(placement: TaskbarUnitPlacement = .primary) -> PanelCoordinator {
+    func testDelayedCGProbeRefreshesAnExpiredImmediateSpaceSnapshot() {
+        let uptime = Mutex<TimeInterval>(10)
+        let cg = CGWindows(nil)
+        let batch = FullscreenReadBatch(uptime: { uptime.withLock { $0 } }, readCG: cg.capture) { _ in .unknown }
+        func capture() -> [[String: Any]]? {
+            XCTFail("Unbatched capture")
+            return nil
+        }
+        XCTAssertNil(batch.cgWindows(isImmediateSpaceChange: true, fallback: capture))
+        cg.windows = []
+        uptime.withLock { $0 += 1 }
+
+        XCTAssertNil(batch.cgWindows(isImmediateSpaceChange: true, fallback: capture))
+        XCTAssertEqual(cg.captures, 1)
+
+        XCTAssertEqual(batch.cgWindows(fallback: capture)?.count, 0)
+        XCTAssertEqual(cg.captures, 2)
+    }
+
+    private func coordinator(placement: TaskbarUnitPlacement = .primary, usesSLS: Bool = true) -> PanelCoordinator {
         let coordinator = PanelCoordinator(placement: placement, overlaySpaceHost: nil, runtime: AppRuntime(tracker: PanelInventory()),
             stripOrderStore: StripOrderStore(),
             displayTopologyStore: DisplayTopologyStore(initialSnapshot: ScreenTopologySnapshot(
                 physicalDisplayCount: 0, identifiedDisplayUUIDs: [], attributionTable: .empty)),
-            screenProvider: { [] }, mainScreenProvider: { nil })
+            fullscreenSLSVerdictEnabled: usesSLS, screenProvider: { [] }, mainScreenProvider: { nil })
         coordinator.fullscreenFrameProvider = { .zero }
+        coordinator.fullscreenCGWindowsProvider = { [] }
+        coordinator.fullscreenCGWindowObservationProvider = { _ in nil }
         return coordinator
     }
 
@@ -169,7 +589,7 @@ final class PanelLifecycleTests: XCTestCase {
         }
         let desktopWindows = [window(10, CGRect(x: 10, y: 20, width: 500, height: 450)),
                               window(11, otherScreen), window(12, screen, layer: -1)]
-        let stillFullscreen = desktopWindows + [window(13, screen, layer: 2)]
+        let stillFullscreen = [window(13, screen, layer: 2)] + desktopWindows
         let cases: [(String, Bool?, [[String: Any]]?, Bool)] = [
             ("confirmed desktop", false, desktopWindows, true),
             ("empty desktop", false, [], true),
@@ -214,7 +634,7 @@ final class PanelLifecycleTests: XCTestCase {
         coordinator.fullscreenFrameProvider = { CGRect(x: 600, y: 0, width: 600, height: 500) }
         coordinator.visibilityState.setFullscreen(true)
 
-        coordinator.handleAppActivated(pid: nil, sharedRead: FullscreenAXReadBatch { _ in .unknown })
+        coordinator.handleAppActivated(pid: nil, sharedRead: FullscreenReadBatch { _ in .unknown })
         let confirmation = try XCTUnwrap(coordinator.fullscreenSpaceHoldTimer)
         confirmation.fire()
         while let work = worker.pendingWorkForTesting.first { await work.value }
@@ -358,8 +778,10 @@ final class PanelLifecycleTests: XCTestCase {
 
     func testLateFullscreenSpaceResultCannotApplyToANewerProbeGeneration() async {
         let coordinator = coordinator(placement: .fixed(displayUUID: "left"))
-        coordinator.fullscreenFrameProvider = { .zero }
+        let screen = CGRect(x: 0, y: 0, width: 600, height: 500)
+        coordinator.fullscreenFrameProvider = { screen }
         coordinator.fullscreenProbeGeneration = 1
+        coordinator.fullscreenSpaceHold = FullscreenSpaceHold(generation: 3, pid: 42, displayWindowServerFrame: screen)
         let entered = Mutex(false)
         let gate = DispatchSemaphore(value: 0)
         var delivered = 0
@@ -374,8 +796,8 @@ final class PanelLifecycleTests: XCTestCase {
             coordinator.receiveFullscreenProbe(probe, request: request)
         })
         defer { gate.signal(); worker.stop(); coordinator.tearDown() }
-        worker.request(FullscreenProbeRequest(pid: 42, screenFrame: .zero, generation: 1, spaceGeneration: 3,
-            finalConfirmation: false, source: "test", displayUUID: "left"))
+        worker.request(FullscreenProbeRequest(pid: 42, screenFrame: screen, generation: 1, spaceGeneration: 3,
+            finalConfirmation: true, source: "test", displayUUID: "left"))
         let deadline = ContinuousClock.now + .seconds(2)
         while !entered.withLock({ $0 }), ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(1)) }
         XCTAssertTrue(entered.withLock { $0 })
@@ -384,6 +806,11 @@ final class PanelLifecycleTests: XCTestCase {
         while delivered == 0, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(delivered, 1)
         XCTAssertTrue(coordinator.visibilityState.isVisible)
+        let current = FullscreenProbeRequest(pid: 42, screenFrame: screen, generation: 2, spaceGeneration: 3,
+            finalConfirmation: true, source: "test", displayUUID: "left")
+        coordinator.receiveFullscreenProbe(FullscreenAXProbe(verdict: .unknown, overlayWindowID: nil, spaceVerdict: true),
+                                           request: current)
+        XCTAssertFalse(coordinator.visibilityState.isVisible)
     }
 
     func testFullscreenSpaceResultCannotApplyAfterDisplayGeometryChanges() {
@@ -519,6 +946,8 @@ final class PanelLifecycleTests: XCTestCase {
     func testPeriodicFullscreenCheckRunsWhileVisibleAndCompletesAPendingHold() async {
         let coordinator = coordinator()
         coordinator.fullscreenFrameProvider = { CGRect(x: 0, y: 0, width: 100, height: 100) }
+        var cgReads = 0
+        coordinator.fullscreenCGWindowsProvider = { cgReads += 1; return [] }
         let reads = Mutex(0)
         var requests: [FullscreenProbeRequest] = []
         coordinator.fullscreenProbeWorker = FullscreenProbeWorker(read: { _ in
@@ -541,6 +970,7 @@ final class PanelLifecycleTests: XCTestCase {
         XCTAssertEqual(requests.last?.finalConfirmation, true)
         XCTAssertNil(coordinator.fullscreenSpaceHold)
         XCTAssertTrue(coordinator.visibilityState.isVisible)
+        XCTAssertEqual(cgReads, 1)
         coordinator.tearDown()
     }
 

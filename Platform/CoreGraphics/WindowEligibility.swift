@@ -145,9 +145,18 @@ struct AppTrackerWindowEligibility {
         }
 
         var isEmbeddedHelper: Bool {
-            guard activationPolicy == .accessory,
-                  !ApplicationIdentity.isDeskMote(bundleIdentifier),
-                  let bundleURL, bundleURL.isFileURL, bundleURL.pathExtension.lowercased() == "app" else { return false }
+            guard let bundleURL = canonicalAccessoryBundleURL else { return false }
+            return isEmbeddedHelper(bundleURL: bundleURL)
+        }
+
+        private var canonicalAccessoryBundleURL: URL? {
+            guard activationPolicy == .accessory, !ApplicationIdentity.isDeskMote(bundleIdentifier),
+                  let origin = ApplicationOrigin(bundleURL: bundleURL) else { return nil }
+            let canonicalURL = URL(fileURLWithPath: origin.bundlePath)
+            return canonicalURL.pathExtension.lowercased() == "app" ? canonicalURL : nil
+        }
+
+        private func isEmbeddedHelper(bundleURL: URL) -> Bool {
             let components = bundleURL.deletingLastPathComponent().pathComponents
             return components.indices.contains { index in
                 guard components[index] == "Contents", index > 0 else { return false }
@@ -169,8 +178,8 @@ struct AppTrackerWindowEligibility {
             switch activationPolicy {
             case .regular: return true
             case .accessory:
-                guard let bundleURL, bundleURL.pathExtension.lowercased() == "app" else { return false }
-                return !isEmbeddedHelper
+                guard let bundleURL = canonicalAccessoryBundleURL else { return false }
+                return !isEmbeddedHelper(bundleURL: bundleURL)
             case .prohibited: return false
             @unknown default: return false
             }
@@ -223,19 +232,23 @@ struct AppTrackerWindowEligibility {
         let verdict = policy.decisionFromEvidence(candidate)
         guard verdict == .eligible else { return verdict }
 
+        let matchesCommonWindowRules = customWindow || AXTaskbarWindowRules.isMainWindow(role: role, subrole: subrole,
+            bounds: bounds, isModal: isModal, isTopLevel: isTopLevel)
         if FinderWindowRules.isFinder(bundleIdentifier: application.bundleIdentifier) {
             return FinderWindowRules.isTrackable(
                 title: title,
                 role: role,
                 subrole: subrole,
                 bounds: bounds,
-                isMinimized: isMinimized,
-                applicationName: application.appName
+                applicationName: application.appName,
+                isModal: isModal,
+                isTopLevel: isTopLevel,
+                isNativeRoot: isNativeRoot,
+                matchesCommonWindowRules: matchesCommonWindowRules
             ) ? .eligible : .finderNotTrackable
         }
 
-        return customWindow || AXTaskbarWindowRules.isMainWindow(role: role, subrole: subrole, bounds: bounds, isModal: isModal, isTopLevel: isTopLevel)
-            ? .eligible : .notMainWindow
+        return matchesCommonWindowRules ? .eligible : .notMainWindow
     }
 }
 

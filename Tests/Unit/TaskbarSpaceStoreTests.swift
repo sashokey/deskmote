@@ -23,6 +23,18 @@ private final class SpaceActionRecorder: WindowActionExecuting {
     }
 }
 
+private final class SpaceBlockedAction: WindowActionExecuting {
+    let token = Mutex<OperationCancellation?>(nil)
+    let release = DispatchSemaphore(value: 0)
+
+    func execute(_ request: PlatformActionRequest, snapshot: DockSnapshot, forcedMinimizedPrior: Bool,
+                 cancellation: OperationCancellation, onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?) -> Bool {
+        token.withLock { $0 = cancellation }
+        _ = release.wait(timeout: .now() + 3)
+        return !cancellation.isCancelled
+    }
+}
+
 @MainActor
 private final class VisibleUtilitySpaceWindow: NSWindow {
     var activeSpace = true
@@ -37,6 +49,68 @@ private final class VisibleUtilitySpaceWindow: NSWindow {
 
 @MainActor
 final class TaskbarSpaceStoreTests: XCTestCase {
+    func testRegisteredWindowAdoptsNewSpaceWhenMinimizedBeforeLayoutCatchesUp() async throws {
+        try await verifyRegisteredWindowAdoptsNewSpace(firstPostChangeMembership: 2)
+    }
+
+    func testRegisteredWindowKeepsAwaitingLayoutAfterAnInitiallyUnchangedCapture() async throws {
+        try await verifyRegisteredWindowAdoptsNewSpace(firstPostChangeMembership: 1)
+    }
+
+    private func verifyRegisteredWindowAdoptsNewSpace(firstPostChangeMembership: Int) async throws {
+        var record = WindowRecord(id: WindowID(rawValue: "utility"), appID: AppID(rawValue: "desk"), pid: 42,
+            bundleIdentifier: nil, title: "Utility", bounds: nil, status: .active, isOnDesktop: true,
+            displayUUID: "left", source: .utility(spaceWindowNumber: 749))
+        let inventory = SpaceInventory(.init(windows: [record.id: record], orderedWindowIDs: [record.id]))
+        let identity = try XCTUnwrap(StripItem(record: record).spaceIdentity)
+        let notifications = NotificationCenter()
+        let observation = Mutex((layout: 1, membership: 1))
+        let store = TaskbarSpaceStore(read: { requests in
+            let (layout, membership) = observation.withLock { $0 }
+            return WindowSpaceSnapshot(
+                layouts: ["left": .init(orderedSpaceIDs: [1, 2], fullscreenSpaceIDs: [], currentSpaceID: layout)],
+                memberships: Dictionary(uniqueKeysWithValues: requests.map { ($0.identity, [membership]) })
+            )
+        }, notifications: notifications, pollInterval: 0)
+        var activeSpace: Bool? = true
+        store.start(snapshots: inventory.snapshots, utilityOnActiveSpace: { _ in activeSpace })
+        defer { store.stop() }
+        let filter = StripDisplayFilter(scope: "left", connectedUUIDs: ["left"], primaryUUID: "left")
+        func visibleIDs() -> Set<String> {
+            Set(TaskbarPresentation.visibleItems(StripItem.openWindows(from: inventory.values.value),
+                filter: filter, spaces: store.snapshot, utilityOnPanelDisplay: { _ in true },
+                utilityOnActiveSpace: { _ in activeSpace }).keys)
+        }
+
+        await waitUntil { store.snapshot.memberships[identity] == [1] }
+        observation.withLock { $0.membership = firstPostChangeMembership }
+        notifications.post(name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        await waitUntil { store.confirmedSpaceRevision == 1 }
+        XCTAssertEqual(store.snapshot.layouts["left"]?.currentSpaceID, 1)
+        XCTAssertEqual(store.snapshot.memberships[identity], [firstPostChangeMembership])
+        XCTAssertEqual(visibleIDs(), [identity.itemID])
+
+        if firstPostChangeMembership != 2 {
+            observation.withLock { $0.membership = 2 }
+            store.refresh()
+            await waitUntil { store.snapshot.memberships[identity] == [2] }
+            XCTAssertEqual(store.snapshot.layouts["left"]?.currentSpaceID, 1)
+            XCTAssertEqual(visibleIDs(), [identity.itemID])
+        }
+        activeSpace = nil
+        record.status = .minimized
+        record.isOnDesktop = false
+        inventory.values.send(.init(windows: [record.id: record], orderedWindowIDs: [record.id]))
+        await flushSnapshotDelivery()
+        for task in store.pendingWorkForTesting { await task.value }
+
+        observation.withLock { $0.layout = 2 }
+        store.refresh()
+        await waitUntil { store.snapshot.layouts["left"]?.currentSpaceID == 2 }
+        XCTAssertEqual(store.snapshot.memberships[identity], [2])
+        XCTAssertEqual(visibleIDs(), [identity.itemID])
+    }
+
     func testRegisteredWindowUsesLiveSpaceWhileWindowServerCatchesUp() async throws {
         let inventory = SpaceInventory(.empty)
         let runtime = AppRuntime(tracker: inventory)
@@ -310,6 +384,86 @@ final class TaskbarSpaceStoreTests: XCTestCase {
         XCTAssertEqual(store.snapshot.layouts["left"]?.currentSpaceID, 2)
     }
 
+    func testSpaceChangeCancelsAnAdmittedActionBeforeReadingUtilityVisibility() async throws {
+        var source = inventory()
+        let external = WindowID(rawValue: "window-1")
+        let utility = WindowID(rawValue: "space-utility")
+        source.windows[utility] = WindowRecord(id: utility, appID: AppID(rawValue: "utility"), pid: -51230,
+            bundleIdentifier: nil, title: "Utility", bounds: nil, status: .inactive, cgWindowID: 3,
+            displayUUID: "left", source: .utility(spaceWindowNumber: 3))
+        source.orderedWindowIDs.append(utility)
+        let target = try XCTUnwrap(source.windows[external]?.actionIdentity)
+        let center = NotificationCenter()
+        let executor = SpaceBlockedAction()
+        let runtime = AppRuntime(tracker: SpaceInventory(source), actionExecutor: executor)
+        let store = TaskbarSpaceStore(read: { requests in
+            WindowSpaceSnapshot(layouts: ["left": .init(orderedSpaceIDs: [1, 2], fullscreenSpaceIDs: [], currentSpaceID: 1)],
+                memberships: Dictionary(uniqueKeysWithValues: requests.map { ($0.identity, [1]) }))
+        }, notifications: center, pollInterval: 0)
+        var cancellationAtVisibility: Bool?
+        var projectionAtVisibility: Bool?
+        var checkingNotification = false
+        runtime.start()
+        store.start(snapshots: runtime.$snapshot.eraseToAnyPublisher(), utilityOnActiveSpace: { _ in
+            if checkingNotification {
+                cancellationAtVisibility = executor.token.withLock { $0?.isCancelled }
+                projectionAtVisibility = store.canUseProjection(on: "left", renderedSpaceRevision: 0)
+                executor.release.signal()
+            }
+            return true
+        })
+        defer { executor.release.signal(); store.stop(); runtime.stop() }
+        await waitUntil { store.snapshot.memberships.count == 3 }
+        runtime.trigger(.activate(external), expected: target, projectionInvalidations: store.activeSpaceChanges) {
+            store.canUseProjection(on: "left", renderedSpaceRevision: 0)
+        }
+        await waitUntil { executor.token.withLock { $0 != nil } }
+        checkingNotification = true
+        center.post(name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        checkingNotification = false
+
+        XCTAssertEqual(cancellationAtVisibility, true)
+        XCTAssertEqual(projectionAtVisibility, false)
+    }
+
+    func testRestartRequiresAFreshLayoutBeforeAuthorizingAProjection() async {
+        let entered = Mutex(0)
+        let freshRead = DispatchSemaphore(value: 0)
+        let unread = DispatchSemaphore(value: 0)
+        let store = TaskbarSpaceStore(read: { _ in
+            let call = entered.withLock { $0 += 1; return $0 }
+            if call == 2 {
+                _ = unread.wait(timeout: .now() + 3)
+                return nil
+            }
+            if call == 3 { _ = freshRead.wait(timeout: .now() + 3) }
+            return .init(layouts: ["left": .init(orderedSpaceIDs: [1, 2], fullscreenSpaceIDs: [], currentSpaceID: call == 1 ? 1 : 2)])
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        let source = Just(inventory()).eraseToAnyPublisher()
+        defer { unread.signal(); freshRead.signal(); store.stop() }
+        store.start(snapshots: source)
+        await waitUntil { store.snapshot.layouts["left"]?.currentSpaceID == 1 }
+        let previous = store.confirmedSpaceRevision
+        XCTAssertTrue(store.canUseProjection(on: "left", renderedSpaceRevision: previous))
+
+        store.stop()
+        XCTAssertFalse(store.canUseProjection(on: "left", renderedSpaceRevision: previous))
+        store.start(snapshots: source)
+        await waitUntil { entered.withLock { $0 == 2 } }
+        XCTAssertFalse(store.canUseProjection(on: "left", renderedSpaceRevision: store.confirmedSpaceRevision))
+        unread.signal()
+        for task in store.pendingWorkForTesting { await task.value }
+        XCTAssertFalse(store.canUseProjection(on: "left", renderedSpaceRevision: store.confirmedSpaceRevision))
+
+        store.refresh()
+        await waitUntil { entered.withLock { $0 == 3 } }
+        XCTAssertFalse(store.canUseProjection(on: "left", renderedSpaceRevision: store.confirmedSpaceRevision))
+        freshRead.signal()
+        await waitUntil { store.snapshot.layouts["left"]?.currentSpaceID == 2 }
+        XCTAssertFalse(store.canUseProjection(on: "left", renderedSpaceRevision: previous))
+        XCTAssertTrue(store.canUseProjection(on: "left", renderedSpaceRevision: store.confirmedSpaceRevision))
+    }
+
     func testPartialReadAfterSpaceChangeCannotProjectOrActOnStaleMembership() async throws {
         let source = inventory()
         let first = WindowID(rawValue: "window-1")
@@ -506,18 +660,38 @@ final class TaskbarSpaceStoreTests: XCTestCase {
          "right": SpaceLayoutSnapshot(orderedSpaceIDs: [10, 11], fullscreenSpaceIDs: [], currentSpaceID: 10)]
     }
 
-    func testDisplayTransferUpdatesBothPresentersWithoutPollingOrSpaceNotifications() async {
-        let original = inventory()
+    func testDisplayTransferUpdatesBothPresentersWithoutPollingOrWaitingForBulkMembership() async throws {
+        let first = WindowID(rawValue: "window-1")
+        let second = WindowID(rawValue: "window-2")
+        var original = inventory()
+        original.windows[second]?.status = .minimized
+        let target = try XCTUnwrap(original.windows[first]?.actionIdentity)
         let fixture = SpaceInventory(original)
-        let runtime = AppRuntime(tracker: fixture)
-        let currentMembership = Mutex<Set<Int>>([1])
-        let calls = Mutex(0)
+        let executor = SpaceActionRecorder()
+        let runtime = AppRuntime(tracker: fixture, actionExecutor: executor)
+        let bulkReads = Mutex(0)
+        let destinationReads = Mutex(0)
+        let bulkGate = DispatchSemaphore(value: 0)
+        let destinationGate = DispatchSemaphore(value: 0)
+        let timeouts = Mutex(0)
         let layouts = twoDisplayLayouts
         let store = TaskbarSpaceStore(read: { requests in
-            calls.withLock { $0 += 1 }
-            let movedSpace = currentMembership.withLock { $0 }
+            var space = Set([1])
+            if requests.count == 1, requests.first?.displayUUID == "right" {
+                let attempt = destinationReads.withLock { $0 += 1; return $0 }
+                if attempt == 1 { return nil }
+                if attempt == 3 {
+                    if destinationGate.wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
+                    space = [10]
+                }
+            } else if requests.count == 2 {
+                let attempt = bulkReads.withLock { $0 += 1; return $0 }
+                if attempt == 1 { space = [1, 10] }
+                if attempt == 2, bulkGate.wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
+                if attempt == 4 { space = [10] }
+            }
             return WindowSpaceSnapshot(layouts: layouts, memberships: Dictionary(uniqueKeysWithValues:
-                requests.map { ($0.identity, $0.identity.windowID == 1 ? movedSpace : Set([1])) }))
+                requests.map { ($0.identity, $0.identity.windowID == 1 ? space : Set([1])) }))
         }, notifications: NotificationCenter(), pollInterval: 0)
         let domain = "DeskMote.DisplayTransferTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: domain)!
@@ -539,27 +713,145 @@ final class TaskbarSpaceStoreTests: XCTestCase {
         }
         func ids(_ view: TaskbarView) -> [String] { view.taskbarContent.groups.flatMap(\.windows).map(\.id) }
         runtime.start()
-        defer { store.stop(); runtime.stop(); withExtendedLifetime(presenters) {} }
+        defer {
+            bulkGate.signal()
+            destinationGate.signal()
+            store.stop()
+            runtime.stop()
+            withExtendedLifetime(presenters) {}
+        }
         await waitUntil { runtime.snapshot.windows.count == 2 }
         store.start(snapshots: runtime.$snapshot.eraseToAnyPublisher())
         await waitUntil { store.snapshot.memberships.count == 2 && ids(left) == ["window-1", "window-2"] }
         XCTAssertTrue(ids(right).isEmpty)
         reorderSecondBeforeFirst(ordering)
         await waitUntil { ids(left) == ["window-2", "window-1"] }
+        let identity = try XCTUnwrap(StripItem.openWindows(from: original).first?.spaceIdentity)
+        XCTAssertEqual(store.snapshot.memberships[identity], [1, 10])
+        store.refresh()
+        await waitUntil { bulkReads.withLock { $0 } == 2 }
         var moved = original
-        moved.windows[WindowID(rawValue: "window-1")]?.displayUUID = "right"
-        currentMembership.withLock { $0 = [10] }
+        moved.windows[first]?.displayUUID = "right"
         fixture.values.send(moved)
+        await waitUntil { ids(left) == ["window-2"] && destinationReads.withLock { $0 } == 3 }
+        guard destinationReads.withLock({ $0 }) == 3 else { return }
+        XCTAssertTrue(ids(right).isEmpty)
+        XCTAssertNil(store.snapshot.memberships[identity])
+        left.taskbarContent.actions.close(target)
+        right.taskbarContent.actions.activate(target)
+        for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertTrue(executor.calls.withLock { $0.isEmpty })
+
+        destinationGate.signal()
         await waitUntil { ids(left) == ["window-2"] && ids(right) == ["window-1"] }
-        XCTAssertEqual(calls.withLock { $0 }, 2)
+        XCTAssertEqual(bulkReads.withLock { $0 }, 2)
+        XCTAssertEqual(timeouts.withLock { $0 }, 0)
+        left.taskbarContent.actions.close(target)
+        right.taskbarContent.actions.activate(target)
+        for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertEqual(executor.calls.withLock { $0 }, [first])
         XCTAssertEqual(ordering.liveOrder, ["window-2", "window-1"])
-        currentMembership.withLock { $0 = [1] }
+        moved.windows[first]?.status = .minimized
+        fixture.values.send(moved)
+        await waitUntil { runtime.snapshot.windows[first]?.status == .minimized }
+        await flushSnapshotDelivery()
+        var lostDestination = false
+        let observation = store.$snapshot.sink { value in
+            if value.memberships[identity] != [10] { lostDestination = true }
+        }
+        let pendingBulk = store.pendingWorkForTesting
+        bulkGate.signal()
+        for task in pendingBulk { await task.value }
+        await waitUntil { bulkReads.withLock { $0 } == 3 }
+        for task in store.pendingWorkForTesting { await task.value }
+        await flushSnapshotDelivery()
+        observation.cancel()
+        XCTAssertFalse(lostDestination)
+        XCTAssertEqual(ids(right), ["window-1"])
+        XCTAssertEqual(ids(left), ["window-2"])
+        left.taskbarContent.actions.close(target)
+        for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertEqual(executor.calls.withLock { $0 }, [first])
+
+        store.refresh()
+        await waitUntil { bulkReads.withLock { $0 } == 4 }
+        for task in store.pendingWorkForTesting { await task.value }
+        XCTAssertEqual(store.snapshot.memberships[identity], [10])
+        store.refresh()
+        await waitUntil { bulkReads.withLock { $0 } == 5 && store.snapshot.memberships[identity] == [1] }
+        await flushSnapshotDelivery()
+        XCTAssertEqual(ids(left), ["window-2", "window-1"])
+        XCTAssertTrue(ids(right).isEmpty)
+
         fixture.values.send(original)
         await waitUntil { ids(left) == ["window-2", "window-1"] && ids(right).isEmpty }
-        XCTAssertEqual(calls.withLock { $0 }, 3)
         XCTAssertEqual(runtime.snapshot.windows.count, 2)
         XCTAssertNil(left.window)
         XCTAssertNil(right.window)
+    }
+
+    func testDisplayTransferToAnInactiveDestinationSpaceNeedsNoRetry() async throws {
+        let original = inventory()
+        let identity = try XCTUnwrap(StripItem.openWindows(from: original).first?.spaceIdentity)
+        let source = CurrentValueSubject<DockSnapshot, Never>(original)
+        let reads = Mutex(0)
+        let layouts = twoDisplayLayouts
+        let store = TaskbarSpaceStore(read: { requests in
+            reads.withLock { $0 += 1 }
+            return .init(layouts: layouts, memberships: Dictionary(uniqueKeysWithValues: requests.map {
+                ($0.identity, $0.displayUUID == "right" ? [11] : [1])
+            }))
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        store.start(snapshots: source.eraseToAnyPublisher())
+        defer { store.stop() }
+        await waitUntil { store.snapshot.memberships[identity] == [1] }
+
+        var moved = original
+        moved.windows[identity.actionIdentity.windowID]?.displayUUID = "right"
+        source.send(moved)
+        await waitUntil { store.snapshot.memberships[identity] == [11] }
+        for task in store.pendingWorkForTesting { await task.value }
+
+        XCTAssertFalse(store.snapshot.shows(identity, on: "right"))
+        XCTAssertEqual(reads.withLock { $0 }, 2)
+    }
+
+    func testReversingATransferDiscardsTheBlockedDestinationRead() async throws {
+        let original = inventory()
+        let identity = try XCTUnwrap(StripItem.openWindows(from: original).first?.spaceIdentity)
+        let source = CurrentValueSubject<DockSnapshot, Never>(original)
+        let entered = Mutex(false)
+        let gate = DispatchSemaphore(value: 0)
+        let timeouts = Mutex(0)
+        let layouts = twoDisplayLayouts
+        let store = TaskbarSpaceStore(read: { requests in
+            if requests.contains(where: { $0.displayUUID == "right" }) {
+                entered.withLock { $0 = true }
+                if gate.wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
+            }
+            return .init(layouts: layouts, memberships: Dictionary(uniqueKeysWithValues: requests.map {
+                ($0.identity, $0.displayUUID == "right" ? [10] : [1])
+            }))
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        store.start(snapshots: source.eraseToAnyPublisher())
+        defer { gate.signal(); store.stop() }
+        await waitUntil { store.snapshot.memberships[identity] == [1] }
+
+        var moved = original
+        moved.windows[identity.actionIdentity.windowID]?.displayUUID = "right"
+        source.send(moved)
+        await waitUntil { entered.withLock { $0 } }
+        let old = store.pendingWorkForTesting
+        XCTAssertFalse(store.snapshot.shows(identity, on: "right"))
+
+        source.send(original)
+        await waitUntil { store.snapshot.memberships[identity] == [1] }
+        gate.signal()
+        for task in old { await task.value }
+        XCTAssertEqual(timeouts.withLock { $0 }, 0)
+        XCTAssertEqual(store.snapshot.memberships[identity], [1])
+        XCTAssertTrue(store.snapshot.shows(identity, on: "left"))
+        XCTAssertFalse(store.snapshot.shows(identity, on: "right"))
     }
 
     func testDisplayChangesDuringAReadCoalesceAndRejectOldMembership() async {
@@ -571,6 +863,7 @@ final class TaskbarSpaceStoreTests: XCTestCase {
         let secondGate = DispatchSemaphore(value: 0)
         let layouts = twoDisplayLayouts
         let store = TaskbarSpaceStore(read: { requests in
+            guard requests.count == 2 else { return nil }
             let call = calls.withLock { $0 += 1; return $0 }
             let spaces = membership.withLock { $0 }
             if call == 1 { _ = firstGate.wait(timeout: .now() + 3) }
@@ -594,6 +887,157 @@ final class TaskbarSpaceStoreTests: XCTestCase {
         secondGate.signal()
         await waitUntil { store.snapshot.memberships.values.allSatisfy { $0 == [10] } && store.snapshot.memberships.count == 2 }
         XCTAssertEqual(calls.withLock { $0 }, 2)
+    }
+
+    func testDisplayTransferConfirmsMembershipWhileTheInitialLayoutReadIsBlocked() async throws {
+        let original = inventory()
+        let movedID = WindowID(rawValue: "window-1")
+        let identity = try XCTUnwrap(StripItem.openWindows(from: original).first?.spaceIdentity)
+        let source = CurrentValueSubject<DockSnapshot, Never>(original)
+        let initialReadEntered = Mutex(false)
+        let initialRead = DispatchSemaphore(value: 0)
+        let layouts = twoDisplayLayouts
+        let store = TaskbarSpaceStore(read: { requests in
+            let initial = requests.count == 2 && initialReadEntered.withLock { entered in
+                defer { entered = true }
+                return !entered
+            }
+            if initial { _ = initialRead.wait(timeout: .now() + 8) }
+            return .init(layouts: layouts, memberships: Dictionary(uniqueKeysWithValues: requests.map {
+                ($0.identity, $0.displayUUID == "right" ? [10] : [1])
+            }))
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        store.start(snapshots: source.eraseToAnyPublisher())
+        defer { initialRead.signal(); store.stop() }
+        await waitUntil { initialReadEntered.withLock { $0 } }
+        XCTAssertTrue(store.snapshot.layouts.isEmpty)
+
+        var moved = original
+        moved.windows[movedID]?.displayUUID = "right"
+        source.send(moved)
+        await waitUntil { store.snapshot.memberships[identity] == [10] }
+        XCTAssertTrue(store.snapshot.shows(identity, on: "right"))
+    }
+
+    func testPartialTransferCanRetryAfterEstablishingTheInitialLayout() async throws {
+        let original = inventory()
+        let identities = StripItem.openWindows(from: original).compactMap(\.spaceIdentity)
+        XCTAssertEqual(identities.map(\.windowID), [1, 2])
+        let first = try XCTUnwrap(identities.first)
+        let second = try XCTUnwrap(identities.last)
+        let source = CurrentValueSubject<DockSnapshot, Never>(original)
+        let initialReadEntered = Mutex(false)
+        let initialReadFinished = Mutex(false)
+        let initialRead = DispatchSemaphore(value: 0)
+        let allowSecondMembership = DispatchSemaphore(value: 0)
+        let requested = Mutex<[[UInt32]]>([])
+        let timeouts = Mutex(0)
+        let layouts = twoDisplayLayouts
+        let store = TaskbarSpaceStore(read: { requests in
+            if requests.allSatisfy({ $0.displayUUID == "left" }) {
+                initialReadEntered.withLock { $0 = true }
+                if initialRead.wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
+                initialReadFinished.withLock { $0 = true }
+                return .init(layouts: layouts, memberships: [first: [1], second: [1]])
+            }
+            let attempt = requested.withLock {
+                $0.append(requests.map(\.identity.windowID))
+                return $0.count
+            }
+            if attempt == 1 { return .init(layouts: layouts, memberships: [first: [10]]) }
+            if allowSecondMembership.wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
+            return .init(layouts: layouts, memberships: [second: [10]])
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        store.start(snapshots: source.eraseToAnyPublisher())
+        defer {
+            store.stop()
+            initialRead.signal()
+            allowSecondMembership.signal()
+        }
+        await waitUntil { initialReadEntered.withLock { $0 } }
+        XCTAssertTrue(store.snapshot.layouts.isEmpty)
+
+        var moved = original
+        moved.windows[first.actionIdentity.windowID]?.displayUUID = "right"
+        moved.windows[second.actionIdentity.windowID]?.displayUUID = "right"
+        source.send(moved)
+        await waitUntil { store.snapshot.shows(first, on: "right") && store.snapshot.layouts == layouts }
+        XCTAssertFalse(store.snapshot.shows(second, on: "right"))
+        await waitUntil { requested.withLock { $0.count } == 2 }
+
+        allowSecondMembership.signal()
+        await waitUntil { store.snapshot.shows(second, on: "right") }
+        XCTAssertTrue(store.snapshot.shows(first, on: "right"))
+        XCTAssertFalse(initialReadFinished.withLock { $0 })
+        XCTAssertEqual(requested.withLock { $0 }, [[1, 2], [2]])
+        XCTAssertEqual(timeouts.withLock { $0 }, 0)
+    }
+
+    func testMinimizingDuringTransferKeepsStaleSourceMembershipOutOfBothPanels() async throws {
+        let original = inventory()
+        let first = WindowID(rawValue: "window-1")
+        let target = try XCTUnwrap(original.windows[first]?.actionIdentity)
+        let fixture = SpaceInventory(original)
+        let executor = SpaceActionRecorder()
+        let runtime = AppRuntime(tracker: fixture, actionExecutor: executor)
+        let confirmed = Mutex(false)
+        let staleParkedReads = Mutex(0)
+        let layouts = twoDisplayLayouts
+        let store = TaskbarSpaceStore(read: { requests in
+            let available = confirmed.withLock { $0 }
+            if !available, requests.count == 2,
+               requests.contains(where: { $0.identity.windowID == 1 && $0.isParked && $0.displayUUID == "right" }) {
+                staleParkedReads.withLock { $0 += 1 }
+            }
+            return .init(layouts: layouts, memberships: Dictionary(uniqueKeysWithValues: requests.map {
+                ($0.identity, $0.identity.windowID == 1 && $0.displayUUID == "right" && available ? [10] : [1])
+            }))
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        let domain = "DeskMote.ParkedTransferTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let ordering = StripOrderStore(defaults: defaults)
+        let topology = DisplayTopologyStore(initialSnapshot: .init(physicalDisplayCount: 2,
+            identifiedDisplayUUIDs: ["left", "right"], attributionTable: .init(displays: [
+                .init(uuid: "left", cgFrame: CGRect(x: 0, y: 0, width: 800, height: 600)),
+                .init(uuid: "right", cgFrame: CGRect(x: 800, y: 0, width: 800, height: 600))
+            ], primaryUUID: "left")))
+        let left = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+        let right = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+        let presenters = [("left", left), ("right", right)].map { display, view in
+            TaskbarPresenter(view: view, runtime: runtime, ordering: ordering, topology: topology, spaces: store,
+                displayUUID: display, backgroundMenu: { _, _ in }, popupPresented: { _ in }, contextMenuVisibilityChanged: { _ in })
+        }
+        func ids(_ view: TaskbarView) -> [String] { view.taskbarContent.groups.flatMap(\.windows).map(\.id) }
+        runtime.start()
+        store.start(snapshots: runtime.$snapshot.eraseToAnyPublisher())
+        defer { store.stop(); runtime.stop(); withExtendedLifetime(presenters) {} }
+        await waitUntil { store.snapshot.memberships.count == 2 && ids(left) == ["window-1", "window-2"] }
+
+        var moved = original
+        moved.windows[first]?.displayUUID = "right"
+        fixture.values.send(moved)
+        await waitUntil { ids(left) == ["window-2"] && ids(right).isEmpty }
+        moved.windows[first]?.status = .minimized
+        fixture.values.send(moved)
+        await waitUntil { runtime.snapshot.windows[first]?.status == .minimized }
+        await flushSnapshotDelivery()
+        store.refresh()
+        await waitUntil { staleParkedReads.withLock { $0 > 0 } }
+        for task in store.pendingWorkForTesting { await task.value }
+        await flushSnapshotDelivery()
+        XCTAssertEqual(ids(left), ["window-2"])
+        XCTAssertTrue(ids(right).isEmpty)
+        left.taskbarContent.actions.close(target)
+        for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertTrue(executor.calls.withLock { $0.isEmpty })
+
+        confirmed.withLock { $0 = true }
+        store.refresh()
+        await waitUntil { ids(left) == ["window-2"] && ids(right) == ["window-1"] }
+        right.taskbarContent.actions.close(target)
+        for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertEqual(executor.calls.withLock { $0 }, [first])
     }
 
     func testSameDisplayGeometryTitleAndFocusChangesDoNotRefreshSpaces() async {

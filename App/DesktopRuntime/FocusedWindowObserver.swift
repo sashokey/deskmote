@@ -81,15 +81,19 @@ final class FrontmostWindowGeometryObserver {
     private var focusedWindow: AXElementKey?
     private var starting = false
     private var refreshing = false
+    private var focusRevision: UInt64 = 0
     private var needsRefresh = false
     private var needsRetry = false
     private var bindingInFlight = false
+    private var bindingAwaitingFreshFocus = false
     private var needsBinding = false
     private var needsBindingRetry = false
     private var bindingCancellation: OperationCancellation?
 
     init(makeSession: @escaping Factory = { AXWindowObservationSession(pid: $0, receive: $1) },
-         readFocused: @escaping @Sendable (pid_t) -> FocusedWindowRead = FrontmostWindowGeometryObserver.readFocusedWindow) {
+         readFocused: @escaping @Sendable (pid_t) -> FocusedWindowRead = {
+             FrontmostWindowGeometryObserver.readFocusedWindow(pid: $0)
+         }) {
         self.makeSession = makeSession
         self.readFocused = readFocused
     }
@@ -107,10 +111,15 @@ final class FrontmostWindowGeometryObserver {
         starting = true
         work.restart()
         let generation = work.generation
-        let receive: @Sendable (AXElementKey, String) -> Void = { [weak self] element, name in
-            Task { @MainActor [weak self] in
-                guard let self, self.work.isCurrent(generation) else { return }
-                self.handleNotification(element, name: name)
+        let deliver: @MainActor @Sendable (AXElementKey, String) -> Void = { [weak self] element, name in
+            guard let self, self.work.isCurrent(generation) else { return }
+            self.handleNotification(element, name: name)
+        }
+        let receive: @Sendable (AXElementKey, String) -> Void = { element, name in
+            if Thread.isMainThread, name == kAXFocusedWindowChangedNotification || name == kAXUIElementDestroyedNotification {
+                MainActor.assumeIsolated { deliver(element, name) }
+            } else {
+                Task { @MainActor in deliver(element, name) }
             }
         }
         let makeSession = makeSession
@@ -154,6 +163,7 @@ final class FrontmostWindowGeometryObserver {
         needsRefresh = false
         needsRetry = false
         bindingInFlight = false
+        bindingAwaitingFreshFocus = false
         needsBinding = false
         needsBindingRetry = false
     }
@@ -162,6 +172,7 @@ final class FrontmostWindowGeometryObserver {
         guard let pid = activePID, binding != nil else { return }
         guard !refreshing else { needsRefresh = true; return }
         refreshing = true
+        let focusRevision = focusRevision
         let readFocused = readFocused
         let queue = queue
         work.launch { [weak self] generation in
@@ -169,15 +180,17 @@ final class FrontmostWindowGeometryObserver {
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation) else { return }
                 self.refreshing = false
-                self.needsRetry = false
-                switch result {
-                case let .window(element):
-                    self.updateFocusedWindow(element)
-                    self.onEvent?(.focusedWindowChanged)
-                case .none:
-                    self.updateFocusedWindow(nil)
-                case .unavailable:
-                    self.needsRetry = true
+                if self.focusRevision == focusRevision {
+                    self.needsRetry = false
+                    switch result {
+                    case let .window(element):
+                        self.updateFocusedWindow(element)
+                        self.onEvent?(.focusedWindowChanged)
+                    case .none:
+                        self.updateFocusedWindow(nil)
+                    case .unavailable:
+                        self.needsRetry = true
+                    }
                 }
                 if self.needsRefresh {
                     self.needsRefresh = false
@@ -190,11 +203,12 @@ final class FrontmostWindowGeometryObserver {
     func retryUnavailableObservation() {
         if binding == nil, !starting, let activePID { activate(pid: activePID); return }
         if needsRetry, !refreshing { requestFocusedRefresh() }
-        if needsBindingRetry, !bindingInFlight { beginBinding() }
+        if needsBindingRetry, !bindingInFlight, !bindingAwaitingFreshFocus { beginBinding() }
     }
 
     private func updateFocusedWindow(_ next: AXElementKey?) {
-        guard next != focusedWindow else { return }
+        guard next != focusedWindow || bindingAwaitingFreshFocus else { return }
+        bindingAwaitingFreshFocus = false
         focusedWindow = next
         bindingCancellation?.cancel()
         if bindingInFlight { needsBinding = true }
@@ -227,6 +241,12 @@ final class FrontmostWindowGeometryObserver {
 
     private func handleNotification(_ element: AXElementKey, name: String) {
         if name == kAXFocusedWindowChangedNotification {
+            focusRevision &+= 1
+            if bindingInFlight || needsBindingRetry {
+                bindingCancellation?.cancel()
+                needsBinding = false
+                bindingAwaitingFreshFocus = true
+            }
             onEvent?(.focusedWindowChanged)
             requestFocusedRefresh()
         } else if name == kAXWindowCreatedNotification {
@@ -236,6 +256,7 @@ final class FrontmostWindowGeometryObserver {
             if name == kAXWindowMovedNotification || name == kAXWindowResizedNotification {
                 onEvent?(.geometryChanged)
             } else if name == kAXUIElementDestroyedNotification {
+                focusRevision &+= 1
                 onEvent?(.windowDestroyed)
                 updateFocusedWindow(nil)
                 requestFocusedRefresh()
@@ -243,14 +264,17 @@ final class FrontmostWindowGeometryObserver {
         }
     }
 
-    nonisolated private static func readFocusedWindow(pid: pid_t) -> FocusedWindowRead {
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.1)
-        var value: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value)
+    nonisolated static func readFocusedWindow(
+        pid: pid_t, accessibility: any AccessibilityOperations = NativeAccessibilityOperations()
+    ) -> FocusedWindowRead {
+        let app = accessibility.application(pid)
+        _ = accessibility.setTimeout(app, 0.1)
+        let (error, value) = accessibility.copy(app, kAXFocusedWindowAttribute as CFString)
         if error == .noValue { return .none }
         guard error == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return .unavailable }
-        return .window(AXElementKey(e: value as! AXUIElement))
+        let element = value as! AXUIElement
+        guard accessibility.pid(element) == pid else { return .unavailable }
+        return .window(AXElementKey(e: element))
     }
 
 

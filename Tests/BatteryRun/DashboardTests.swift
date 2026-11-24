@@ -31,8 +31,8 @@ let dashboardTests = [
         tracker.reconcile(history: """
         2024-01-01 11:00:00 +0000 Sleep Using Batt(Charge: 95%)
         2024-01-01 12:10:00 +0000 Wake                 Wake from sleep Using Batt(Charge: 83%)
+        2024-01-01 12:29:30 +0000 DarkWake DarkWake from sleep Using Batt(Charge: 76%)
         2024-01-01 12:30:00 +0000 Wake                 DarkWake to FullWake from sleep Using Batt(Charge: 75%)
-        2024-01-01 12:40:00 +0000 DarkWake DarkWake from sleep Using Batt(Charge: 74%)
         """, current: current)
         let model = DashboardModel(sample: current, session: tracker.session, forecastStart: tracker.forecastStart)
         try expect(model.remaining == "7h 0m" && model.fullDuration == "10h 0m", "the full wake should set the charge and elapsed time for both forecasts")

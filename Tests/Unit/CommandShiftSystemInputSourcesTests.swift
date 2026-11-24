@@ -3,35 +3,61 @@ import XCTest
 @testable import CommandShift
 
 final class SystemInputSourcesTests: XCTestCase {
-    func testSwitchForwardsTheChosenSourceAndSystemFailure() throws {
-        try MainActor.assumeIsolated {
-            let source = try XCTUnwrap(SystemInputSources.available().first)
-            var selected: TISInputSource?
-            let result = SystemInputSources.selectNext(
-                readSources: { [source] },
-                readCurrent: { nil },
-                select: { selected = $0; return -50 }
+    func testSwitchPassesTheChosenMappedSourceAndForwardsSystemFailure() {
+        MainActor.assumeIsolated {
+            var selected: [Fixture] = []
+            let current = Fixture(id: "first", value: 1)
+            let unidentifiable = Fixture(id: nil, value: 2)
+            let next = Fixture(id: "next", value: 3)
+            let later = Fixture(id: "later", value: 4)
+            let status = SystemInputSources.selectNext(
+                readSources: { _ in [current, unidentifiable, next, later] },
+                readCurrent: { Fixture(id: "first", value: 5) },
+                identifier: \.id,
+                select: { selected.append($0); return -50 }
             )
-            XCTAssertEqual(selected, source)
-            XCTAssertEqual(result, -50)
+            XCTAssertEqual(selected, [next])
+            XCTAssertEqual(status, -50)
         }
     }
 
-    func testCatalogContainsOnlyEnabledSelectableKeyboardSources() throws {
-        try MainActor.assumeIsolated {
-            let sources = SystemInputSources.available()
-            XCTAssertFalse(sources.isEmpty)
-            for source in sources {
-                XCTAssertEqual(Self.property(source, kTISPropertyInputSourceCategory) as? String, kTISCategoryKeyboardInputSource as String)
-                XCTAssertEqual(Self.property(source, kTISPropertyInputSourceIsEnabled) as? Bool, true)
-                XCTAssertEqual(Self.property(source, kTISPropertyInputSourceIsSelectCapable) as? Bool, true)
-                XCTAssertFalse(try XCTUnwrap(SystemInputSources.identifier(source)).isEmpty)
-            }
+    func testQueryRequestsOnlyEnabledSelectableKeyboardSources() {
+        MainActor.assumeIsolated {
+            var query: [String: Any]?
+            let status = SystemInputSources.selectNext(
+                readSources: { filter -> [Fixture] in query = filter as? [String: Any]; return [] },
+                readCurrent: { nil },
+                identifier: \.id,
+                select: { _ in XCTFail("Selected a source from an empty catalog"); return -50 }
+            )
+            XCTAssertEqual(query?.count, 3)
+            XCTAssertEqual(
+                query?[kTISPropertyInputSourceCategory as String] as? String,
+                kTISCategoryKeyboardInputSource as String
+            )
+            XCTAssertEqual(query?[kTISPropertyInputSourceIsEnabled as String] as? Bool, true)
+            XCTAssertEqual(query?[kTISPropertyInputSourceIsSelectCapable as String] as? Bool, true)
+            XCTAssertEqual(status, noErr)
         }
     }
 
-    private static func property(_ source: TISInputSource, _ key: CFString) -> AnyObject? {
-        guard let pointer = TISGetInputSourceProperty(source, key) else { return nil }
-        return Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue()
+    func testUnlistedCurrentUsesTheFirstIdentifiableSource() {
+        MainActor.assumeIsolated {
+            let first = Fixture(id: "first", value: 1)
+            var selected: [Fixture] = []
+            let status = SystemInputSources.selectNext(
+                readSources: { _ in [Fixture(id: nil, value: 0), first] },
+                readCurrent: { Fixture(id: "unlisted", value: 2) },
+                identifier: \.id,
+                select: { selected.append($0); return noErr }
+            )
+            XCTAssertEqual(selected, [first])
+            XCTAssertEqual(status, noErr)
+        }
+    }
+
+    private struct Fixture: Equatable {
+        let id: String?
+        let value: Int
     }
 }

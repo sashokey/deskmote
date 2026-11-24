@@ -10,14 +10,15 @@ final class BatteryMonitor: ObservableObject {
     @Published private(set) var tracker = SessionTracker()
     @Published private(set) var isReadingHistory = false
     @Published private(set) var notice: String?
-    @Published private var uncheckedForecastDate: Date?
     private(set) var chargingSession: ChargingSession?
-    var forecastStart: BatterySample? { uncheckedForecastDate == nil ? tracker.forecastStart : nil }
+    var forecastStart: BatterySample? { tracker.forecastHistoryCheckpoint == nil ? tracker.forecastStart : nil }
 
     let stateURL: URL
-    private let readSample: () -> BatterySample?
+    private let readSample: (Date) -> BatterySample?
     private var bootDate: Date?
     private let loadHistory: @Sendable () -> PowerHistory?
+    private let readClock: () -> (wall: Date, continuous: ContinuousClock.Instant)
+    private var clockAnchor: (wall: Date, continuous: ContinuousClock.Instant)?
     private var powerSource: CFRunLoopSource?
     private var timer: Timer?
     private var wakeObserver: NSObjectProtocol?
@@ -29,6 +30,8 @@ final class BatteryMonitor: ObservableObject {
     private var nextHistoryRetry: ContinuousClock.Instant?
     private var historyRetryInterval: Duration = .seconds(30)
     private var observedSleepDate: Date?
+    private var latestGapCheckpoint: Date?
+    private var firstReadingAfterGap: Date?
 
     static var defaultStateURL: URL {
         URL.applicationSupportDirectory.appending(path: "DeskMote/BatteryRun/session.json")
@@ -36,16 +39,18 @@ final class BatteryMonitor: ObservableObject {
 
     init(
         stateURL: URL = BatteryMonitor.defaultStateURL,
-        readSample: @escaping () -> BatterySample? = { BatteryReader.read() },
+        readSample: @escaping (Date) -> BatterySample? = BatteryReader.read(at:),
         bootDate: Date? = BatteryMonitor.systemBootDate(),
         loadHistory: @escaping @Sendable () -> PowerHistory? = {
             PowerHistoryLoader.run().map { PowerHistory(from: $0, before: Date()) }
-        }
+        },
+        readClock: @escaping () -> (wall: Date, continuous: ContinuousClock.Instant) = { (Date(), .now) }
     ) {
         self.stateURL = stateURL
         self.readSample = readSample
         self.bootDate = bootDate
         self.loadHistory = loadHistory
+        self.readClock = readClock
         tracker = SessionStore.load(from: stateURL) ?? SessionTracker()
     }
 
@@ -59,19 +64,16 @@ final class BatteryMonitor: ObservableObject {
     func refresh(wakeDate: Date? = nil) {
         guard !isSleeping else { return }
         if wakeDate != nil {
-            uncheckedForecastDate = nil
             nextHistoryRetry = nil
             historyRetryInterval = .seconds(30)
             historyGeneration &+= 1
             needsHistory = true
         }
-        guard let current = readSample() else {
+        let clock = readClock()
+        guard let current = readSample(clock.wall) else {
             if sample != nil {
                 historyGeneration &+= 1
                 needsHistory = true
-                if uncheckedForecastDate == nil, tracker.forecastStart != nil {
-                    uncheckedForecastDate = tracker.lastSample?.date
-                }
             }
             chargingSession = nil
             sample = nil
@@ -79,19 +81,25 @@ final class BatteryMonitor: ObservableObject {
             if let wakeDate {
                 let earliestWake = min(observedSleepDate ?? wakeDate, wakeDate)
                 tracker.markWake(at: earliestWake)
+                clearObservationGap()
                 persist()
             } else {
-                tracker.markObservationGap()
+                let checkpoint = tracker.forecastHistoryCheckpoint
+                markObservationGap()
+                if tracker.forecastHistoryCheckpoint != checkpoint { persist() }
             }
             return
         }
         let previous = tracker.lastSample
         let previousSession = tracker.session
         let previousForecastStart = tracker.forecastStart
+        let previousCheckpoint = tracker.forecastHistoryCheckpoint
         let clockMovedBackward = current.isValid && (
             previous.map { current.date < $0.date } == true ||
             tracker.wakeHistoryFloor.map { current.date < $0 } == true)
-        if clockMovedBackward {
+        let clockMovedForward = current.isValid && wallClockMovedForward(to: clock)
+        let clockAdjusted = clockMovedBackward || clockMovedForward
+        if clockAdjusted {
             let pendingWake = tracker.wakeAfterClockRollback == true
                 ? tracker.wakeHistoryFloor.flatMap { $0 <= current.date ? $0 : nil } : nil
             let liveWake = wakeDate.flatMap { $0 <= current.date ? $0 : nil }
@@ -105,27 +113,50 @@ final class BatteryMonitor: ObservableObject {
         }
         if current.mode != .charging {
             chargingSession = nil
-        } else if chargingSession == nil || wakeDate != nil || current.percent < (sample?.percent ?? 0) {
-            let observedStart = wakeDate == nil && sample.map { $0.mode != .charging } == true
+        } else if chargingSession == nil || wakeDate != nil || sample.map({ $0.hasMoreCharge(than: current) }) == true {
+            let observedStart = !clockAdjusted && wakeDate == nil && sample.map { $0.mode != .charging } == true
             chargingSession = ChargingSession(start: current, observedStart: observedStart)
         }
         sample = current
         scheduleRefresh(isCompact: current.mode == .idle)
         tracker.update(current, bootDate: bootDate, wakeDate: wakeDate)
-        if tracker.forecastStart != previousForecastStart {
-            uncheckedForecastDate = nil
+        let newObservedForecast = tracker.forecastStart != nil && tracker.forecastStart != previousForecastStart
+        if clockAdjusted || wakeDate != nil || !current.onBattery || newObservedForecast {
+            clearObservationGap()
+        } else if latestGapCheckpoint != nil, current.isValid, firstReadingAfterGap == nil {
+            firstReadingAfterGap = current.date
         }
-        if notice != nil || clockMovedBackward || wakeDate != nil || previous?.percent != current.percent || previous?.onBattery != current.onBattery ||
-            previousSession != tracker.session || previousForecastStart != tracker.forecastStart {
+        let pendingGapAdvanced = latestGapCheckpoint != nil && previous?.date != tracker.lastSample?.date
+        if notice != nil || clockAdjusted || wakeDate != nil || previous?.percent != current.percent || previous?.onBattery != current.onBattery ||
+            previousSession != tracker.session || previousForecastStart != tracker.forecastStart ||
+            previousCheckpoint != tracker.forecastHistoryCheckpoint || pendingGapAdvanced {
             persist()
         }
         if started, needsHistory { recoverHistory(automatic: true) }
     }
 
+    private func wallClockMovedForward(to now: (wall: Date, continuous: ContinuousClock.Instant)) -> Bool {
+        defer { clockAnchor = now }
+        guard let clockAnchor else { return false }
+        let elapsed = now.wall.timeIntervalSince(clockAnchor.wall)
+        return elapsed.isFinite && .seconds(elapsed) > clockAnchor.continuous.duration(to: now.continuous) + .seconds(1)
+    }
+
+    private func markObservationGap() {
+        tracker.markObservationGap()
+        latestGapCheckpoint = tracker.lastSample?.date
+        firstReadingAfterGap = nil
+    }
+
+    private func clearObservationGap() {
+        latestGapCheckpoint = nil
+        firstReadingAfterGap = nil
+    }
+
     func start() {
         guard !started else { return }
         started = true
-        if tracker.forecastStart != nil { uncheckedForecastDate = tracker.lastSample?.date }
+        markObservationGap()
         needsHistory = true
         refresh()
         powerSource = IOPSNotificationCreateRunLoopSource({ context in
@@ -140,7 +171,7 @@ final class BatteryMonitor: ObservableObject {
             MainActor.assumeIsolated {
                 self?.isSleeping = true
                 self?.observedSleepDate = Date()
-                self?.tracker.markObservationGap()
+                self?.markObservationGap()
             }
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -168,31 +199,19 @@ final class BatteryMonitor: ObservableObject {
 
     func recoverHistory(automatic: Bool = false) {
         guard !isSleeping, !isReadingHistory, sample?.onBattery == true else { return }
-        if automatic, let nextHistoryRetry, ContinuousClock.now < nextHistoryRetry { return }
+        if automatic, let nextHistoryRetry, readClock().continuous < nextHistoryRetry { return }
         isReadingHistory = true
         needsHistory = false
         let generation = historyGeneration
         let loadHistory = loadHistory
         Task { [weak self] in
-            let history = await Task.detached(priority: .utility, operation: loadHistory).value
+            let history = await PowerHistoryLoader.load(using: loadHistory)
             guard let self else { return }
             self.refresh()
             if generation == self.historyGeneration {
-                if !self.isSleeping, let history, history.hasRecords, let current = self.sample,
-                   self.uncheckedForecastDate.map(history.hasRecords(after:)) ?? true,
-                   self.tracker.wakeHistoryFloor.map(history.hasRecords(atOrAfter:)) ?? true {
-                    if let unchecked = self.uncheckedForecastDate, !history.covers(unchecked) {
-                        self.tracker.discardForecast(through: unchecked)
-                    }
-                    self.tracker.reconcile(history: history, current: current, bootDate: self.bootDate)
-                    self.uncheckedForecastDate = nil
-                    if !self.tracker.needsWakeHistory {
-                        self.nextHistoryRetry = nil
-                        self.historyRetryInterval = .seconds(30)
-                    } else {
-                        self.deferHistoryRetry()
-                    }
-                    self.persist()
+                if self.applyHistory(history), !self.tracker.needsWakeHistory {
+                    self.nextHistoryRetry = nil
+                    self.historyRetryInterval = .seconds(30)
                 } else {
                     self.deferHistoryRetry()
                 }
@@ -202,9 +221,35 @@ final class BatteryMonitor: ObservableObject {
         }
     }
 
+    private func applyHistory(_ history: PowerHistory?) -> Bool {
+        guard !isSleeping, let history, history.hasRecords, let current = sample, current.onBattery else { return false }
+        let forecastReady = !history.awaitsFullWake(since: bootDate) &&
+            (tracker.wakeHistoryFloor.map(history.hasRecords(atOrAfter:)) ?? true)
+        var reconciled = tracker
+        let unchecked = tracker.forecastHistoryCheckpoint
+        let covered = (unchecked ?? latestGapCheckpoint).map { checkpoint in
+            firstReadingAfterGap.map { history.covers(from: checkpoint, through: $0) } ?? false
+        } ?? true
+        if forecastReady, !covered, let checkpoint = latestGapCheckpoint ?? unchecked {
+            reconciled.discardForecast(through: checkpoint)
+        }
+        let interruption = reconciled.reconcile(
+            history: history, current: current, bootDate: bootDate, allowsForecastRecovery: forecastReady
+        )
+        let forecastResolved = forecastReady && (covered || reconciled.forecastStart != nil)
+        guard forecastResolved || interruption != nil else { return false }
+        if forecastResolved {
+            reconciled.forecastHistoryCheckpoint = nil
+            clearObservationGap()
+        }
+        tracker = reconciled
+        persist()
+        return forecastResolved
+    }
+
     private func deferHistoryRetry() {
         needsHistory = true
-        nextHistoryRetry = ContinuousClock.now.advanced(by: historyRetryInterval)
+        nextHistoryRetry = readClock().continuous.advanced(by: historyRetryInterval)
         historyRetryInterval = min(historyRetryInterval * 2, .seconds(300))
     }
 

@@ -170,8 +170,9 @@ final class TaskbarPresenter {
         let permitsExternal = allowsExternalProjection(revision: confirmedSpaceRevision)
         let liveUtility = permitsExternal ? [] : visibleItems().values.filter(isLiveUtility)
         renderedOnlyLiveUtility = !liveUtility.isEmpty
+        let activeItemID = runtime.effectiveActiveWindowID.flatMap { runtime.snapshot.windows[$0]?.groupID }
         let groups = TaskbarPresentation.groups(items: renderedOnlyLiveUtility ? liveUtility : items, order: order, filter: displayFilter,
-                                                optimisticStates: runtime.optimisticStatesByWindowID,
+                                                activeItemID: activeItemID,
                                                 spaces: spaces.snapshot,
                                                 utilityOnPanelDisplay: utilityOnPanelDisplay,
                                                 utilityOnActiveSpace: { runtime.utilityWindowOnActiveSpace($0) }) { item in

@@ -14,11 +14,7 @@ enum Alerts {
     }
 
     private static func present(_ alert: NSAlert) -> NSApplication.ModalResponse {
-        if #available(macOS 14, *) {
-            NSApplication.shared.activate()
-        } else {
-            NSApplication.shared.activate(ignoringOtherApps: true)
-        }
+        NSApplication.shared.activate()
         return alert.runModal()
     }
 }

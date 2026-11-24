@@ -3,11 +3,9 @@ import IOKit.hid
 import IOKit.hidsystem
 
 struct HIDDevice {
-    let id: UInt64
     let isExternalMouse: Bool
 
-    init(id: UInt64, properties: [String: Any]) {
-        self.id = id
+    init(properties: [String: Any]) {
         let transport = properties[kIOHIDTransportKey] as? String ?? ""
         let external = [kIOHIDTransportUSBValue, kIOHIDTransportBluetoothValue, kIOHIDTransportBluetoothLowEnergyValue].contains(transport)
         let builtIn = properties[kIOHIDBuiltInKey] as? Bool == true

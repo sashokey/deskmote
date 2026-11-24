@@ -34,6 +34,14 @@ final class ProcessGenerationCache<Value: Sendable>: Sendable {
     private struct Storage: Sendable {
         var entries: [pid_t: Entry] = [:]
         var sequence: UInt64 = 0
+
+        mutating func store(_ value: Value, for pid: pid_t, startTime: timeval, capacity: Int) {
+            sequence &+= 1
+            entries[pid] = Entry(startTime: startTime, value: value, sequence: sequence)
+            while entries.count > capacity, let oldest = entries.min(by: { $0.value.sequence < $1.value.sequence })?.key {
+                entries[oldest] = nil
+            }
+        }
     }
 
     private let storage = Mutex(Storage())
@@ -47,25 +55,32 @@ final class ProcessGenerationCache<Value: Sendable>: Sendable {
 
     func remember(_ value: Value, for pid: pid_t) {
         guard capacity > 0 else { return }
-        guard let start = startTime(pid) else {
-            storage.withLock { $0.entries[pid] = nil }
-            return
-        }
-        if storage.withLock({ $0.entries[pid] == nil }) { pruneExpired() }
-        storage.withLock { state in
-            state.sequence &+= 1
-            state.entries[pid] = Entry(startTime: start, value: value, sequence: state.sequence)
-            while state.entries.count > capacity, let oldest = state.entries.min(by: { $0.value.sequence < $1.value.sequence })?.key {
-                state.entries[oldest] = nil
+        let sequence = storage.withLock { $0.entries[pid]?.sequence }
+        let start = startTime(pid)
+        if sequence == nil, start != nil { pruneExpired() }
+        let wasEvicted = storage.withLock { state in
+            guard state.entries[pid]?.sequence == sequence else { return state.entries[pid] == nil }
+            if let start {
+                state.store(value, for: pid, startTime: start, capacity: capacity)
+            } else {
+                state.entries[pid] = nil
             }
+            return false
+        }
+        guard wasEvicted, let start, let current = startTime(pid), Self.matches(start, current) else { return }
+        storage.withLock { state in
+            guard state.entries[pid] == nil else { return }
+            state.store(value, for: pid, startTime: start, capacity: capacity)
         }
     }
 
     func value(for pid: pid_t) -> Value? {
+        guard let sequence = storage.withLock({ $0.entries[pid]?.sequence }) else { return nil }
         let start = startTime(pid)
         return storage.withLock { state in
-            guard let start, let entry = state.entries[pid], Self.matches(entry.startTime, start) else {
-                state.entries[pid] = nil
+            guard let entry = state.entries[pid] else { return nil }
+            guard let start, Self.matches(entry.startTime, start) else {
+                if entry.sequence == sequence { state.entries[pid] = nil }
                 return nil
             }
             return entry.value

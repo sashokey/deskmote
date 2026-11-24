@@ -24,6 +24,8 @@ enum TaskbarPresentation {
         let needsPrimaryEvidence = filter.needsPrimaryDisplayEvidence(layoutCount: spaces.layouts.count)
         return Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }).filter { _, item in
             let parked = item.status == WindowStatus.minimized.rawValue || item.status == WindowStatus.hidden.rawValue
+            if case .external = item.source, !parked,
+               !spaces.matchesExternalDisplay(item.spaceIdentity, displayUUID: item.displayUUID) { return false }
             let parkedDisplay = parked ? spaces.uniqueDisplay(for: item.spaceIdentity, among: filter.connectedUUIDs) : nil
             let physicalMatch: Bool?
             if case .utility = item.source, parkedDisplay == nil {
@@ -52,7 +54,7 @@ enum TaskbarPresentation {
     }
 
     static func groups(items: [StripItem], order: [String], filter: StripDisplayFilter,
-                       optimisticStates: [String: OptimisticWindowState],
+                       activeItemID: String?,
                        spaces: WindowSpaceSnapshot = WindowSpaceSnapshot(),
                        utilityOnPanelDisplay: (WindowID) -> Bool? = { _ in nil },
                        utilityOnActiveSpace: (WindowID) -> Bool? = { _ in nil },
@@ -68,11 +70,10 @@ enum TaskbarPresentation {
             let name = WindowDisplayTitle.bounded(appName(item))
             if members[key] == nil { groupOrder.append(key) }
             names[key] = name
-            let status = optimisticStates[item.actionWindowID]?.status.rawValue ?? item.status
             members[key, default: []].append(TaskbarWindowPresentation(
                 item: item,
                 title: WindowDisplayTitle.resolve(rawTitle: item.title, fallbackName: name),
-                isActive: status == WindowStatus.active.rawValue
+                isActive: item.id == activeItemID
             ))
         }
         return groupOrder.map {

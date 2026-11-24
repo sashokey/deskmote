@@ -27,6 +27,15 @@ class WindowLabCLITests(unittest.TestCase):
                 dict(name='close-verification', steps=steps)))
             return self.run_cli('transitionReplay', 'close-verification', cwd=root)
 
+    def run_identity_replay(self, steps, stable):
+        with tempfile.TemporaryDirectory(dir=WORK) as directory:
+            root = Path(directory)
+            scenarios = root / SCENARIOS
+            scenarios.mkdir(parents=True)
+            (scenarios / 'identity-verification.json').write_text(json.dumps(
+                dict(name='identity-verification', expectedStableIdentity=stable, steps=steps)))
+            return self.run_cli('replay', 'identity-verification', cwd=root)
+
     def test_modes_are_explicit(self):
         for args in [(), ('unknown-mode',)]:
             with self.subTest(args=args):
@@ -41,6 +50,20 @@ class WindowLabCLITests(unittest.TestCase):
                 self.assertEqual(result.returncode, 64)
                 self.assertEqual(result.stdout, '')
                 self.assertIn('Use a single quoted window selector', result.stderr)
+
+    def test_replays_reject_extra_arguments_without_running_a_scenario(self):
+        for mode, scenario in [('replay', 'minimize-restore-replay'),
+                               ('placementReplay', 'placement-permanent-hold-replay'),
+                               ('transitionReplay', 'focused-active-replay')]:
+            with self.subTest(mode=mode):
+                result = self.run_cli(mode, scenario, 'extra')
+                self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, '')
+
+    def test_observe_rejects_arguments_without_scanning(self):
+        result = self.run_cli('observe', 'extra')
+        self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, '')
 
     def test_empty_replays_cannot_pass_without_checks(self):
         for mode, contents in [
@@ -93,6 +116,133 @@ class WindowLabCLITests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn('replay scenario requires tracked endpoints', result.stderr)
+
+    def test_identity_replay_rejects_ambiguous_endpoints_for_both_comparisons(self):
+        known = dict(kind='appeared', source='coreGraphics', pid=43, cgWindowID=21,
+                     isMinimized=False)
+        unknown = dict(kind='unchanged', source='accessibility', pid=42, isMinimized=False,
+                       expectedDecision='ambiguous')
+        for stable, first, last in [(True, unknown, unknown), (False, unknown, known),
+                                    (False, known, unknown)]:
+            with self.subTest(stable=stable, first=first['source'], last=last['source']):
+                result = self.run_identity_replay([
+                    dict(label='before', observations=[first]),
+                    dict(label='after', observations=[dict(last, atSeconds=1)]),
+                ], stable=stable)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn('replay scenario requires confirmed endpoint identities', result.stderr)
+
+    def test_identity_replay_does_not_treat_an_ax_conflict_as_a_different_window(self):
+        source = ROOT / SCENARIOS / 'coarse-conflict-replay.json'
+        scenario = json.loads(source.read_text())
+        result = self.run_identity_replay(scenario['steps'][:2], stable=False)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('replay scenario requires confirmed endpoint identities', result.stderr)
+
+    def test_identity_replay_keeps_a_repeated_ax_conflict_unconfirmed(self):
+        source = ROOT / SCENARIOS / 'coarse-conflict-replay.json'
+        baseline, conflict, _ = json.loads(source.read_text())['steps']
+        observation = conflict['observations'][0]
+        repeat = dict(observation, atSeconds=2, expectedDecision='knownWindow',
+                      expectedReason='signature-replay-accessibility', expectedConfidence='medium')
+        result = self.run_identity_replay([
+            baseline, conflict, dict(label='repeat conflict', observations=[repeat]),
+        ], stable=False)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('replay scenario requires confirmed endpoint identities', result.stderr)
+
+    def test_identity_replay_requires_a_positive_exact_native_bridge(self):
+        source = ROOT / SCENARIOS / 'coarse-conflict-replay.json'
+        baseline, conflict, _ = json.loads(source.read_text())['steps']
+        observation = conflict['observations'][0]
+        minimized = dict(observation, atSeconds=2, kind='minimized', isMinimized=True,
+                         expectedDecision='knownWindow', expectedReason='minimized-side-evidence',
+                         expectedConfidence='medium')
+        native = dict(observation, atSeconds=3, source='coreGraphics', cgWindowID=21,
+                      expectedDecision=None, expectedReason=None, expectedConfidence=None)
+        repeat = dict(observation, atSeconds=5, expectedDecision=None,
+                      expectedReason=None, expectedConfidence=None)
+        cases = [dict(native, kind='appeared', bounds=baseline['observations'][0]['bounds']),
+                 dict(native, kind='appeared', bounds=None), dict(native, kind='disappeared')]
+        for candidate in cases:
+            with self.subTest(kind=candidate['kind'], bounds=candidate['bounds']):
+                result = self.run_identity_replay([
+                    baseline, conflict, dict(label='minimized', observations=[minimized]),
+                    dict(label='insufficient native evidence', observations=[candidate]),
+                    dict(label='repeat native evidence', observations=[dict(candidate, atSeconds=4)]),
+                    dict(label='repeat AX conflict', observations=[repeat]),
+                ], stable=False)
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn('replay scenario requires confirmed endpoint identities', result.stderr)
+
+    def test_identity_replay_disappearance_retires_the_previous_frame_as_positive_evidence(self):
+        source = ROOT / SCENARIOS / 'coarse-conflict-replay.json'
+        baseline, conflict, _ = json.loads(source.read_text())['steps']
+        observation = conflict['observations'][0]
+        minimized = dict(observation, atSeconds=2, kind='minimized', isMinimized=True,
+                         expectedDecision='knownWindow', expectedReason='minimized-side-evidence',
+                         expectedConfidence='medium')
+        disappeared = dict(observation, atSeconds=3, kind='disappeared', bounds='521:120:800:600',
+                           expectedDecision='knownWindow', expectedReason='frame-replay-accessibility',
+                           expectedConfidence='medium')
+        native = dict(observation, atSeconds=4, kind='appeared', source='coreGraphics', cgWindowID=21,
+                      expectedDecision=None, expectedReason=None, expectedConfidence=None)
+        for frame in [observation['bounds'], disappeared['bounds']]:
+            with self.subTest(frame=frame):
+                result = self.run_identity_replay([
+                    baseline, conflict, dict(label='minimized', observations=[minimized]),
+                    dict(label='disappeared at different frame', observations=[disappeared]),
+                    dict(label='native number after disappearance', observations=[dict(native, bounds=frame)]),
+                ], stable=False)
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn('replay scenario requires confirmed endpoint identities', result.stderr)
+
+    def test_identity_replay_accepts_an_ax_identity_after_native_confirmation(self):
+        source = ROOT / SCENARIOS / 'coarse-conflict-replay.json'
+        baseline, conflict, _ = json.loads(source.read_text())['steps']
+        observation = conflict['observations'][0]
+        minimized = dict(observation, atSeconds=2, kind='minimized', isMinimized=True,
+                         expectedDecision='knownWindow', expectedReason='minimized-side-evidence',
+                         expectedConfidence='medium')
+        native = dict(observation, atSeconds=3, kind='appeared', source='coreGraphics', cgWindowID=21,
+                      expectedDecision='knownWindow', expectedReason='restored-via-bridge',
+                      expectedConfidence='medium')
+        repeat = dict(observation, atSeconds=4, expectedDecision='knownWindow',
+                      expectedReason='signature-streak-accessibility', expectedConfidence='high')
+        result = self.run_identity_replay([
+            baseline, conflict, dict(label='minimized', observations=[minimized]),
+            dict(label='native confirmation', observations=[native]),
+            dict(label='confirmed repeat', observations=[repeat]),
+        ], stable=False)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('# final identity: ax-8001-transient-2', result.stdout)
+
+    def test_single_step_cannot_use_an_unrelated_expectation_to_accept_an_ambiguous_endpoint(self):
+        known = dict(kind='appeared', source='coreGraphics', pid=43, cgWindowID=21,
+                     isMinimized=False, expectedDecision='newWindow')
+        unknown = dict(kind='unchanged', source='accessibility', pid=42, isMinimized=False,
+                       track=True)
+        result = self.run_identity_replay([
+            dict(label='mixed observations', observations=[known, unknown]),
+        ], stable=True)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('single-step replay requires an explicit ambiguous decision for an unconfirmed endpoint',
+                      result.stderr)
+
+    def test_single_observation_can_assert_an_ambiguous_decision(self):
+        observation = dict(kind='unchanged', source='accessibility', pid=42, isMinimized=False)
+        for decision, status in [('ambiguous', 0), ('knownWindow', 1)]:
+            with self.subTest(decision=decision):
+                result = self.run_identity_replay([
+                    dict(label='observation', observations=[dict(observation, expectedDecision=decision)]),
+                ], stable=True)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
 
     def test_transition_replay_accepts_a_confirmed_pending_close(self):
         window = dict(source='coreGraphics', pid=42, cgWindowID=21, title='Fixture',
@@ -253,12 +403,16 @@ class WindowLabCLITests(unittest.TestCase):
         window = dict(source='coreGraphics', pid=42, cgWindowID=21, title='Fixture',
                       bounds='0:30:800:600', isMinimized=False)
         replacement = dict(window, cgWindowID=22, isFocusedWindow=True)
-        for appearance in ('appeared', 'restored'):
+        for disappearance, appearance in (('minimized', 'restored'), ('hidden', 'unhidden')):
             with self.subTest(appearance=appearance):
                 result = self.run_transition_replay([
                     dict(label='baseline', observation=dict(window, kind='appeared'), expectedStatus='inactive'),
                     dict(label='old close request', observation=dict(window, kind='unchanged', atSeconds=0.5),
                          trackCloseAtSeconds=0.5, expectedStatus='inactive'),
+                    dict(label='old window parked',
+                         observation=dict(window, source='accessibility', cgWindowID=None, kind=disappearance,
+                                          isMinimized=disappearance == 'minimized', atSeconds=0.6),
+                         expectedStatus=disappearance),
                     dict(label='new native window', observation=dict(replacement, kind=appearance, atSeconds=0.75),
                          expectedStatus='active'),
                     dict(label='new close request', observation=dict(replacement, kind='unchanged', atSeconds=0.9),

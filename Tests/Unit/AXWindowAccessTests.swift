@@ -1,5 +1,6 @@
 import ApplicationServices
 import Combine
+import Synchronization
 import XCTest
 
 final class ExternalWindowGeometryTests: XCTestCase {
@@ -201,6 +202,125 @@ final class PublishedWindowInventoryTests: XCTestCase {
         XCTAssertEqual(access.scalarWindowAttributes, [kAXRoleAttribute as String])
     }
 
+    func testInventoryRecoversTransientBatchGeometryAndWindowRolesThroughScalarReads() throws {
+        let required = [kAXPositionAttribute, kAXSizeAttribute, kAXRoleAttribute, kAXSubroleAttribute].map { $0 as String }
+        let access = BatchedInventoryFixture(fieldErrors: Dictionary(uniqueKeysWithValues: required.map { ($0, .cannotComplete) }))
+        let result = AXWindowReader(accessibility: access).inventoryWindows(forPID: -41000, messagingTimeout: 0.1)
+        let window = try XCTUnwrap(result.windowsOrEmpty.first)
+        XCTAssertEqual(window.bounds, CGRect(x: 0, y: 30, width: 1920, height: 1050))
+        XCTAssertEqual(window.role, kAXWindowRole as String)
+        XCTAssertEqual(window.subrole, kAXStandardWindowSubrole as String)
+        XCTAssertEqual(access.scalarWindowAttributes, required)
+    }
+
+    func testInventoryReturnsUnreadWhenRequiredAttributesRemainUnavailable() {
+        for attribute in [kAXPositionAttribute, kAXSizeAttribute, kAXRoleAttribute, kAXSubroleAttribute].map({ $0 as String }) {
+            for result in [AXError.success, .notImplemented] {
+                let access = BatchedInventoryFixture(result: result, fieldErrors: [attribute: .cannotComplete],
+                                                     scalarErrors: [attribute: .cannotComplete])
+                guard case .unread(.cannotComplete) = AXWindowReader(accessibility: access)
+                    .inventoryWindows(forPID: -41000, messagingTimeout: 0.1) else {
+                    XCTFail("Expected unread inventory after \(attribute) failed for batch status \(result)")
+                    continue
+                }
+                XCTAssertEqual(access.scalarWindowAttributes.filter { $0 == attribute }.count, 1)
+            }
+        }
+    }
+
+    func testUnsupportedSubroleRemainsAbsentWithoutScalarReads() throws {
+        let access = BatchedInventoryFixture(fieldErrors: [kAXSubroleAttribute as String: .attributeUnsupported])
+        let result = AXWindowReader(accessibility: access).inventoryWindows(forPID: -41000, messagingTimeout: 0.1)
+        XCTAssertNil(try XCTUnwrap(result.windowsOrEmpty.first).subrole)
+        XCTAssertTrue(access.scalarWindowAttributes.isEmpty)
+    }
+
+    func testInventoryRetainsConfirmedMinimizeWhenGeometryIsTemporarilyUnread() throws {
+        let position = kAXPositionAttribute as String
+        let access = BatchedInventoryFixture(fieldErrors: [position: .cannotComplete], scalarErrors: [position: .cannotComplete])
+        access.desktop.state.withLock { $0.windows[1001]?.status = .minimized }
+        let result = AXWindowReader(accessibility: access).inventoryWindows(forPID: -41000, messagingTimeout: 0.1)
+        let window = try XCTUnwrap(result.windowsOrEmpty.first)
+        XCTAssertEqual(window.isMinimizedRead, true)
+        XCTAssertNil(window.bounds)
+    }
+
+    func testInventoryRecoversMalformedSuccessfulBatchFieldsWithCorrectScalarTypes() throws {
+        let names = [kAXMinimizedAttribute, kAXTitleAttribute, kAXPositionAttribute, kAXSizeAttribute,
+                     kAXRoleAttribute, kAXSubroleAttribute]
+        var point = CGPoint(x: 10, y: 20)
+        let pointValue = try XCTUnwrap(AXValueCreate(.cgPoint, &point))
+        let malformed: [CFTypeRef] = [NSNumber(value: 1), NSNumber(value: 1), NSNumber(value: 1), pointValue,
+                                     NSNumber(value: 1), NSNumber(value: 1)]
+        let access = BatchedInventoryFixture(fieldValues: Dictionary(uniqueKeysWithValues: zip(names, malformed)))
+        let window = try XCTUnwrap(AXWindowReader(accessibility: access).inventoryWindows(forPID: -41000, messagingTimeout: 0.1)
+            .windowsOrEmpty.first)
+        XCTAssertEqual(window.isMinimizedRead, false)
+        XCTAssertEqual(window.title, "editor-a")
+        XCTAssertEqual(window.role, kAXWindowRole)
+        XCTAssertEqual(window.subrole, kAXStandardWindowSubrole)
+        XCTAssertEqual(window.bounds, CGRect(x: 0, y: 30, width: 1920, height: 1050))
+        XCTAssertEqual(access.scalarWindowAttributes, names)
+    }
+
+    func testMalformedScalarSubroleDoesNotConfirmAnAbsentSubrole() {
+        let malformed: [String: CFTypeRef] = [kAXSubroleAttribute: NSNumber(value: 1)]
+        for batchStatus: AXError in [.success, .notImplemented] {
+            let access = BatchedInventoryFixture(result: batchStatus, fieldValues: malformed, scalarValues: malformed)
+            let result = AXWindowReader(accessibility: access).inventoryWindows(forPID: -41000, messagingTimeout: 0.1)
+            guard case .unread(.failure) = result else { return XCTFail("Malformed subrole was accepted as absent") }
+            XCTAssertEqual(access.scalarWindowAttributes.filter { $0 == kAXSubroleAttribute }.count, 1)
+        }
+    }
+
+    @MainActor
+    func testFocusReadUptimeReflectsSampleBeforeOwnerValidation() async throws {
+        for investigateInventory in [false, true] {
+            let desktop = BehaviorDesktop()
+            let gate = BehaviorReadGate(attribute: "owner")
+            desktop.state.withLock {
+                $0.beforeOwnerRead = { id in
+                    if id == 1001 { gate.read("owner") }
+                }
+            }
+            let reader = AXWindowReader(accessibility: desktop)
+            let read: @Sendable () -> (id: CGWindowID?, time: TimeInterval?) = {
+                if investigateInventory {
+                    let windows = reader.inventoryWindows(forPID: -41000, messagingTimeout: 0.5).windowsOrEmpty
+                    let focused = windows.first(where: \.isFocusedWindow)
+                    return (focused?.cgWindowID, focused?.focusReadUptime)
+                }
+                let focus = reader.focusedWindowRead(forPID: -41000, messagingTimeout: 0.5, cancellation: OperationCancellation())
+                guard case .window(let id) = focus.result else { return (nil, nil) }
+                return (id, focus.observedAt)
+            }
+            let firstRead = Task.detached { read() }
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !gate.entered.withLock({ $0 }), ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertTrue(gate.entered.withLock { $0 })
+            desktop.state.withLock { $0.focused = 1002 }
+            let newer = read()
+            gate.release.signal()
+            let older = await firstRead.value
+
+            XCTAssertFalse(gate.timedOut.withLock { $0 })
+            XCTAssertEqual(older.id, 1001)
+            XCTAssertEqual(newer.id, 1002)
+            XCTAssertLessThan(try XCTUnwrap(older.time), try XCTUnwrap(newer.time))
+        }
+    }
+
+    func testBatchRecoveryCannotStartAfterItsReadBudgetExpires() {
+        let uptime = Mutex<TimeInterval>(0)
+        let access = BatchedInventoryFixture(fieldErrors: [kAXSubroleAttribute as String: .cannotComplete],
+            afterBatchRead: { uptime.withLock { $0 = 1 } })
+        let budget = OperationReadBudget(maximumDuration: 1, cancellation: OperationCancellation(), uptime: { uptime.withLock { $0 } })
+        let result = AXWindowReader(accessibility: access).withOperationBudget(budget)
+            .inventoryWindows(forPID: -41000, messagingTimeout: 0.1)
+        guard case .unread(.cannotComplete) = result else { return XCTFail("Expected an expired budget") }
+        XCTAssertTrue(access.scalarWindowAttributes.isEmpty)
+    }
+
     func testFocusedWindowSurvivesAnEmptyPublishedList() {
         let desktop = BehaviorDesktop()
         desktop.state.withLock { $0.enumeratedWindows[-41000] = [] }
@@ -242,6 +362,45 @@ final class PublishedWindowInventoryTests: XCTestCase {
         let result = AXWindowReader(accessibility: desktop).inventoryWindows(forPID: -41000, messagingTimeout: 0.1)
         XCTAssertEqual(result.windowsOrEmpty.compactMap(\.cgWindowID), [1002])
         XCTAssertEqual(result.windowsOrEmpty.map(\.isFocusedWindow), [false])
+        XCTAssertNil(result.windowsOrEmpty.first?.focusReadUptime)
+    }
+
+    func testInventoryPublishesFocusEvidenceOnlyForAnOwnedWindowOrConfirmedAbsence() throws {
+        let access = BatchedInventoryFixture()
+        let reader = AXWindowReader(accessibility: access)
+        func snapshot() throws -> AXWindowSnapshot {
+            try XCTUnwrap(reader.inventoryWindows(forPID: -41000, messagingTimeout: 0.1).windowsOrEmpty.first)
+        }
+
+        let focused = try snapshot()
+        XCTAssertTrue(focused.isFocusedWindow)
+        XCTAssertNotNil(focused.focusReadUptime)
+
+        access.desktop.state.withLock { $0.focused = nil }
+        let absent = try snapshot()
+        XCTAssertFalse(absent.isFocusedWindow)
+        XCTAssertNotNil(absent.focusReadUptime)
+
+        _ = access.desktop.state.withLock { $0.unreadFocusedWindows.insert(-41000) }
+        XCTAssertNil(try snapshot().focusReadUptime)
+        _ = access.desktop.state.withLock { $0.unreadFocusedWindows.remove(-41000) }
+
+        let malformed: [CFTypeRef] = ["not an element" as CFString, kCFNull]
+        for value in malformed {
+            access.focusedValue = value
+            XCTAssertNil(try snapshot().focusReadUptime)
+            XCTAssertNil(reader.focusedWindow(forPID: -41000))
+        }
+    }
+
+    func testFocusedWindowElementRejectsAnUnreadOrForeignOwner() throws {
+        let desktop = BehaviorDesktop()
+        let reader = AXWindowReader(accessibility: desktop)
+        XCTAssertEqual(desktop.number(try XCTUnwrap(reader.focusedWindow(forPID: -41000))), 1001)
+        _ = desktop.state.withLock { $0.unreadOwners.insert(1001) }
+        XCTAssertNil(reader.focusedWindow(forPID: -41000))
+        desktop.state.withLock { $0.publishedFocusedWindows[-41000] = 2001 }
+        XCTAssertNil(reader.focusedWindow(forPID: -41000))
     }
 
     func testUnreadListDoesNotBecomeASuccessfulPartialInventory() {
@@ -284,6 +443,12 @@ private final class BatchedInventoryFixture: AccessibilityOperations, @unchecked
     let result: AXError
     let titleError: AXError?
     let nullRole: Bool
+    let fieldErrors: [String: AXError]
+    let scalarErrors: [String: AXError]
+    let fieldValues: [String: CFTypeRef]
+    let scalarValues: [String: CFTypeRef]
+    let afterBatchRead: () -> Void
+    var focusedValue: CFTypeRef?
     private let windowAttributes = Set([
         kAXMinimizedAttribute, kAXTitleAttribute, kAXPositionAttribute, kAXSizeAttribute,
         kAXRoleAttribute, kAXSubroleAttribute,
@@ -291,10 +456,18 @@ private final class BatchedInventoryFixture: AccessibilityOperations, @unchecked
     private(set) var batches = 0
     private(set) var scalarWindowAttributes: [String] = []
 
-    init(result: AXError = .success, titleError: AXError? = nil, nullRole: Bool = false) {
+    init(result: AXError = .success, titleError: AXError? = nil, nullRole: Bool = false,
+         fieldErrors: [String: AXError] = [:], scalarErrors: [String: AXError] = [:],
+         fieldValues: [String: CFTypeRef] = [:], scalarValues: [String: CFTypeRef] = [:],
+         afterBatchRead: @escaping () -> Void = {}) {
         self.result = result
         self.titleError = titleError
         self.nullRole = nullRole
+        self.fieldErrors = fieldErrors
+        self.scalarErrors = scalarErrors
+        self.fieldValues = fieldValues
+        self.scalarValues = scalarValues
+        self.afterBatchRead = afterBatchRead
         desktop.state.withLock { $0.enumeratedWindows[-41000] = [1001] }
     }
 
@@ -312,7 +485,11 @@ private final class BatchedInventoryFixture: AccessibilityOperations, @unchecked
     }
 
     func copy(_ element: AXUIElement, _ attribute: CFString) -> (AXError, CFTypeRef?) {
-        if windowAttributes.contains(attribute as String) { scalarWindowAttributes.append(attribute as String) }
+        let name = attribute as String
+        if windowAttributes.contains(name) { scalarWindowAttributes.append(name) }
+        if let error = scalarErrors[name] { return (error, nil) }
+        if let value = scalarValues[name] { return (.success, value) }
+        if name == kAXFocusedWindowAttribute as String, let focusedValue { return (.success, focusedValue) }
         return desktop.copy(element, attribute)
     }
 
@@ -320,7 +497,10 @@ private final class BatchedInventoryFixture: AccessibilityOperations, @unchecked
         batches += 1
         guard result == .success else { return (result, nil) }
         XCTAssertEqual(Set(attributes), windowAttributes)
+        defer { afterBatchRead() }
         return (.success, attributes.map { attribute in
+            if var error = fieldErrors[attribute] { return AXValueCreate(.axError, &error)! }
+            if let value = fieldValues[attribute] { return value }
             switch attribute {
             case kAXTitleAttribute as String:
                 if var titleError {
@@ -1579,7 +1759,8 @@ final class WindowLabInputTests: XCTestCase {
         ) -> AnalyzedObservation {
             AnalyzedObservation(
                 observation: observation(kind: kind, source: source, cgWindowID: cgWindowID, pid: pid, title: "Open"),
-                identity: IdentityDecision(kind: decisionKind, windowID: windowID, confidence: .high, reason: "Fixture")
+                identity: IdentityDecision(kind: decisionKind, windowID: windowID, confidence: .high,
+                                           reason: "Fixture", isConfirmed: decisionKind != .ambiguous)
             )
         }
         let mismatches = [
@@ -1601,6 +1782,89 @@ final class WindowLabInputTests: XCTestCase {
                        renumbered.observation)
     }
 
+    func testNativeCGAppearanceRebindsOnlyWithPositiveRestorationProof() throws {
+        let now = Date(timeIntervalSince1970: 100)
+        let bounds = CGRect(x: 0, y: 30, width: 800, height: 600)
+        func nativeWindow(_ number: CGWindowID) -> CoreGraphicsSource.WindowSnapshot {
+            .init(cgWindowID: number, pid: 42, bundleIdentifier: "example.app", appName: "Fixture",
+                  title: "Open", bounds: bounds)
+        }
+
+        for confirmed in [Set<CGWindowID>(), [22], [22, 23]] {
+            var source = CoreGraphicsSource()
+            let engine = WindowIdentityEngine()
+            let initial = try XCTUnwrap(source.observations(from: [nativeWindow(21)], at: now).first)
+            let baseline = engine.identify(observation: initial)
+            let record = WindowRecord(id: baseline.windowID, appID: AppID(rawValue: "example.app"), pid: 42,
+                bundleIdentifier: "example.app", title: "Open", bounds: bounds, status: .inactive, cgWindowID: 21)
+            let disappeared = try XCTUnwrap(source.observations(from: [], at: now.addingTimeInterval(1)).first)
+            XCTAssertEqual(disappeared.kind, .disappeared)
+            XCTAssertEqual(engine.identify(observation: disappeared).windowID, baseline.windowID)
+            let current = source.observations(from: [nativeWindow(22), nativeWindow(23)], at: now.addingTimeInterval(2))
+            XCTAssertEqual(current.map(\.kind), [.appeared, .appeared])
+
+            let resolved = WindowLabInput.analyzeRestoration(current, for: record, using: engine, confirmsWindow: confirmed.contains)
+            let first = try XCTUnwrap(resolved.observations.first)
+            let second = try XCTUnwrap(resolved.observations.last)
+            XCTAssertEqual(first.observation.kind, .appeared)
+            XCTAssertNotEqual(second.identity.windowID, baseline.windowID)
+            if confirmed == [22] {
+                XCTAssertEqual(resolved.match?.identity.windowID, baseline.windowID)
+                XCTAssertEqual(first.identity.windowID, baseline.windowID)
+            } else {
+                XCTAssertNil(resolved.match)
+                XCTAssertNotEqual(first.identity.windowID, baseline.windowID)
+            }
+        }
+    }
+
+    func testConfirmedRestoreReservesItsIdentityBeforeAnEarlierRowReusesTheOldCGNumber() throws {
+        let now = Date(timeIntervalSince1970: 100)
+        let bounds = CGRect(x: 0, y: 30, width: 800, height: 600)
+        func nativeWindow(_ number: CGWindowID) -> CoreGraphicsSource.WindowSnapshot {
+            .init(cgWindowID: number, pid: 42, bundleIdentifier: "example.app", appName: "Fixture",
+                  title: "Open", bounds: bounds)
+        }
+
+        for reusesOldNumber in [false, true] {
+            var source = CoreGraphicsSource()
+            let engine = WindowIdentityEngine()
+            let initial = try XCTUnwrap(source.observations(from: [nativeWindow(21)], at: now).first)
+            let baseline = engine.identify(observation: initial)
+            let record = WindowRecord(id: baseline.windowID, appID: AppID(rawValue: "example.app"), pid: 42,
+                bundleIdentifier: "example.app", title: "Open", bounds: bounds, status: .inactive, cgWindowID: 21)
+            let disappeared = try XCTUnwrap(source.observations(from: [], at: now.addingTimeInterval(1)).first)
+            _ = engine.identify(observation: disappeared)
+            let current = reusesOldNumber ? [nativeWindow(21), nativeWindow(22)] : [nativeWindow(22)]
+            let cgRows = source.observations(from: current, at: now.addingTimeInterval(2))
+            XCTAssertTrue(cgRows.allSatisfy { $0.kind == .appeared })
+            let lateAX = observation(kind: .disappeared, cgWindowID: 21, title: "Open", bounds: bounds)
+
+            let resolved = WindowLabInput.analyzeRestoration(cgRows + [lateAX], for: record, using: engine) { $0 == 22 }
+            XCTAssertEqual(resolved.match?.identity.windowID, baseline.windowID)
+            XCTAssertEqual(resolved.observations.map(\.observation.cgWindowID), reusesOldNumber ? [21, 22] : [22])
+            XCTAssertEqual(Set(resolved.observations.map(\.identity.windowID)).count, cgRows.count)
+            if reusesOldNumber {
+                XCTAssertNotEqual(resolved.observations.first?.identity.windowID, baseline.windowID)
+            }
+        }
+    }
+
+    func testConfirmedRestorePreservesAnotherAlreadyBoundCGSeat() {
+        let engine = WindowIdentityEngine()
+        let baseline = observation(kind: .appeared, source: .coreGraphics, cgWindowID: 21, title: "Open")
+        let previous = engine.identify(observation: baseline)
+        let record = WindowRecord(id: previous.windowID, appID: AppID(rawValue: "example.app"), pid: 42,
+            bundleIdentifier: "example.app", title: "Open", bounds: baseline.bounds, status: .inactive, cgWindowID: 21)
+        let other = observation(kind: .appeared, source: .coreGraphics, cgWindowID: 22, title: "Open")
+        let existing = engine.identify(observation: other)
+
+        let resolved = WindowLabInput.analyzeRestoration([baseline, other], for: record, using: engine) { $0 == 22 }
+        XCTAssertNil(resolved.match)
+        XCTAssertNotEqual(existing.windowID, previous.windowID)
+        XCTAssertEqual(resolved.observations.map(\.identity.windowID), [previous.windowID, existing.windowID])
+    }
+
     func testWindowLabEscapesOutputWithoutChangingTheInputTitle() {
         let title = "First\r\nSecond\nThird\u{2028}Fourth\t\u{001B}"
         let line = WindowLabInput.diagnosticLine(title)
@@ -1613,6 +1877,10 @@ final class WindowLabInputTests: XCTestCase {
     func testMissingAndUnknownModesFailWithoutStartingObservation() {
         for args in [[], ["typo"], ["--help"]] as [[String]] { XCTAssertThrowsError(try WindowLabInput.mode(args)) }
         XCTAssertEqual(try WindowLabInput.mode(["observe"]), .observe)
+    }
+
+    func testObserveRejectsExtraArgumentsBeforeStartingObservation() {
+        XCTAssertThrowsError(try WindowLabInput.mode(["observe", "extra"]))
     }
 
     func testScenarioNamesCannotEscapeTheScenarioDirectory() {

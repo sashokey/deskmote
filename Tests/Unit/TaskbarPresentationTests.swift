@@ -11,10 +11,10 @@ final class TaskbarPresentationTests: XCTestCase {
     }
 
     private func groups(_ items: [StripItem], order: [String], scope: String? = "left",
-                        optimistic: [String: OptimisticWindowState] = [:]) -> [TaskbarGroupPresentation] {
+                        active: String? = nil) -> [TaskbarGroupPresentation] {
         TaskbarPresentation.groups(items: items, order: order,
                                     filter: StripDisplayFilter(scope: scope, connectedUUIDs: ["left", "right"], primaryUUID: "left"),
-                                    optimisticStates: optimistic, appName: { $0.appID })
+                                    activeItemID: active, appName: { $0.appID })
     }
 
     func testCollidingBundleIdentifiersFromDifferentBundlesStaySeparate() {
@@ -90,10 +90,10 @@ final class TaskbarPresentationTests: XCTestCase {
     func testActivationAndMinimizationDoNotReorderSiblings() {
         let base = [item("first"), item("second", status: .active), item("third", status: .minimized)]
         let order = ["first", "second", "third"]
-        let before = groups(base, order: order)
-        let after = groups(base, order: order, optimistic: ["third": OptimisticWindowState(status: .active, createdAt: Date())])
+        let before = groups(base, order: order, active: "second")
+        let after = groups(base, order: order, active: "third")
         XCTAssertEqual(before[0].windows.map(\.id), after[0].windows.map(\.id))
-        XCTAssertTrue(after[0].windows[2].isActive)
+        XCTAssertEqual(after.flatMap(\.windows).filter(\.isActive).map(\.id), ["third"])
     }
 
     func testExternalWindowNamedDeskMotePreservesItsTitle() {
@@ -131,7 +131,7 @@ final class TaskbarPresentationTests: XCTestCase {
             memberships: Dictionary(uniqueKeysWithValues: items.map { ($0.spaceIdentity!, Set([$0.id == "fullscreen" ? 2 : 1])) }))
         let result = TaskbarPresentation.groups(items: items, order: items.map(\.id),
             filter: StripDisplayFilter(scope: "left", connectedUUIDs: ["left"], primaryUUID: "left"),
-            optimisticStates: [:], spaces: spaces, appName: { $0.appID })
+            activeItemID: nil, spaces: spaces, appName: { $0.appID })
         XCTAssertEqual(result[0].windows.map(\.id), ["a", "b"])
         let button = TaskbarButtonLayout(id: "group:editor", groupID: result[0].id, windowIDs: result[0].windows.map(\.id), isCombined: true, frame: .zero)
         XCTAssertEqual(TaskbarContextMenuModel.actions(button: button, group: result[0]), [.closeWindows(["a", "b"]), .quitApplication])

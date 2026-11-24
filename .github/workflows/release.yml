@@ -245,11 +245,13 @@ jobs:
             const crypto = require('node:crypto');
             const version = process.env.RELEASE_VERSION;
             const sourceSHA = process.env.RELEASE_SOURCE_SHA || context.sha;
+            const resume = process.env.RELEASE_RESUME === 'true';
+            const prerelease = process.env.RELEASE_PRERELEASE === 'true';
             const names = ['DeskMote-' + version + '.zip'];
             const packageName = names[0];
             const packageBytes = await fs.readFile('dist/' + packageName);
             const checksum = crypto.createHash('sha256').update(packageBytes).digest('hex');
-            if (process.env.RELEASE_RESUME !== 'true' && checksum !== process.env.RELEASE_ZIP_SHA256) {
+            if (!resume && checksum !== process.env.RELEASE_ZIP_SHA256) {
               throw new Error('Checksum mismatch: ' + packageName);
             }
             const releases = await github.paginate(github.rest.repos.listReleases, {
@@ -276,10 +278,16 @@ jobs:
                 throw new Error('Release tag points to a different commit');
               }
             }
+            function requireExpectedRelease(result) {
+              if (result.tag_name !== version || result.name !== version || result.prerelease !== prerelease) {
+                throw new Error('GitHub returned unexpected release metadata');
+              }
+            }
             try {
               await requireExpectedTag();
             } catch (error) {
               if (error.status !== 404) throw error;
+              if (resume) throw new Error('Resumed release does not have its original tag');
               if (release) throw new Error('Existing release does not have its original tag');
               try {
                 await github.rest.git.createRef({ ...context.repo, ref: 'refs/' + tagRef, sha: sourceSHA });
@@ -288,28 +296,30 @@ jobs:
               }
               await requireExpectedTag();
             }
-            if (release && (release.name !== version || release.prerelease !== (process.env.RELEASE_PRERELEASE === 'true'))) {
-              throw new Error('Existing release metadata does not match the tested source');
-            }
             if (release && !release.draft && process.env.RELEASE_DRAFT === 'true') {
               throw new Error('Existing release is already published');
             }
-            if (!release) ({ data: release } = await github.rest.repos.createRelease({
-              ...context.repo,
-              tag_name: version,
-              name: version,
-              draft: true,
-              prerelease: process.env.RELEASE_PRERELEASE === 'true',
-              generate_release_notes: true,
-              body: [
-                process.env.RELEASE_NOTES,
-                'Apple Silicon app for macOS 27 or later. Ad-hoc signed.',
-                'The installable app ZIP is attached.',
-                "Source is available through GitHub's standard Source code archives for this release tag.",
-                'Mac acceptance checklist: https://github.com/' + context.repo.owner + '/' + context.repo.repo
-                  + '/blob/' + sourceSHA + '/AGENTS.md'
-              ].filter(Boolean).join('\n\n')
-            }));
+            if (!release) {
+              ({ data: release } = await github.rest.repos.createRelease({
+                ...context.repo,
+                tag_name: version,
+                target_commitish: sourceSHA,
+                name: version,
+                draft: true,
+                prerelease,
+                generate_release_notes: true,
+                body: [
+                  process.env.RELEASE_NOTES,
+                  'Apple Silicon app for macOS 27 or later. Ad-hoc signed.',
+                  'The installable app ZIP is attached.',
+                  "Source is available through GitHub's standard Source code archives for this release tag.",
+                  'Mac acceptance checklist: https://github.com/' + context.repo.owner + '/' + context.repo.repo
+                    + '/blob/' + sourceSHA + '/AGENTS.md'
+                ].filter(Boolean).join('\n\n')
+              }));
+              await requireExpectedTag();
+            }
+            requireExpectedRelease(release);
             if (release.assets.some(asset => !names.includes(asset.name))) {
               throw new Error('Existing release contains unexpected assets');
             }
@@ -337,9 +347,12 @@ jobs:
             }
             await requireExpectedTag();
             if (process.env.RELEASE_DRAFT !== 'true' && release.draft) {
-              await github.rest.repos.updateRelease({
-                ...context.repo, release_id: release.id, draft: false
-              });
+              ({ data: release } = await github.rest.repos.updateRelease({
+                ...context.repo, release_id: release.id, target_commitish: sourceSHA, draft: false
+              }));
+              await requireExpectedTag();
+              requireExpectedRelease(release);
+              if (release.draft) throw new Error('GitHub left the release as a draft');
             }
             core.summary.addLink(version, release.html_url);
             await core.summary.write();

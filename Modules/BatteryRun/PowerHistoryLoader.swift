@@ -2,6 +2,14 @@ import Foundation
 import Darwin
 
 enum PowerHistoryLoader {
+    private static let queue = DispatchQueue(label: "DeskMote.BatteryRun.PowerHistory", qos: .utility)
+
+    static func load(using read: @escaping @Sendable () -> PowerHistory?) async -> PowerHistory? {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: read()) }
+        }
+    }
+
     static func run(executable: URL = URL(fileURLWithPath: "/usr/bin/pmset"), arguments: [String] = ["-g", "log"], timeout: TimeInterval = 5, limit: Int = 16 * 1024 * 1024) -> String? {
         guard timeout > 0, limit > 0 else { return nil }
         let process = Process()

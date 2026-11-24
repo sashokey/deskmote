@@ -41,8 +41,24 @@ let historyTests = [
         let stale = PowerHistory(from: first, before: current.date)
         let spanning = PowerHistory(from: first + "\n2024-01-01 12:45:00 +0000 Wake Wake from sleep Using Batt(Charge: 70%)",
                                     before: current.date)
-        try expect(!stale.covers(checkpoint), "a log ending before the observation cannot cover the gap")
-        try expect(spanning.covers(checkpoint), "observations both before and after the checkpoint cover the gap")
+        let resumed = checkpoint.addingTimeInterval(600)
+        try expect(!stale.covers(from: checkpoint, through: resumed), "a log ending before the observation cannot cover the gap")
+        try expect(spanning.covers(from: checkpoint, through: resumed), "observations before and after the gap cover its bounds")
+    },
+    TestCase(name: "wake requests bound coverage at their journal time without becoming wake evidence") {
+        let current = historyCurrent()
+        let checkpoint = current.date.addingTimeInterval(-2400)
+        let resumed = current.date.addingTimeInterval(-1800)
+        let partial = """
+        2024-01-01 12:00:00 +0000 Wake Wake from sleep Using Batt (Charge: 80%)
+        2024-01-01 12:25:00 +0000 Wake Requests   [process=powerd request=Maintenance deltaSecs=1800 wakeAt=2024-01-01 12:55:00]
+        """
+        let pending = PowerHistory(from: partial, before: current.date)
+        try expect(!pending.covers(from: checkpoint, through: resumed), "the scheduled payload must not extend the journal")
+        let spanning = PowerHistory(from: partial + "\n2024-01-01 12:40:00 +0000 Wake Requests\t[process=powerd request=Maintenance deltaSecs=1200 wakeAt=2024-01-01 13:00:00]",
+                                    before: current.date)
+        try expect(spanning.covers(from: checkpoint, through: resumed), "the emitted event timestamp can extend journal coverage")
+        try expect(!spanning.hasRecords(atOrAfter: resumed), "a wake request is not an observed wake or power reading")
     },
     TestCase(name: "an AC record later in the forecast start second clears the saved baseline") {
         let current = historyCurrent(70)

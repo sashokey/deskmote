@@ -64,12 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         displayTableProvider: { [displayTopologyStore] in displayTopologyStore.table }
     )
     lazy var stripOrderStore = StripOrderStore(inventoryLog: inventoryLog)
-    let settingsStore: AppSettingsStore
     private var panelCoordinator: TaskbarScreenOrchestrator?
     private var windowLiftAvoidanceController: WindowLiftAvoidanceController?
     private lazy var launchAtLoginService = LaunchAtLoginService()
     private lazy var settingsCoordinator = SettingsCoordinator(
-        store: settingsStore,
         launchAtLoginService: launchAtLoginService
     )
     private var startupTask: Task<Void, Never>?
@@ -111,11 +109,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override convenience init() { self.init(environment: ApplicationEnvironment()) }
 
     init(environment: ApplicationEnvironment, runtime: AppRuntime? = nil,
-         displayTopologyStore: DisplayTopologyStore? = nil, settingsStore: AppSettingsStore? = nil,
+         displayTopologyStore: DisplayTopologyStore? = nil,
          stripOrderStore: StripOrderStore? = nil) {
         self.environment = environment
         self.displayTopologyStore = displayTopologyStore ?? DisplayTopologyStore(initialSnapshot: DisplayIdentity.topologySnapshot())
-        self.settingsStore = settingsStore ?? AppSettingsStore()
         super.init()
         if let runtime { self.runtime = runtime }
         if let stripOrderStore { self.stripOrderStore = stripOrderStore }

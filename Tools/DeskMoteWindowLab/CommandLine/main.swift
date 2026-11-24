@@ -26,6 +26,7 @@ let rawArguments = Array(CommandLine.arguments.dropFirst())
 let mode: LabMode = {
     do { return try WindowLabInput.mode(rawArguments) }
     catch WindowLabInputError.invalidSelectorArguments { fail("Use a single quoted window selector") }
+    catch WindowLabInputError.unexpectedArguments(let mode) { fail("Unexpected arguments for \(mode.rawValue)") }
     catch { fail("Specify a mode: observe, minimizeRestore, closeTarget, replay, placementReplay or transitionReplay") }
 }()
 let modeArguments = Array(rawArguments.dropFirst())
@@ -97,11 +98,17 @@ func printObservation(_ observation: SystemObservation, label: String) -> Identi
 }
 
 @MainActor
-func collectAnalyzedRealObservations() -> (observations: [AnalyzedObservation], windowInfo: [[String: Any]]?) {
+func collectRealObservations() -> (observations: [SystemObservation], windowInfo: [[String: Any]]?) {
     let cg = cgSource.observe()
     let ax = axSource.observe()
-    let finder = finderSource.observe()
-    return (analyze((cg?.observations ?? []) + ax + finder), cg?.windowInfo)
+    let finder = finderSource.observe(cgObservations: cg?.observations ?? [])
+    return ((cg?.observations ?? []) + ax + finder, cg?.windowInfo)
+}
+
+@MainActor
+func collectAnalyzedRealObservations() -> (observations: [AnalyzedObservation], windowInfo: [[String: Any]]?) {
+    let captured = collectRealObservations()
+    return (analyze(captured.observations), captured.windowInfo)
 }
 
 @MainActor
@@ -300,7 +307,8 @@ func areClose(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
 @MainActor
 func runObserveMode(rounds: Int = 3) {
     for round in 0..<rounds {
-        if let capture = cgSource.observe() {
+        let capture = cgSource.observe()
+        if let capture {
             let observations = capture.observations.filter { $0.kind != .unchanged || round > 0 }
             for observation in observations.prefix(10) {
                 printObservation(observation, label: "CG")
@@ -313,7 +321,7 @@ func runObserveMode(rounds: Int = 3) {
             for observation in axSource.observe().prefix(10) {
                 printObservation(observation, label: "AX")
             }
-            for observation in finderSource.observe().prefix(10) {
+            for observation in finderSource.observe(cgObservations: capture?.observations ?? []).prefix(10) {
                 printObservation(observation, label: "FINDER-AX")
             }
         }
@@ -460,20 +468,21 @@ func runMinimizeRestoreMode() {
     Thread.sleep(forTimeInterval: 0.8)
 
     printDiagnostic("# step 5: collect restored-state windows")
-    let restored = collectAnalyzedRealObservations()
-    printPhaseObservations(restored.observations, phase: "RESTORE")
-    printTargetDiagnostics(phase: "restored", analyzed: restored.observations, target: target)
-
+    let captured = collectRealObservations()
     let system = NativeWindowSystem()
-    let restoredMatch = WindowLabInput.restoredWindow(in: restored.observations, identity: target.baselineIdentity,
-                                                      pid: target.pid) { number in
-        guard system.generation(target.pid) == boundRecord.processGeneration,
+    let restored = WindowLabInput.analyzeRestoration(captured.observations, for: boundRecord, using: identityEngine) { number in
+        guard disappearedFromCG, let generation = boundRecord.processGeneration, system.generation(target.pid) == generation,
               system.windowDescriptions(for: [number])?.contains(where: {
                   nativeWindowNumber(in: $0) == number && $0[kCGWindowOwnerPID as String] as? pid_t == target.pid
               }) == true else { return false }
         return axActionExecutor.captureHandleByCGWindowID(number, pid: target.pid, title: nil, bounds: nil,
                                                            expectedElement: actionHandle.elementKey) != nil
+            && system.generation(target.pid) == generation
     }
+    printPhaseObservations(restored.observations, phase: "RESTORE")
+    printTargetDiagnostics(phase: "restored", analyzed: restored.observations, target: target)
+
+    let restoredMatch = restored.match
     let restoredIdentity = restoredMatch?.identity.windowID.rawValue ?? "<missing>"
     let stableIdentity = restoredMatch != nil && system.generation(target.pid) == boundRecord.processGeneration
     let confirmedReplacement = restoredMatch.map { $0.observation.cgWindowID != windowID } == true
@@ -552,6 +561,15 @@ struct ReplayScenario: Decodable {
     struct Step: Decodable {
         let label: String
         let observations: [ReplayObservation]
+
+        func tracks(_ observation: ReplayObservation) -> Bool {
+            observation.track ?? (observations.count == 1)
+        }
+
+        var trackedObservation: ReplayObservation? {
+            let tracked = observations.filter(tracks)
+            return tracked.count == 1 ? tracked.first : nil
+        }
     }
 
     struct ReplayObservation: Decodable {
@@ -639,17 +657,15 @@ func runReplayMode() {
     do { scenario = try WindowLabInput.decode(ReplayScenario.self, from: root) }
     catch { fail("Unable to read a valid scenario JSON file") }
     guard let first = scenario.steps.first, let last = scenario.steps.last,
-          [first, last].allSatisfy({ step in
-              step.observations.filter { $0.track ?? (step.observations.count == 1) }.count == 1
-          }) else {
+          let firstTrackedObservation = first.trackedObservation, last.trackedObservation != nil else {
         fputs("replay scenario requires tracked endpoints\n", stderr)
         exit(1)
     }
     printDiagnostic("# replay scenario: \(scenario.name)")
 
     var trackedKey = ""
-    var beforeIdentity = ""
-    var finalIdentity = ""
+    var beforeDecision: IdentityDecision?
+    var finalDecision: IdentityDecision?
 
     for (stepIndex, step) in scenario.steps.enumerated() {
         printDiagnostic("# step: \(step.label)")
@@ -672,14 +688,13 @@ func runReplayMode() {
                 exit(1)
             }
             let key = observation.title ?? observation.appName ?? "untitled"
-            let isTracked = replayObservation.track ?? (step.observations.count == 1)
-            if isTracked {
+            if step.tracks(replayObservation) {
                 trackedKey = key
-                if stepIndex == 0 && beforeIdentity.isEmpty {
-                    beforeIdentity = identity.windowID.rawValue
+                if stepIndex == 0 {
+                    beforeDecision = identity
                 }
                 if stepIndex == scenario.steps.count - 1 {
-                    finalIdentity = identity.windowID.rawValue
+                    finalDecision = identity
                 }
             }
         }
@@ -691,14 +706,24 @@ func runReplayMode() {
         fputs("single-step replay requires a decision expectation\n", stderr)
         exit(1)
     }
-    guard !beforeIdentity.isEmpty, !finalIdentity.isEmpty else {
+    guard let beforeDecision, let finalDecision,
+          !beforeDecision.windowID.rawValue.isEmpty, !finalDecision.windowID.rawValue.isEmpty else {
         fputs("replay scenario requires tracked endpoints\n", stderr)
         exit(1)
     }
-    let stable = beforeIdentity == finalIdentity
+    if scenario.steps.count == 1 {
+        if !beforeDecision.isConfirmed, firstTrackedObservation.expectedDecision != DecisionKind.ambiguous.rawValue {
+            fputs("single-step replay requires an explicit ambiguous decision for an unconfirmed endpoint\n", stderr)
+            exit(1)
+        }
+    } else if !beforeDecision.isConfirmed || !finalDecision.isConfirmed {
+        fputs("replay scenario requires confirmed endpoint identities\n", stderr)
+        exit(1)
+    }
+    let stable = beforeDecision.windowID == finalDecision.windowID
     printDiagnostic("# tracked key: \(trackedKey)")
-    printDiagnostic("# before identity: \(beforeIdentity)")
-    printDiagnostic("# final identity: \(finalIdentity)")
+    printDiagnostic("# before identity: \(beforeDecision.windowID.rawValue)")
+    printDiagnostic("# final identity: \(finalDecision.windowID.rawValue)")
     printDiagnostic("# stable identity: \(stable)")
     if stable != scenario.expectedStableIdentity {
         fputs("replay scenario failed\n", stderr)

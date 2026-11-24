@@ -63,7 +63,7 @@ private struct AQIProvider: AppIntentTimelineProvider {
         if let (bytes, response) = try? await session.bytes(for: request),
            (response as? HTTPURLResponse)?.statusCode == 200,
            let data = try? await collectAQIBody(bytes, limit: 4 * 1024 * 1024) {
-            reading = currentAirQuality(in: String(decoding: data, as: UTF8.self))
+            reading = currentAirQuality(in: data, textEncodingName: response.textEncodingName)
         } else {
             reading = nil
         }

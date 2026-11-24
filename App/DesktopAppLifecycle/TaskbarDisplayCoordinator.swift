@@ -22,7 +22,10 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
     private let topologySnapshotProvider: @MainActor () -> ScreenTopologySnapshot
     private let startCoordinator: (PanelCoordinator) -> Bool
     private let topologyRetryScheduler: DisplayTopologyRefreshController.ScheduleAfter
-    private let captureFullscreenCGWindows: () -> [[String: Any]]?
+    private let captureFullscreenCGWindows: @MainActor () -> [[String: Any]]?
+    private let workspaceNotifications: NotificationCenter
+    private let frontmostApplicationPID: () -> pid_t?
+    private let fullscreenUptime: @Sendable () -> TimeInterval
     #if DEBUG
     private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "taskbar-screens")
     #endif
@@ -52,7 +55,10 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
             return item
         },
-        captureFullscreenCGWindows: @escaping () -> [[String: Any]]? = PanelCoordinator.captureFullscreenCGWindows
+        captureFullscreenCGWindows: @escaping @MainActor () -> [[String: Any]]? = PanelCoordinator.captureFullscreenCGWindows,
+        workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
+        frontmostApplicationPID: @escaping () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier },
+        fullscreenUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.overlaySpaceHost = overlaySpaceHost
         self.runtime = runtime
@@ -63,6 +69,9 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         self.topologyRetryScheduler = topologyRetryScheduler
         self.startCoordinator = startCoordinator
         self.captureFullscreenCGWindows = captureFullscreenCGWindows
+        self.workspaceNotifications = workspaceNotifications
+        self.frontmostApplicationPID = frontmostApplicationPID
+        self.fullscreenUptime = fullscreenUptime
         super.init()
     }
 
@@ -74,7 +83,7 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
     }
 
     func start() {
-        guard !started else { return }
+        guard !started, !isSuspended else { return }
         started = true
         let seedController = makeTopologyRefreshController()
         topologyRefreshController = seedController
@@ -124,7 +133,15 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
                 unit.coordinator.tearDown()
             }
         }
-        units = desired.compactMap { key in survivors[key] ?? makeUnit(key: key) }
+        let initialRead = makeFullscreenReadBatch()
+        lazy var initialPID = frontmostApplicationPID()
+        units = desired.compactMap { key in
+            if let survivor = survivors[key] { return survivor }
+            guard let unit = makeUnit(key: key) else { return nil }
+            unit.coordinator.lastActiveApplicationPID = initialPID
+            unit.coordinator.triggerAsyncFullscreenCheck(source: "initial-ax", sharedRead: initialRead)
+            return unit
+        }
         #if DEBUG
         logger.info("units rebuilt reason=\(reason, privacy: .public) count=\(self.units.count, privacy: .public)")
         #endif
@@ -138,8 +155,7 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
             runtime: runtime,
             stripOrderStore: stripOrderStore,
             displayTopologyStore: displayTopologyStore,
-            spaceStore: spaceStore,
-            usesSharedFullscreenMonitor: true
+            spaceStore: spaceStore
         )
         coordinator.onRequestTaskbarMenu = onRequestTaskbarMenu
         coordinator.onAccessoryWillOpen = { [weak self] unit, kind in
@@ -204,13 +220,12 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
     }
 
     private func startFullscreenMonitoring() {
-        let notifications = NSWorkspace.shared.notificationCenter
-        fullscreenObservers.append(notifications.addObserver(
+        fullscreenObservers.append(workspaceNotifications.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.handleSpaceChange() }
         })
-        fullscreenObservers.append(notifications.addObserver(
+        fullscreenObservers.append(workspaceNotifications.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
             let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
@@ -220,30 +235,39 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         })
         fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.updateFullscreenPanels { $0.reconcileFullscreenState(sharedRead: $1) }
+                self?.reconcileFullscreenState()
             }
         }
         fullscreenTimer?.tolerance = 0.5
     }
 
     private func handleSpaceChange() {
-        lazy var windows = captureFullscreenCGWindows()
-        updateFullscreenPanels { coordinator, batch in
-            coordinator.handleSpaceChange(sharedRead: batch, readCGWindows: { windows })
-        }
+        guard started, !isSuspended, !units.isEmpty else { return }
+        overlaySpaceHost?.reconcileVisibility()
+        updateFullscreenPanels { $0.handleSpaceChange(sharedRead: $1) }
+    }
+
+    func reconcileFullscreenState() {
+        updateFullscreenPanels { $0.reconcileFullscreenState(sharedRead: $1) }
     }
 
     private func stopFullscreenMonitoring() {
         fullscreenTimer?.invalidate()
         fullscreenTimer = nil
-        fullscreenObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        fullscreenObservers.forEach { workspaceNotifications.removeObserver($0) }
         fullscreenObservers.removeAll()
     }
 
-    private func updateFullscreenPanels(_ update: (PanelCoordinator, FullscreenAXReadBatch) -> Void) {
+    private func updateFullscreenPanels(_ update: (PanelCoordinator, FullscreenReadBatch) -> Void) {
         guard started, !isSuspended, !units.isEmpty else { return }
-        let batch = FullscreenAXReadBatch(read: PanelCoordinator.readFullscreenAXObservation)
+        let batch = makeFullscreenReadBatch()
         units.forEach { update($0.coordinator, batch) }
+    }
+
+    private func makeFullscreenReadBatch() -> FullscreenReadBatch {
+        FullscreenReadBatch(uptime: fullscreenUptime, readCG: captureFullscreenCGWindows) {
+            PanelCoordinator.readFullscreenAXObservation(pid: $0)
+        }
     }
 
 }

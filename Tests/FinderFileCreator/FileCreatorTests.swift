@@ -13,16 +13,26 @@ enum FileCreatorTests {
             try testConcurrentCreation()
             try testFailsOutsideAnExistingDirectory()
             try testCreatesZIPThatMacOSCanExtract()
+            try testArchiveSkipsAnOccupiedSymbolicLinkName()
             try testRemovesIncompleteArchive()
             try testArchiveIsPublishedAfterTheWriteFinishes()
             try testArchiveRejectsAReplacedDestinationBeforePublication()
+            try testArchiveAvoidsStagingParentsThatMayPreventCleanup()
+            try testArchiveUsesProtectedTempWhenSelectedFolderDeniesDeletion()
+            try testArchiveFallsBackWhenTemporaryParentDeniesMkdir()
+            try testArchiveFallsBackWhenInheritedACLBlocksStagingAccess()
             try testArchiveCanBeCreatedWhenOnlyFilesMayBeAdded()
             try testArchiveInheritsTheDestinationACL()
             try testArchiveCanBeCreatedWhenOnlyTheParentAllowsAddingFiles()
             try testArchiveCanInheritARestrictionAgainstDeletion()
+            try testArchiveWithoutCloningPreservesInheritedPermissions()
+            try testArchiveWithoutCloningCleansUpAfterDeniedRename()
+            try testArchiveWithoutCloningReportsUnsafeHardLinkCleanup()
+            try testArchiveCleansUpWhenPathStatIsDenied()
+            try testACLPermissionMasksCoverGenericAndUnknownRights()
             try testFinderMenuHasDirectCreationCommands()
             try await Task.detached { try testRequestedFileAndFolderFollowFinderAction() }.value
-            print("15 tests passed")
+            print("25 tests passed")
         } catch {
             FileHandle.standardError.write(Data("\(error)\n".utf8))
             exit(EXIT_FAILURE)
@@ -166,8 +176,32 @@ enum FileCreatorTests {
         }
     }
 
-    private static func testRemovesIncompleteArchive() throws {
+    private static func testArchiveSkipsAnOccupiedSymbolicLinkName() throws {
         try inTemporaryDirectory { directory in
+            let link = directory.appending(path: "New Compressed (zipped) Folder.zip")
+            let manager = FileManager.default
+            try manager.createSymbolicLink(atPath: link.path, withDestinationPath: link.lastPathComponent)
+
+            let archive = try FileCreator.create(.zipArchive, in: directory)
+            try expect(archive.lastPathComponent == "New Compressed (zipped) Folder (2).zip",
+                       "An existing symbolic link must occupy the first archive name")
+            try expect(manager.destinationOfSymbolicLink(atPath: link.path) == link.lastPathComponent,
+                       "The existing symbolic link must be left intact")
+            try expect(Data(contentsOf: archive) == NewFileType.zipArchive.initialContents,
+                       "The returned numbered path must contain the complete ZIP")
+        }
+    }
+
+    private static func testRemovesIncompleteArchive() throws {
+        enum InjectedWriteError: Error {
+            case interrupted
+        }
+
+        try inTemporaryDirectory { root in
+            let temporary = try fixtureDirectory("Temporary", in: root)
+            let destination = try fixtureDirectory("Selected", in: root)
+            let temporaryIdentity = FinderDirectoryIdentity.capture(at: temporary)
+            let fileSystem = FileCreator.ArchiveFileSystem(temporaryDirectory: temporary)
             var originalLimit = rlimit()
             try expect(getrlimit(RLIMIT_FSIZE, &originalLimit) == 0, "Could not read file-size limit")
             var limited = originalLimit
@@ -180,10 +214,25 @@ enum FileCreatorTests {
             }
             try expect(setrlimit(RLIMIT_FSIZE, &limited) == 0, "Could not set file-size limit")
 
+            var actualParents = [FinderDirectoryIdentity]()
             do {
-                _ = try FileCreator.create(.zipArchive, in: directory)
-            } catch {
-                try expect(FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty, "Incomplete archive remained on disk")
+                _ = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem) { handle, data in
+                    actualParents.append(try stagingParentIdentity(of: handle))
+                    do {
+                        try handle.write(contentsOf: data)
+                    } catch {
+                        try expect(lseek(handle.fileDescriptor, 0, SEEK_CUR) == 1,
+                                   "The limited write must leave exactly one byte before failing")
+                        throw InjectedWriteError.interrupted
+                    }
+                }
+            } catch InjectedWriteError.interrupted {
+                try expect(actualParents.count == 1 && actualParents.first == temporaryIdentity,
+                           "The failed write must occur once in the controlled temporary directory")
+                try expect(FileManager.default.contentsOfDirectory(atPath: temporary.path).isEmpty,
+                           "The incomplete archive and staging directory must be removed")
+                try expect(FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty,
+                           "A failed write must leave the selected directory empty")
                 return
             }
             throw Failure("Creation unexpectedly succeeded with a one-byte file-size limit")
@@ -248,6 +297,173 @@ enum FileCreatorTests {
         }
     }
 
+    private static func testArchiveAvoidsStagingParentsThatMayPreventCleanup() throws {
+        let restrictions: [(String, (URL) throws -> Void)] = [
+            ("delete-child ACL", { try changeFixtureACL(["+a", "everyone deny delete_child"], at: $0) }),
+            ("directory-inherited delete ACL", {
+                try changeFixtureACL(["+a", "everyone deny delete,directory_inherit,only_inherit"], at: $0)
+            }),
+            ("append-only flag", {
+                try expect(chflags($0.path, UInt32(UF_APPEND)) == 0, "Could not set the fixture's append-only flag")
+            }),
+            ("ACL-only creation", {
+                try expect(chmod($0.path, 0o500) == 0, "Could not set the fixture's POSIX mode")
+                try changeFixtureACL(["+a", "everyone allow add_subdirectory"], at: $0)
+            })
+        ]
+        var unsafe = [String]()
+        for (restriction, configure) in restrictions {
+            try inTemporaryDirectory { root in
+                let temporary = try fixtureDirectory("Temporary", in: root)
+                let destination = try fixtureDirectory("Selected", in: root)
+                defer {
+                    _ = chflags(temporary.path, 0)
+                    _ = chmod(temporary.path, 0o700)
+                    try? changeFixtureACL(["-RN"], at: temporary)
+                }
+                try configure(temporary)
+                let fileSystem = FileCreator.ArchiveFileSystem(temporaryDirectory: temporary)
+                var actualParent: FinderDirectoryIdentity?
+                let archive = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem) { handle, data in
+                    actualParent = try stagingParentIdentity(of: handle)
+                    try handle.write(contentsOf: data)
+                }
+                try expect(Data(contentsOf: archive) == NewFileType.zipArchive.initialContents,
+                           "The complete ZIP must be published in the selected directory")
+                try expect(FileManager.default.contentsOfDirectory(atPath: destination.path) == [archive.lastPathComponent],
+                           "The selected directory must have no staging entries after publication")
+                let remaining = try FileManager.default.contentsOfDirectory(atPath: temporary.path)
+                if actualParent != FinderDirectoryIdentity.capture(at: destination) || !remaining.isEmpty {
+                    unsafe.append(restriction)
+                }
+            }
+        }
+        try expect(unsafe.isEmpty, "ZIP staging required a removable parent under: \(unsafe.joined(separator: ", "))")
+    }
+
+    private static func testArchiveUsesProtectedTempWhenSelectedFolderDeniesDeletion() throws {
+        try inTemporaryDirectory { root in
+            let temporary = try fixtureDirectory("Temporary", in: root)
+            let destination = try fixtureDirectory("Selected", in: root)
+            defer { try? changeFixtureACL(["-RN"], at: destination) }
+            try changeFixtureACL(["+a", "everyone deny delete_child"], at: destination)
+
+            let fileSystem = FileCreator.ArchiveFileSystem(temporaryDirectory: temporary)
+            let temporaryIdentity = FinderDirectoryIdentity.capture(at: temporary)
+            let archive = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem) { handle, data in
+                try expect(temporaryIdentity != nil && stagingParentIdentity(of: handle) == temporaryIdentity,
+                           "The actual archive staging parent must be the protected temporary directory")
+                try handle.write(contentsOf: data)
+            }
+            try expect(Data(contentsOf: archive) == NewFileType.zipArchive.initialContents,
+                       "The selected directory must receive the complete ZIP")
+            try expect(FileManager.default.contentsOfDirectory(atPath: temporary.path).isEmpty,
+                       "The protected temporary directory must be cleaned up")
+            try expect(FileManager.default.contentsOfDirectory(atPath: destination.path) == [archive.lastPathComponent],
+                       "Only the finished ZIP may be left in the selected directory")
+        }
+    }
+
+    private static func testArchiveFallsBackWhenTemporaryParentDeniesMkdir() throws {
+        try inTemporaryDirectory { root in
+            let temporary = try fixtureDirectory("Temporary", in: root)
+            let destination = try fixtureDirectory("Selected", in: root)
+            try changeFixtureACL(["+a", "everyone deny add_subdirectory"], at: temporary)
+            let destinationIdentity = FinderDirectoryIdentity.capture(at: destination)
+            let fileSystem = FileCreator.ArchiveFileSystem(temporaryDirectory: temporary)
+            var actualParents = [FinderDirectoryIdentity]()
+            let archive = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem) { handle, data in
+                actualParents.append(try stagingParentIdentity(of: handle))
+                try handle.write(contentsOf: data)
+            }
+            try expect(actualParents.count == 1 && actualParents.first == destinationIdentity,
+                       "After mkdir is denied, write once under the verified selected directory")
+            try expect(Data(contentsOf: archive) == NewFileType.zipArchive.initialContents,
+                       "The fallback must publish the complete archive")
+            try expect(FileManager.default.contentsOfDirectory(atPath: temporary.path).isEmpty,
+                       "The denied staging parent must stay empty")
+            try expect(FileManager.default.contentsOfDirectory(atPath: destination.path) == [archive.lastPathComponent],
+                       "Fallback staging must be removed")
+        }
+    }
+
+    private static func testArchiveFallsBackWhenInheritedACLBlocksStagingAccess() throws {
+        let fixtures = [
+            (principal: "everyone", right: "search", deniesSearch: true, fallsBack: true),
+            (principal: "everyone", right: "readattr", deniesSearch: false, fallsBack: true),
+            (principal: "everyone", right: "readsecurity", deniesSearch: false, fallsBack: true),
+            (principal: "user:root", right: "search,readattr,readsecurity", deniesSearch: false, fallsBack: false)
+        ]
+        var failures = [String]()
+        for (principal, right, deniesSearch, fallsBack) in fixtures {
+            try inTemporaryDirectory { root in
+                let temporary = try fixtureDirectory("Temporary", in: root)
+                let destination = try fixtureDirectory("Selected", in: root)
+                try changeFixtureACL(["+a", "\(principal) deny \(right),directory_inherit,only_inherit"], at: temporary)
+                try verifyStagingAccess(under: temporary, right: right, deniesSearch: deniesSearch,
+                                        deniesStat: fallsBack && !deniesSearch)
+                let manager = FileManager.default
+                let beforeStaging = Date(timeIntervalSince1970: 946_684_800)
+                try manager.setAttributes([.modificationDate: beforeStaging], ofItemAtPath: temporary.path)
+
+                let expectedParent = FinderDirectoryIdentity.capture(at: fallsBack ? destination : temporary)
+                try expect(expectedParent != nil, "Could not identify the expected staging parent")
+                let fileSystem = FileCreator.ArchiveFileSystem(temporaryDirectory: temporary)
+                var actualParents = [FinderDirectoryIdentity]()
+                let archive: URL
+                do {
+                    archive = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem) { handle, data in
+                        actualParents.append(try stagingParentIdentity(of: handle))
+                        let attributes = try manager.attributesOfItem(atPath: temporary.path)
+                        try expect((attributes[.modificationDate] as? Date).map { $0 > beforeStaging } == true,
+                                   "The temporary parent must host staging before the write for \(right)")
+                        try expect(manager.contentsOfDirectory(atPath: temporary.path).isEmpty == fallsBack,
+                                   "Temporary staging must be removed before a fallback write")
+                        try handle.write(contentsOf: data)
+                    }
+                } catch let error as POSIXError where error.code == .EACCES && fallsBack {
+                    failures.append(right)
+                    return
+                }
+                try expect(actualParents.count == 1 && actualParents.first == expectedParent,
+                           "Write once in the expected staging parent for \(principal) deny \(right)")
+                try expect(Data(contentsOf: archive) == NewFileType.zipArchive.initialContents,
+                           "The selected directory must receive the complete ZIP")
+                try expect(manager.contentsOfDirectory(atPath: temporary.path).isEmpty,
+                           "No staging directory may remain in the temporary parent")
+                try expect(manager.contentsOfDirectory(atPath: destination.path) == [archive.lastPathComponent],
+                           "Only the finished ZIP may be left in the selected directory")
+            }
+        }
+        try expect(failures.isEmpty, "Staging must fall back after inherited access is denied: \(failures.joined(separator: ", "))")
+    }
+
+    private static func verifyStagingAccess(under directory: URL, right: String, deniesSearch: Bool,
+                                            deniesStat: Bool) throws {
+        let parent = open(directory.path, O_SEARCH | O_CLOEXEC)
+        try expect(parent >= 0, "The inherited ACL must allow opening the parent for \(right)")
+        defer { _ = close(parent) }
+        var info = stat()
+        try expect(fstat(parent, &info) == 0, "The inherited ACL must allow stat of the parent for \(right)")
+        let name = "Probe"
+        try expect(mkdirat(parent, name, 0o700) == 0, "The inherited ACL must allow mkdir for \(right)")
+
+        let probe = openat(parent, name, O_SEARCH | O_NOFOLLOW | O_CLOEXEC)
+        let openError = errno
+        if deniesSearch {
+            if probe >= 0 { _ = close(probe) }
+            try expect(probe < 0 && openError == EACCES, "Inherited \(right) must deny the staging open")
+        } else {
+            try expect(probe >= 0, "Inherited \(right) must allow the staging open")
+            defer { _ = close(probe) }
+            let result = fstat(probe, &info)
+            let statError = errno
+            try expect(deniesStat ? result != 0 && statError == EACCES : result == 0,
+                       "Unexpected staging stat result with inherited \(right)")
+        }
+        try expect(unlinkat(parent, name, AT_REMOVEDIR) == 0, "The inherited ACL must allow removing empty staging for \(right)")
+    }
+
     private static func testArchiveInheritsTheDestinationACL() throws {
         try inTemporaryDirectory { directory in
             let permissions = Process()
@@ -306,6 +522,191 @@ enum FileCreatorTests {
         guard let text = acl_to_text(acl, nil) else { throw Failure("Could not format file ACL") }
         defer { acl_free(text) }
         return String(cString: text)
+    }
+
+    private static func testArchiveWithoutCloningPreservesInheritedPermissions() throws {
+        let configurations: [(String, Bool)] = [
+            ("user:root deny delete,file_inherit,only_inherit", false),
+            ("everyone allow read,file_inherit,only_inherit", true)
+        ]
+        for (rule, renameUnsupported) in configurations {
+            try inTemporaryDirectory { root in
+                let temporary = try fixtureDirectory("Temporary", in: root)
+                let destination = try fixtureDirectory("Selected", in: root)
+                try changeFixtureACL(["+a", rule], at: destination)
+                let text = try FileCreator.create(.textDocument, in: destination)
+                let occupied = destination.appending(path: "New Compressed (zipped) Folder.zip")
+                let original = Data("keep this".utf8)
+                try original.write(to: occupied)
+                let fileSystem = renameUnsupported
+                    ? FileCreator.ArchiveFileSystem(temporaryDirectory: temporary,
+                                                   clone: cloneUnsupported, rename: renameUnavailable)
+                    : FileCreator.ArchiveFileSystem(temporaryDirectory: temporary, clone: cloneUnsupported)
+
+                let archive = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem)
+                try expect(archive.lastPathComponent == "New Compressed (zipped) Folder (2).zip",
+                           "Fallback publication must preserve numbering")
+                try expect(Data(contentsOf: occupied) == original, "Fallback publication must preserve the occupied file")
+                try expect(Data(contentsOf: archive) == NewFileType.zipArchive.initialContents,
+                           "Fallback publication must preserve the entire ZIP")
+                try expect(aclText(archive) == aclText(text), "Fallback publication must preserve the inherited ACL")
+                try expect(FileManager.default.contentsOfDirectory(atPath: temporary.path).isEmpty,
+                           "Fallback publication must clean up staging")
+            }
+        }
+    }
+
+    private static func testArchiveWithoutCloningCleansUpAfterDeniedRename() throws {
+        try verifyFailedArchivePublication(renameUnsupported: false)
+    }
+
+    private static func testArchiveWithoutCloningReportsUnsafeHardLinkCleanup() throws {
+        try verifyFailedArchivePublication(renameUnsupported: true)
+    }
+
+    private static func testArchiveCleansUpWhenPathStatIsDenied() throws {
+        var leftovers = [String]()
+        for readRight in ["readattr", "readsecurity"] {
+            try inTemporaryDirectory { root in
+                let temporary = try fixtureDirectory("Temporary", in: root)
+                let destination = try fixtureDirectory("Selected", in: root)
+                try changeFixtureACL(["+a", "everyone deny delete,\(readRight),file_inherit,only_inherit"], at: destination)
+                var archiveDescriptor: Int32 = -1
+                var renameDeniedAfterStat = false
+                defer {
+                    if archiveDescriptor >= 0 {
+                        if let empty = acl_init(0) {
+                            _ = acl_set_fd_np(archiveDescriptor, empty, ACL_TYPE_EXTENDED)
+                            acl_free(UnsafeMutableRawPointer(empty))
+                        }
+                        _ = close(archiveDescriptor)
+                    }
+                }
+                let fileSystem = FileCreator.ArchiveFileSystem(temporaryDirectory: temporary, clone: cloneUnsupported) {
+                    staging, selected, name in
+                    var info = stat()
+                    let observed = fstatat(staging, "archive", &info, AT_SYMLINK_NOFOLLOW)
+                    try expect(observed != 0 && errno == EACCES, "The inherited ACL must deny pathname stat")
+                    try expect(fstat(archiveDescriptor, &info) == 0, "The open descriptor must still identify the archived file")
+                    let renamed = renameatx_np(staging, "archive", selected, name, UInt32(RENAME_EXCL))
+                    let renameError = POSIXErrorCode(rawValue: errno) ?? .EIO
+                    try expect(renamed != 0 && renameError == .EACCES, "The inherited ACL must deny exclusive rename")
+                    renameDeniedAfterStat = true
+                    throw POSIXError(renameError)
+                }
+                do {
+                    _ = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem) { handle, data in
+                        try expect(archiveDescriptor == -1, "Denied publication must attempt the archive write once")
+                        archiveDescriptor = fcntl(handle.fileDescriptor, F_DUPFD_CLOEXEC, 0)
+                        try expect(archiveDescriptor >= 0, "Could not retain the fixture archive descriptor")
+                        try handle.write(contentsOf: data)
+                    }
+                    throw Failure("ZIP publication unexpectedly succeeded with an effective delete restriction")
+                } catch let error as POSIXError where error.code == .EACCES {
+                    try expect(renameDeniedAfterStat, "Creation must reach the real rename after pathname stat is denied for \(readRight)")
+                    try expect(FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty,
+                               "Denied rename must leave the selected directory empty")
+                    if try !FileManager.default.contentsOfDirectory(atPath: temporary.path).isEmpty {
+                        leftovers.append(readRight)
+                    }
+                }
+            }
+        }
+        try expect(leftovers.isEmpty, "Staging was left behind with denied: \(leftovers.joined(separator: ", "))")
+    }
+
+    private static func verifyFailedArchivePublication(renameUnsupported: Bool) throws {
+        try inTemporaryDirectory { root in
+            let temporary = try fixtureDirectory("Temporary", in: root)
+            let destination = try fixtureDirectory("Selected", in: root)
+            try changeFixtureACL(["+a", "everyone deny delete,file_inherit,only_inherit"], at: destination)
+            let native = FileCreator.ArchiveFileSystem(temporaryDirectory: temporary, clone: cloneUnsupported)
+            let fileSystem = renameUnsupported
+                ? FileCreator.ArchiveFileSystem(temporaryDirectory: temporary,
+                                               clone: cloneUnsupported, rename: renameUnavailable)
+                : native
+
+            do {
+                _ = try FileCreator.create(.zipArchive, in: destination, archiveFileSystem: fileSystem)
+                throw Failure("ZIP publication unexpectedly succeeded with an effective delete restriction")
+            } catch FileCreator.ArchivePublicationError.hardLinkCleanupMayBeDenied where renameUnsupported {
+            } catch let error as POSIXError where error.code == .EACCES && !renameUnsupported {
+            } catch {
+                throw Failure("Unexpected ZIP publication error: \(error)")
+            }
+            try expect(FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty,
+                       "Failed publication must leave the selected directory empty")
+            try expect(FileManager.default.contentsOfDirectory(atPath: temporary.path).isEmpty,
+                       "Failed publication must remove the staged file and directory")
+        }
+    }
+
+    private static func cloneUnsupported(_ archive: Int32, _ destination: Int32, _ name: String) throws {
+        throw POSIXError(.ENOTSUP)
+    }
+
+    private static func testACLPermissionMasksCoverGenericAndUnknownRights() throws {
+        var standard: acl_permset_mask_t = 0
+        try expect(acl_maximal_permset_mask_np(&standard) == 0, "Could not read the system ACL mask")
+        let delete = UInt64(ACL_DELETE.rawValue)
+        let deleteChild = UInt64(ACL_DELETE_CHILD.rawValue)
+        let writeSecurity = UInt64(ACL_WRITE_SECURITY.rawValue)
+        let addSubdirectory = UInt64(ACL_ADD_SUBDIRECTORY.rawValue)
+        let readAttributes = UInt64(ACL_READ_ATTRIBUTES.rawValue)
+        let readSecurity = UInt64(ACL_READ_SECURITY.rawValue)
+        let execute = UInt64(ACL_EXECUTE.rawValue)
+        let relevantWrite = delete | deleteChild | writeSecurity | addSubdirectory
+        let relevantRead = readAttributes | readSecurity
+        let fixtures: [(String, UInt64, UInt64, UInt64)] = [
+            ("generic all", UInt64(KAUTH_ACE_GENERIC_ALL), relevantWrite | relevantRead | execute, 0),
+            ("generic write", UInt64(KAUTH_ACE_GENERIC_WRITE), relevantWrite, relevantRead),
+            ("generic read", UInt64(KAUTH_ACE_GENERIC_READ), relevantRead, relevantWrite),
+            ("generic execute", UInt64(KAUTH_ACE_GENERIC_EXECUTE), execute, relevantWrite | relevantRead),
+            ("ordinary read", readAttributes, readAttributes, relevantWrite | readSecurity),
+            ("unrecognized access bit", UInt64(1) << 31, relevantWrite | relevantRead, 0)
+        ]
+        var unrecognized = [String]()
+        for (name, mask, expected, excluded) in fixtures {
+            let expanded = FileCreator.expandedACLPermissions(mask, knownPermissions: standard)
+            if expanded & expected != expected || expanded & excluded != 0 {
+                unrecognized.append(name)
+            }
+        }
+        try expect(unrecognized.isEmpty, "Incorrect ACL permissions for: \(unrecognized.joined(separator: ", "))")
+    }
+
+    private static func renameUnavailable(_ staging: Int32, _ destination: Int32, _ name: String) throws {
+        throw POSIXError(.ENOTSUP)
+    }
+
+    private static func fixtureDirectory(_ name: String, in parent: URL) throws -> URL {
+        let directory = parent.appending(path: name, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        return directory
+    }
+
+    private static func changeFixtureACL(_ arguments: [String], at directory: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        process.arguments = arguments + [directory.path]
+        try process.run()
+        process.waitUntilExit()
+        try expect(process.terminationStatus == 0, "Could not change the fixture ACL")
+    }
+
+    private static func stagingParentIdentity(of handle: FileHandle) throws -> FinderDirectoryIdentity {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        return try buffer.withUnsafeMutableBufferPointer { path in
+            guard let address = path.baseAddress, fcntl(handle.fileDescriptor, F_GETPATH, address) == 0 else {
+                throw Failure("Could not look up the staged archive")
+            }
+            let archive = URL(fileURLWithFileSystemRepresentation: address, isDirectory: false, relativeTo: nil)
+            let parent = archive.deletingLastPathComponent().deletingLastPathComponent()
+            guard let identity = FinderDirectoryIdentity.capture(at: parent) else {
+                throw Failure("Could not identify the staging parent")
+            }
+            return identity
+        }
     }
 
     private static func inTemporaryDirectory(_ test: (URL) throws -> Void) throws {

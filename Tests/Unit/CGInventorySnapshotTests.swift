@@ -1,4 +1,5 @@
 import CoreGraphics
+import Synchronization
 import XCTest
 
 final class CGWindowSnapshotTests: XCTestCase {
@@ -85,6 +86,62 @@ final class CGWindowSnapshotTests: XCTestCase {
         XCTAssertTrue(snapshot.onScreenWindowIDs.isEmpty)
     }
 
+    func testExactCaptureUsesExplicitVisibilityWithoutAnOnScreenList() {
+        let rect = CGRect(x: 1200, y: 40, width: 800, height: 600)
+        let current = windowInfo(id: 11, layer: 0, isOnScreen: true, pid: 100, bounds: rect)
+        for flag in [false, true] {
+            let exact = windowInfo(id: 11, layer: 0, isOnScreen: flag, pid: 100, bounds: rect)
+            let system = ExactSnapshotSystem(descriptions: [exact], onScreenDescriptions: [current])
+            let snapshot = AppTrackerCGWindowSnapshot.capture(windowID: 11, system: system)
+            XCTAssertEqual(snapshot.onScreenWindowIDs, flag ? [11] : [])
+            XCTAssertEqual(snapshot.ownerPIDByWindowID, [11: 100])
+            XCTAssertEqual(snapshot.boundsByWindowID, [11: rect])
+            XCTAssertEqual(system.onScreenRequests.withLock { $0 }, 0)
+        }
+    }
+
+    func testExactCaptureUsesTheMatchingOnScreenRecordWhenVisibilityIsOmitted() {
+        let oldBounds = CGRect(x: 120, y: 40, width: 800, height: 600)
+        let newBounds = CGRect(x: 1200, y: 40, width: 800, height: 600)
+        let old = windowInfo(id: 11, layer: 0, isOnScreen: nil, pid: 100, alpha: 0.5, bounds: oldBounds)
+        let unrelated = windowInfo(id: 22, layer: 0, isOnScreen: nil, pid: 100, bounds: oldBounds)
+        let current = windowInfo(id: 11, layer: 0, isOnScreen: nil, pid: 100, alpha: 1, bounds: newBounds)
+        let system = ExactSnapshotSystem(descriptions: [old], onScreenDescriptions: [unrelated, current])
+
+        let snapshot = AppTrackerCGWindowSnapshot.capture(windowID: 11, system: system)
+
+        XCTAssertEqual(system.onScreenRequests.withLock { $0 }, 1)
+        XCTAssertEqual(snapshot.allWindowIDs, [11])
+        XCTAssertEqual(snapshot.onScreenWindowIDs, [11])
+        XCTAssertEqual(snapshot.ownerPIDByWindowID, [11: 100])
+        XCTAssertEqual(snapshot.boundsByWindowID, [11: newBounds])
+        XCTAssertEqual(snapshot.alphaByWindowID, [11: 1])
+    }
+
+    func testExactCaptureDoesNotConfirmAbsentReusedOrIneligibleOnScreenRecords() {
+        let bounds = CGRect(x: 1200, y: 40, width: 800, height: 600)
+        let old = windowInfo(id: 11, layer: 0, isOnScreen: nil, pid: 100, bounds: bounds)
+        let current = windowInfo(id: 11, layer: 0, isOnScreen: nil, pid: 100, bounds: bounds)
+        let reused = windowInfo(id: 11, layer: 0, isOnScreen: nil, pid: 200, bounds: bounds)
+        let candidates: [[[String: Any]]?] = [
+            nil,
+            [],
+            [windowInfo(id: 22, layer: 0, isOnScreen: nil, pid: 100, bounds: bounds)],
+            [reused],
+            [current, reused],
+            [windowInfo(id: 11, layer: 1, isOnScreen: nil, pid: 100, bounds: bounds)],
+            [windowInfo(id: 11, layer: 0, isOnScreen: false, pid: 100, bounds: bounds)],
+        ]
+        for records in candidates {
+            let system = ExactSnapshotSystem(descriptions: [old], onScreenDescriptions: records)
+
+            let snapshot = AppTrackerCGWindowSnapshot.capture(windowID: 11, system: system)
+
+            XCTAssertEqual(system.onScreenRequests.withLock { $0 }, 1)
+            XCTAssertTrue(snapshot.onScreenWindowIDs.isEmpty)
+        }
+    }
+
     func testParseIgnoresMalformedEntriesAndHandlesEmptyInput() {
         let malformed: [[String: Any]] = [
             [kCGWindowLayer as String: 0],
@@ -165,4 +222,28 @@ final class CGWindowSnapshotTests: XCTestCase {
         }
         return info
     }
+}
+
+private final class ExactSnapshotSystem: WindowSystemAccess, @unchecked Sendable {
+    let descriptions: [[String: Any]]
+    let onScreenDescriptions: [[String: Any]]?
+    let onScreenRequests = Mutex(0)
+
+    init(descriptions: [[String: Any]], onScreenDescriptions: [[String: Any]]?) {
+        self.descriptions = descriptions
+        self.onScreenDescriptions = onScreenDescriptions
+    }
+
+    func generation(_ pid: pid_t) -> ProcessGeneration? { nil }
+    func app(_ pid: pid_t) -> WindowApplicationState? { nil }
+    func activate(_ pid: pid_t) -> Bool { false }
+    func unhide(_ pid: pid_t) {}
+    func terminate(_ pid: pid_t, generation: ProcessGeneration, origin: ApplicationOrigin?) -> Bool { false }
+    func windowInfo(_ options: CGWindowListOption, _ relative: CGWindowID) -> [[String: Any]]? {
+        onScreenRequests.withLock { $0 += 1 }
+        guard options == [.optionOnScreenOnly, .excludeDesktopElements], relative == kCGNullWindowID else { return nil }
+        return onScreenDescriptions
+    }
+
+    func windowDescriptions(for ids: [CGWindowID]) -> [[String: Any]]? { ids == [11] ? descriptions : [] }
 }

@@ -4,10 +4,9 @@ import XCTest
 
 @MainActor
 final class SettingsCoordinatorTests: XCTestCase {
-    func testLaunchStateWaitsForTheServiceWhenTheStoredChoiceIsStale() async {
-        let store = makeStore(launchAtLogin: true)
+    func testLaunchStateWaitsForTheServiceAndTracksItsChanges() async {
         let launch = LaunchServiceStub(state: .off)
-        let coordinator = makeCoordinator(store: store, launch: launch)
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
 
         XCTAssertNil(coordinator.launchAtLoginState)
         let firstRefreshAccepted = await coordinator.refreshLaunchAtLoginState()
@@ -20,29 +19,28 @@ final class SettingsCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.launchAtLoginState, .requiresApproval)
     }
 
-    func testLaunchFailureDoesNotChangeStoredMirror() {
-        let store = makeStore(launchAtLogin: false)
+    func testLaunchFailureLeavesTheServiceStateOff() async {
         let launch = LaunchServiceStub(state: .off)
         launch.setError = TestError.failed
-        let coordinator = makeCoordinator(store: store, launch: launch)
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
 
         guard case .failure = coordinator.setLaunchAtLogin(true) else {
             return XCTFail("expected failure")
         }
-        XCTAssertFalse(store.launchAtLogin)
         XCTAssertNil(coordinator.launchAtLoginState)
+        let deadline = ContinuousClock.now + .seconds(1)
+        while coordinator.launchAtLoginState == nil, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertEqual(coordinator.launchAtLoginState, .off)
     }
 
-    func testLaunchSuccessUpdatesMirrorAndWaitsForActualApprovalState() async {
-        let store = makeStore(launchAtLogin: false)
+    func testLaunchSuccessWaitsForActualApprovalState() async {
         let launch = LaunchServiceStub(state: .off)
         launch.stateAfterSet = .requiresApproval
-        let coordinator = makeCoordinator(store: store, launch: launch)
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
 
         guard case .success = coordinator.setLaunchAtLogin(true) else {
             return XCTFail("expected success")
         }
-        XCTAssertTrue(store.launchAtLogin)
         XCTAssertNil(coordinator.launchAtLoginState)
         let deadline = ContinuousClock.now + .seconds(1)
         while coordinator.launchAtLoginState == nil, ContinuousClock.now < deadline { await Task.yield() }
@@ -52,10 +50,7 @@ final class SettingsCoordinatorTests: XCTestCase {
     func testOlderLaunchRefreshCannotOverwriteNewerResult() async {
         let reader = ControlledLaunchStateReader()
         let launch = ControlledLaunchService(reader: reader)
-        let coordinator = SettingsCoordinator(
-            store: makeStore(),
-            launchAtLoginService: launch
-        )
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
 
         let older = Task { await coordinator.refreshLaunchAtLoginState() }
         await reader.waitForReadCount(1)
@@ -74,7 +69,7 @@ final class SettingsCoordinatorTests: XCTestCase {
     func testCancelledRefreshDoesNotPublishAResult() async {
         let reader = ControlledLaunchStateReader()
         let launch = ControlledLaunchService(reader: reader)
-        let coordinator = makeCoordinator(launch: launch)
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
         let refresh = Task { await coordinator.refreshLaunchAtLoginState() }
         await reader.waitForReadCount(1)
         refresh.cancel()
@@ -86,40 +81,23 @@ final class SettingsCoordinatorTests: XCTestCase {
 
     func testLaunchApprovalCanOpenSystemSettings() {
         let launch = LaunchServiceStub(state: .requiresApproval)
-        let coordinator = makeCoordinator(launch: launch)
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
         coordinator.openLoginItemsSettings()
         XCTAssertEqual(launch.settingsOpenCount, 1)
     }
 
-    func testDisablingLoginUpdatesTheStoredChoice() {
-        let store = makeStore(launchAtLogin: true)
+    func testDisablingLoginInvalidatesTheFormerOnState() async {
         let launch = LaunchServiceStub(state: .on)
-        let coordinator = makeCoordinator(store: store, launch: launch)
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
+        _ = await coordinator.refreshLaunchAtLoginState()
+        XCTAssertEqual(coordinator.launchAtLoginState, .on)
         guard case .success = coordinator.setLaunchAtLogin(false) else {
             return XCTFail("Expected successful disable")
         }
-        XCTAssertFalse(store.launchAtLogin)
         XCTAssertNil(coordinator.launchAtLoginState)
         XCTAssertEqual(launch.requests, [false])
     }
 
-    private func makeCoordinator(
-        store: AppSettingsStore? = nil,
-        launch: LaunchAtLoginServicing? = nil
-    ) -> SettingsCoordinator {
-        SettingsCoordinator(
-            store: store ?? makeStore(),
-            launchAtLoginService: launch ?? LaunchServiceStub(state: .off)
-        )
-    }
-
-    private func makeStore(launchAtLogin: Bool = false) -> AppSettingsStore {
-        let suite = "DeskMote.SettingsCoordinatorTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
-        defaults.set(launchAtLogin, forKey: "deskmote.launchAtLogin")
-        return AppSettingsStore(defaults: defaults)
-    }
 }
 
 @MainActor
@@ -212,10 +190,7 @@ final class StatusMenuControllerTests: XCTestCase {
     private func makeController(item: StatusItem, launch: any LaunchAtLoginServicing,
                                 modules: [DeskMoteModule] = [],
                                 quit: @escaping @MainActor () -> Void = {}) -> StatusMenuController {
-        let suite = "DeskMote.StatusMenuControllerTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
-        let coordinator = SettingsCoordinator(store: AppSettingsStore(defaults: defaults), launchAtLoginService: launch)
+        let coordinator = SettingsCoordinator(launchAtLoginService: launch)
         return StatusMenuController(settingsCoordinator: coordinator,
                                     statusItem: item, modules: modules, quit: quit)
     }
@@ -456,10 +431,7 @@ final class StatusMenuControllerTests: XCTestCase {
         let reader = ControlledLaunchStateReader()
         let launch = ControlledLaunchService(reader: reader)
         let item = StatusItem()
-        let suite = "DeskMote.LoginActionTests.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let settings = SettingsCoordinator(store: AppSettingsStore(defaults: defaults), launchAtLoginService: launch)
+        let settings = SettingsCoordinator(launchAtLoginService: launch)
         let controller = StatusMenuController(settingsCoordinator: settings, statusItem: item)
         let menu = try XCTUnwrap(item.menu)
         await reader.waitForReadCount(1)

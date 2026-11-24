@@ -1,5 +1,7 @@
 import ApplicationServices
+import Combine
 import CoreGraphics
+import Synchronization
 import XCTest
 
 @MainActor
@@ -18,6 +20,554 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         ],
         primaryUUID: "A"
     )
+
+    func testNativeMovementUpdatesInventoryWithUnchangedVisibleWindowNumbers() async throws {
+        let (pid, cgWindow, table) = (pid, cgWindow, tableAB)
+        let reader = DisplayMovementReader(pid: pid, windowID: cgWindow, bounds: frameOnA)
+        let fullCaptures = Mutex(0)
+        let fixture = ObservationFixture()
+        let callback = Mutex<(@Sendable (AXElementKey, String) -> Void)?>(nil)
+        let observer = AppWindowObserver(pid: pid, makeSession: { _, receive in
+            callback.withLock { $0 = receive }
+            return fixture
+        })
+        let tracker = AppTracker(reader: reader, processProvider: DisplayAttributionFixedProcessProvider(),
+            cgSnapshotProvider: {
+                fullCaptures.withLock { $0 += 1 }
+                return .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
+                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: reader.bounds.withLock { $0 }],
+                             parentWindowIDs: [cgWindow: 0])
+            }, cgWindowSnapshotProvider: { id in
+                .init(allWindowIDs: [id], onScreenWindowIDs: [id], windowIDsByPID: [pid: [id]],
+                      alphaByWindowID: [:], boundsByWindowID: [id: reader.bounds.withLock { $0 }])
+            }, onScreenWindowIDsProvider: { [cgWindow] }, cgSnapshotReuseEnabled: true,
+            uptimeProvider: { 100 }, frontmostPIDProvider: { pid }, displayTableProvider: { table })
+        defer { tracker.stop() }
+        let id = WindowID(rawValue: "cgw-\(cgWindow)")
+        tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
+        tracker.observeWindows(observer)
+        for task in observer.pendingWorkForTesting { await task.value }
+        tracker.scheduleEventReadForTesting(pid: pid, source: .initialEnumeration)
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        for task in observer.pendingWorkForTesting { await task.value }
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [cgWindow])
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "A")
+        XCTAssertEqual(fullCaptures.withLock { $0 }, 1)
+        XCTAssertEqual(observer.subscribedElement(cgWindowID: cgWindow).map { AXElementKey(e: $0.element) }, reader.element)
+        let receive = try XCTUnwrap(callback.withLock { $0 })
+
+        var publications: [String?] = []
+        let subscription = tracker.snapshots.sink { publications.append($0.windows[id]?.displayUUID) }
+        defer { subscription.cancel() }
+        reader.bounds.withLock { $0 = frameOnB }
+        receive(AXElementKey(e: AXUIElementCreateApplication(pid + 1)), kAXWindowMovedNotification)
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { tracker.snapshot.windows[id]?.displayUUID == "B" }
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(reader.reads.withLock { $0 }, 2)
+        XCTAssertEqual(fullCaptures.withLock { $0 }, 2)
+        XCTAssertEqual(tracker.snapshot.windows[id]?.cgWindowID, cgWindow)
+
+        reader.bounds.withLock { $0 = frameOnA }
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { tracker.snapshot.windows[id]?.displayUUID == "A" }
+        XCTAssertEqual(fullCaptures.withLock { $0 }, 3)
+        reader.bounds.withLock { $0 = frameOnAMoved }
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { reader.reads.withLock { $0 } == 4 }
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(publications, ["A", "B", "A"])
+        XCTAssertEqual(fullCaptures.withLock { $0 }, 3, "A confirmed move within one display can reuse recent CG evidence")
+        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnAMoved)
+
+        let replaced = reader.element
+        let replacement = AXElementKey(e: AXUIElementCreateApplication(pid + 2))
+        reader.currentElement.withLock { $0 = replacement }
+        receive(replacement, kAXWindowCreatedNotification)
+        await waitForMovement {
+            observer.subscribedElement(cgWindowID: cgWindow).map { AXElementKey(e: $0.element) } == replacement
+        }
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        let readsBeforeMove = reader.reads.withLock { $0 }
+        let capturesBeforeMove = fullCaptures.withLock { $0 }
+        reader.bounds.withLock { $0 = frameOnB }
+        receive(replaced, kAXWindowMovedNotification)
+        await Task.yield()
+        receive(replacement, kAXWindowMovedNotification)
+        await waitForMovement { tracker.snapshot.windows[id]?.displayUUID == "B" }
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(reader.reads.withLock { $0 }, readsBeforeMove + 1)
+        XCTAssertEqual(fullCaptures.withLock { $0 }, capturesBeforeMove + 1)
+    }
+
+    func testNewerNativeMovementSuppressesAnOlderDisplayReadBeforeItPublishes() async throws {
+        let (pid, cgWindow, table, frameOnB) = (pid, cgWindow, tableAB, frameOnB)
+        let reader = DisplayMovementReader(pid: pid, windowID: cgWindow, bounds: frameOnA)
+        let fixture = ObservationFixture()
+        let callback = Mutex<(@Sendable (AXElementKey, String) -> Void)?>(nil)
+        let observer = AppWindowObserver(pid: pid, makeSession: { _, receive in
+            callback.withLock { $0 = receive }
+            return fixture
+        })
+        let entered = Mutex(false)
+        let timeouts = Mutex(0)
+        let gate = DispatchSemaphore(value: 0)
+        let tracker = AppTracker(reader: reader, processProvider: DisplayAttributionFixedProcessProvider(),
+            cgSnapshotProvider: {
+                let bounds = reader.bounds.withLock { $0 }
+                if bounds == frameOnB {
+                    entered.withLock { $0 = true }
+                    if gate.wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
+                }
+                return .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
+                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: bounds], parentWindowIDs: [cgWindow: 0])
+            }, onScreenWindowIDsProvider: { [cgWindow] }, cgSnapshotReuseEnabled: true,
+            uptimeProvider: { 100 }, frontmostPIDProvider: { pid }, displayTableProvider: { table })
+        defer { gate.signal(); tracker.stop() }
+        let id = WindowID(rawValue: "cgw-\(cgWindow)")
+        tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
+        tracker.observeWindows(observer)
+        for task in observer.pendingWorkForTesting { await task.value }
+        tracker.scheduleEventReadForTesting(pid: pid, source: .initialEnumeration)
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [cgWindow])
+        let receive = try XCTUnwrap(callback.withLock { $0 })
+
+        var acceptedEvents = 0
+        let trackMove = observer.onWindowMoved
+        observer.onWindowMoved = { pid, windowID, element in
+            trackMove?(pid, windowID, element)
+            acceptedEvents += 1
+        }
+        var publications: [String?] = []
+        let subscription = tracker.snapshots.sink { publications.append($0.windows[id]?.displayUUID) }
+        defer { subscription.cancel() }
+        reader.bounds.withLock { $0 = frameOnB }
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { entered.withLock { $0 } }
+        let blockedRead = tracker.pendingInventoryWorkForTesting
+        reader.bounds.withLock { $0 = frameOnAMoved }
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { acceptedEvents == 2 }
+
+        gate.signal()
+        for task in blockedRead { await task.value }
+        await waitForMovement { reader.reads.withLock { $0 } == 3 }
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(publications, ["A"])
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "A")
+        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnAMoved)
+        XCTAssertEqual(timeouts.withLock { $0 }, 0)
+    }
+
+    func testNativeMovementChecksCurrentCGWhenAXStillReportsTheOldDisplay() async throws {
+        let (pid, cgWindow, table) = (pid, cgWindow, tableAB)
+        let reader = DisplayMovementReader(pid: pid, windowID: cgWindow, bounds: frameOnA)
+        let cgBounds = Mutex(frameOnA)
+        let capturedWindowIDs = Mutex<[CGWindowID]>([])
+        let allowSamples = (0..<3).map { _ in DispatchSemaphore(value: 0) }
+        let timeouts = Mutex(0)
+        let fixture = ObservationFixture()
+        let callback = Mutex<(@Sendable (AXElementKey, String) -> Void)?>(nil)
+        let observer = AppWindowObserver(pid: pid, makeSession: { _, receive in
+            callback.withLock { $0 = receive }
+            return fixture
+        })
+        let tracker = AppTracker(reader: reader, processProvider: DisplayAttributionFixedProcessProvider(),
+            cgSnapshotProvider: {
+                .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
+                      alphaByWindowID: [:], boundsByWindowID: [cgWindow: cgBounds.withLock { $0 }], parentWindowIDs: [cgWindow: 0])
+            }, cgWindowSnapshotProvider: { id in
+                let attempt = capturedWindowIDs.withLock { $0.append(id); return $0.count }
+                if attempt.isMultiple(of: 2), allowSamples.indices.contains(attempt / 2 - 1),
+                   allowSamples[attempt / 2 - 1].wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
+                return .init(allWindowIDs: [id], onScreenWindowIDs: [id], windowIDsByPID: [pid: [id]],
+                             alphaByWindowID: [:], boundsByWindowID: [id: cgBounds.withLock { $0 }])
+            }, onScreenWindowIDsProvider: { [cgWindow] }, cgSnapshotReuseEnabled: true,
+            uptimeProvider: { 100 }, frontmostPIDProvider: { pid }, displayTableProvider: { table })
+        defer { for gate in allowSamples { gate.signal() }; tracker.stop() }
+        let id = WindowID(rawValue: "cgw-\(cgWindow)")
+        tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
+        tracker.observeWindows(observer)
+        for task in observer.pendingWorkForTesting { await task.value }
+        tracker.scheduleEventReadForTesting(pid: pid, source: .initialEnumeration)
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [cgWindow])
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "A")
+        let receive = try XCTUnwrap(callback.withLock { $0 })
+
+        reader.bounds.withLock { $0 = frameOnAMoved }
+        cgBounds.withLock { $0 = frameOnB }
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { capturedWindowIDs.withLock { $0.count } == 2 }
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "A")
+        allowSamples[0].signal()
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "B")
+        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnAMoved)
+
+        reader.bounds.withLock { $0 = frameOnB }
+        cgBounds.withLock { $0 = frameOnA }
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { capturedWindowIDs.withLock { $0.count } == 4 }
+        cgBounds.withLock { $0 = frameOnB }
+        allowSamples[1].signal()
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "B")
+
+        cgBounds.withLock { $0 = frameOnA }
+        receive(reader.element, kAXWindowMovedNotification)
+        await waitForMovement { capturedWindowIDs.withLock { $0.count } == 6 }
+        receive(reader.element, kAXWindowMiniaturizedNotification)
+        await waitForMovement { tracker.snapshot.windows[id]?.status == .minimized }
+        allowSamples[2].signal()
+        for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "B")
+        XCTAssertEqual(capturedWindowIDs.withLock { $0 }, Array(repeating: cgWindow, count: 6))
+        XCTAssertEqual(timeouts.withLock { $0 }, 0)
+    }
+
+    func testNativeMoveQueuedBehindATitleReadPreservesBothExactSamples() async throws {
+        let gate = DisplayCaptureGate()
+        let fixture = try await makeMovementFixture(bulkGate: gate)
+        defer { gate.open(); fixture.tracker.stop() }
+        let actions = DisplayMovementActions()
+        let runtime = AppRuntime(tracker: DisplayMovementInventory(tracker: fixture.tracker), actionExecutor: actions)
+        let layouts = ["A": SpaceLayoutSnapshot(orderedSpaceIDs: [1], fullscreenSpaceIDs: [], currentSpaceID: 1),
+                       "B": SpaceLayoutSnapshot(orderedSpaceIDs: [10], fullscreenSpaceIDs: [], currentSpaceID: 10)]
+        let spaces = TaskbarSpaceStore(read: { requests in
+            WindowSpaceSnapshot(layouts: layouts, memberships: Dictionary(uniqueKeysWithValues: requests.map {
+                ($0.identity, $0.displayUUID == "B" ? Set([10]) : Set([1]))
+            }))
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        let topology = DisplayTopologyStore(initialSnapshot: ScreenTopologySnapshot(
+            physicalDisplayCount: 2, identifiedDisplayUUIDs: ["A", "B"], attributionTable: tableAB))
+        let domain = "DeskMote.QueuedMovement.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        let ordering = StripOrderStore(defaults: defaults)
+        let a = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+        let b = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+        let presenters = [("A", a), ("B", b)].map { display, view in
+            TaskbarPresenter(view: view, runtime: runtime, ordering: ordering, topology: topology, spaces: spaces,
+                             displayUUID: display, backgroundMenu: { _, _ in }, popupPresented: { _ in },
+                             contextMenuVisibilityChanged: { _ in })
+        }
+        func ids(_ view: TaskbarView) -> [String] { view.taskbarContent.groups.flatMap(\.windows).map(\.item.actionWindowID) }
+        runtime.start()
+        spaces.start(snapshots: runtime.$snapshot.eraseToAnyPublisher())
+        defer {
+            spaces.stop()
+            runtime.stop()
+            defaults.removePersistentDomain(forName: domain)
+            withExtendedLifetime(presenters) {}
+        }
+        await waitForMovement { ids(a) == [fixture.id.rawValue] && ids(b).isEmpty }
+        let target = try XCTUnwrap(runtime.snapshot.windows[fixture.id]?.actionIdentity)
+        let spaceIdentity = try XCTUnwrap(StripItem.openWindows(from: runtime.snapshot).first?.spaceIdentity)
+
+        let readTitle = fixture.observer.onTitleChanged
+        var titleEvents = 0
+        fixture.observer.onTitleChanged = { pid, windowID in
+            readTitle?(pid, windowID)
+            titleEvents += 1
+        }
+        let readMove = fixture.observer.onWindowMoved
+        var moveEvents = 0
+        fixture.observer.onWindowMoved = { pid, windowID, element in
+            readMove?(pid, windowID, element)
+            moveEvents += 1
+        }
+        gate.arm()
+        fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
+        await waitForMovement { gate.isBlocked }
+
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { moveEvents == 1 }
+        fixture.reader.title.withLock { $0 = "Latest title" }
+        fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
+        await waitForMovement { titleEvents == 2 }
+
+        gate.open()
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.title, "Latest title")
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
+        await waitForMovement { ids(a).isEmpty && ids(b) == [fixture.id.rawValue] }
+        XCTAssertEqual(spaces.snapshot.memberships[spaceIdentity], [10])
+        a.taskbarContent.actions.close(target)
+        for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertTrue(actions.ids.withLock { $0.isEmpty })
+        b.taskbarContent.actions.close(target)
+        for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertEqual(actions.ids.withLock { $0 }, [fixture.id])
+        XCTAssertFalse(gate.timedOut)
+    }
+
+    func testNativeMoveBackRejectsDisplayCapturedByAnInFlightTitleRead() async throws {
+        let gate = DisplayCaptureGate()
+        let fixture = try await makeMovementFixture(bulkGate: gate)
+        defer { gate.open(); fixture.tracker.stop() }
+        let readMove = fixture.observer.onWindowMoved
+        var moveEvents = 0
+        fixture.observer.onWindowMoved = { pid, windowID, element in
+            readMove?(pid, windowID, element)
+            moveEvents += 1
+        }
+        var displays: [String?] = []
+        let subscription = fixture.tracker.snapshots.sink { displays.append($0.windows[fixture.id]?.displayUUID) }
+        defer { subscription.cancel() }
+
+        fixture.reader.bounds.withLock { $0 = frameOnB }
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        gate.arm()
+        fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
+        await waitForMovement { gate.isBlocked }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { moveEvents == 1 }
+        fixture.reader.bounds.withLock { $0 = frameOnAMoved }
+        fixture.reader.title.withLock { $0 = "Title after returning" }
+        fixture.cg.bounds.withLock { $0 = frameOnAMoved }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { moveEvents == 2 }
+
+        gate.open()
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(displays, ["A", "A"])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.title, "Title after returning")
+        XCTAssertEqual(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnAMoved)
+        XCTAssertFalse(gate.timedOut)
+    }
+
+    func testNativeMoveReceivesBothExactSamplesAfterInventoryBackoff() async throws {
+        let uptime = UptimeBox()
+        let fixture = try await makeMovementFixture(uptime: { uptime.now })
+        defer { fixture.tracker.stop() }
+        fixture.reader.unread.withLock { $0 = true }
+        fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
+        await waitForMovement { fixture.reader.reads.withLock { $0 == 2 } }
+        await drainMovementWork(fixture.tracker)
+
+        let readMove = fixture.observer.onWindowMoved
+        var receivedMove = false
+        fixture.observer.onWindowMoved = { pid, windowID, element in
+            readMove?(pid, windowID, element)
+            receivedMove = true
+        }
+        fixture.reader.unread.withLock { $0 = false }
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { receivedMove }
+        XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 2)
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "A")
+
+        uptime.now += 0.5
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
+    }
+
+    func testUnreadNativeMoveRetriesFromTheFrontmostTickAndMovesItsButton() async throws {
+        let uptime = UptimeBox()
+        let fixture = try await makeMovementFixture(uptime: { uptime.now })
+        defer { fixture.tracker.stop() }
+        let runtime = AppRuntime(tracker: DisplayMovementInventory(tracker: fixture.tracker),
+                                 actionExecutor: DisplayMovementActions())
+        let layouts = ["A": SpaceLayoutSnapshot(orderedSpaceIDs: [1], fullscreenSpaceIDs: [], currentSpaceID: 1),
+                       "B": SpaceLayoutSnapshot(orderedSpaceIDs: [10], fullscreenSpaceIDs: [], currentSpaceID: 10)]
+        let spaces = TaskbarSpaceStore(read: { requests in
+            WindowSpaceSnapshot(layouts: layouts, memberships: Dictionary(uniqueKeysWithValues: requests.map {
+                ($0.identity, $0.displayUUID == "B" ? Set([10]) : Set([1]))
+            }))
+        }, notifications: NotificationCenter(), pollInterval: 0)
+        let topology = DisplayTopologyStore(initialSnapshot: ScreenTopologySnapshot(
+            physicalDisplayCount: 2, identifiedDisplayUUIDs: ["A", "B"], attributionTable: tableAB))
+        let domain = "DeskMote.UnreadMovement.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        let ordering = StripOrderStore(defaults: defaults)
+        let a = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+        let b = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+        let presenters = [("A", a), ("B", b)].map { display, view in
+            TaskbarPresenter(view: view, runtime: runtime, ordering: ordering, topology: topology, spaces: spaces,
+                             displayUUID: display, backgroundMenu: { _, _ in }, popupPresented: { _ in },
+                             contextMenuVisibilityChanged: { _ in })
+        }
+        func ids(_ view: TaskbarView) -> [String] { view.taskbarContent.groups.flatMap(\.windows).map(\.item.actionWindowID) }
+        runtime.start()
+        spaces.start(snapshots: runtime.$snapshot.eraseToAnyPublisher())
+        defer {
+            spaces.stop()
+            runtime.stop()
+            defaults.removePersistentDomain(forName: domain)
+            withExtendedLifetime(presenters) {}
+        }
+        await waitForMovement { ids(a) == [fixture.id.rawValue] && ids(b).isEmpty }
+
+        fixture.reader.unread.withLock { $0 = true }
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { fixture.reader.reads.withLock { $0 == 2 } }
+        await drainMovementWork(fixture.tracker)
+        XCTAssertTrue(fixture.cg.exactIDs.withLock { $0.isEmpty })
+        XCTAssertEqual(ids(a), [fixture.id.rawValue])
+        XCTAssertTrue(ids(b).isEmpty)
+
+        fixture.reader.unread.withLock { $0 = false }
+        uptime.now = 100.49
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 2)
+
+        uptime.now = 100.5
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 3)
+        XCTAssertEqual(fixture.reader.bounds.withLock { $0 }, frameOnA)
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
+        await waitForMovement { ids(a).isEmpty && ids(b) == [fixture.id.rawValue] }
+    }
+
+    func testUnreadNativeMoveKeepsItsExactSamplesForThePeriodicTail() async throws {
+        let uptime = UptimeBox()
+        let fixture = try await makeMovementFixture(uptime: { uptime.now })
+        defer { fixture.tracker.stop() }
+        fixture.reader.unread.withLock { $0 = true }
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { fixture.reader.reads.withLock { $0 == 2 } }
+        await drainMovementWork(fixture.tracker)
+
+        for (index, due) in [100.5, 101.5, 103.5].enumerated() {
+            uptime.now = due - 0.01
+            fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
+            await drainMovementWork(fixture.tracker)
+            XCTAssertEqual(fixture.reader.reads.withLock { $0 }, index + 2)
+
+            uptime.now = due
+            fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
+            await drainMovementWork(fixture.tracker)
+            XCTAssertEqual(fixture.reader.reads.withLock { $0 }, index + 3)
+        }
+
+        fixture.reader.unread.withLock { $0 = false }
+        uptime.now = 105
+        fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 5)
+        XCTAssertTrue(fixture.cg.exactIDs.withLock { $0.isEmpty })
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "A")
+
+        fixture.tracker.runPeriodicBatchForTesting(cgSnapshot: cgSnapshot(bounds: [cgWindow: frameOnB]))
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 6)
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow])
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
+    }
+
+    func testTitleUpdatesWhileSecondExactDisplaySampleIsBlocked() async throws {
+        let gate = DisplayCaptureGate()
+        let fixture = try await makeMovementFixture(secondExactGate: gate)
+        defer { gate.open(); fixture.tracker.stop() }
+        let readTitle = fixture.observer.onTitleChanged
+        var receivedTitle = false
+        fixture.observer.onTitleChanged = { pid, windowID in
+            readTitle?(pid, windowID)
+            receivedTitle = true
+        }
+        fixture.reader.title.withLock { $0 = "First update" }
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        gate.arm()
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { gate.isBlocked }
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.title, "First update")
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "A")
+
+        fixture.reader.title.withLock { $0 = "Next update" }
+        fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
+        await waitForMovement { receivedTitle }
+        await waitForMovement { fixture.tracker.snapshot.windows[fixture.id]?.title == "Next update" }
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "A")
+
+        gate.open()
+        await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.title, "Next update")
+        XCTAssertFalse(gate.timedOut)
+    }
+
+    private struct MovementFixture {
+        let tracker: AppTracker
+        let observer: AppWindowObserver
+        let reader: DisplayMovementReader
+        let receive: @Sendable (AXElementKey, String) -> Void
+        let cg: CGState
+        let id: WindowID
+    }
+
+    private final class CGState: Sendable {
+        let bounds: Mutex<CGRect>
+        let exactIDs = Mutex<[CGWindowID]>([])
+
+        init(bounds: CGRect) { self.bounds = Mutex(bounds) }
+    }
+
+    private final class UptimeBox {
+        var now: TimeInterval = 100
+    }
+
+    private func makeMovementFixture(
+        bulkGate: DisplayCaptureGate? = nil, secondExactGate: DisplayCaptureGate? = nil,
+        uptime: @escaping () -> TimeInterval = { 100 }
+    ) async throws -> MovementFixture {
+        let (pid, cgWindow, table) = (pid, cgWindow, tableAB)
+        let reader = DisplayMovementReader(pid: pid, windowID: cgWindow, bounds: frameOnA)
+        let cg = CGState(bounds: frameOnA)
+        let session = ObservationFixture()
+        let callback = Mutex<(@Sendable (AXElementKey, String) -> Void)?>(nil)
+        let observer = AppWindowObserver(pid: pid, makeSession: { _, receive in
+            callback.withLock { $0 = receive }
+            return session
+        })
+        let tracker = AppTracker(reader: reader, processProvider: DisplayAttributionFixedProcessProvider(),
+            cgSnapshotProvider: {
+                let bounds = cg.bounds.withLock { $0 }
+                bulkGate?.waitIfArmed()
+                return .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
+                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: bounds], parentWindowIDs: [cgWindow: 0])
+            }, cgWindowSnapshotProvider: { id in
+                let attempt = cg.exactIDs.withLock { $0.append(id); return $0.count }
+                if attempt == 2 { secondExactGate?.waitIfArmed() }
+                return .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
+                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: cg.bounds.withLock { $0 }])
+            }, onScreenWindowIDsProvider: { [cgWindow] }, cgSnapshotReuseEnabled: false,
+            uptimeProvider: uptime, frontmostPIDProvider: { pid }, displayTableProvider: { table })
+        let id = WindowID(rawValue: "cgw-\(cgWindow)")
+        tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
+        tracker.observeWindows(observer)
+        for task in observer.pendingWorkForTesting { await task.value }
+        tracker.scheduleEventReadForTesting(pid: pid, source: .initialEnumeration)
+        await drainMovementWork(tracker)
+        for task in observer.pendingWorkForTesting { await task.value }
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [cgWindow])
+        XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "A")
+        XCTAssertEqual(observer.subscribedElement(cgWindowID: cgWindow).map { AXElementKey(e: $0.element) }, reader.element)
+        return MovementFixture(tracker: tracker, observer: observer, reader: reader, receive: try XCTUnwrap(callback.withLock { $0 }),
+                               cg: cg, id: id)
+    }
+
+    private func drainMovementWork(_ tracker: AppTracker) async {
+        while !tracker.pendingInventoryWorkForTesting.isEmpty {
+            for task in tracker.pendingInventoryWorkForTesting { await task.value }
+        }
+    }
+
+    private func waitForMovement(file: StaticString = #filePath, line: UInt = #line, _ predicate: () -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !predicate(), ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertTrue(predicate(), file: file, line: line)
+    }
 
     func testMovingAcrossDisplaysChangesTheSignatureAndPublishes() {
         let tracker = makeTracker()
@@ -51,6 +601,51 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         XCTAssertFalse(changed, "Movement within a display must avoid an inventory rebuild")
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.displayUUID, "A")
         XCTAssertEqual(tracker.snapshot, before)
+    }
+
+    func testTwoTitleChangesPublishWhenTheirContentsCollideWithSignatureDelimiters() async {
+        let (pid, firstID, initialBounds, secondBounds, table) = (pid, cgWindow, frameOnA, frameOnAMoved, tableAB)
+        let secondID: CGWindowID = 92
+        let secondToken = "tabgrp-5151-s2"
+        let delimiters = ":0:0:A|\(secondID):\(secondToken):"
+        var app = makeApp(displayUUID: "A")
+        let firstElement = AXElementKey(e: AXUIElementCreateApplication(pid))
+        let secondElement = AXElementKey(e: AXUIElementCreateApplication(pid + 1))
+        app.windowsByID[cgWindow]?.title = "Alpha\(delimiters)Beta"
+        app.windowsByID[cgWindow]?.actionTarget = WindowActionTarget(element: firstElement)
+        app.windowsByID[secondID] = WindowEntry(cgWindowID: secondID, token: secondToken, title: "Gamma",
+            bounds: frameOnAMoved, isMinimized: false, isFocused: false, everSeenVisible: true,
+            displayUUID: "A", actionTarget: WindowActionTarget(element: secondElement))
+        app.windowOrder.append(secondID)
+        let titles = ["Alpha", "Beta\(delimiters)Gamma"]
+        let reader = DisplayAttributionReader {
+            .success([
+                AXWindowSnapshot(pid: pid, cgWindowID: firstID, titleRead: .value(titles[0]), bounds: initialBounds,
+                    role: kAXWindowRole as String, subrole: kAXStandardWindowSubrole as String, isMinimized: false,
+                    isFocusedWindow: false, element: firstElement.e),
+                AXWindowSnapshot(pid: pid, cgWindowID: secondID, titleRead: .value(titles[1]), bounds: secondBounds,
+                    role: kAXWindowRole as String, subrole: kAXStandardWindowSubrole as String, isMinimized: false,
+                    isFocusedWindow: false, element: secondElement.e)
+            ])
+        }
+        let ids: Set<CGWindowID> = [firstID, secondID]
+        let cg = AppTrackerCGWindowSnapshot(allWindowIDs: ids, onScreenWindowIDs: ids,
+            windowIDsByPID: [pid: ids], alphaByWindowID: [:])
+        let tracker = AppTracker(reader: reader, processProvider: DisplayAttributionFixedProcessProvider(),
+            cgSnapshotProvider: { cg }, onScreenWindowIDsProvider: { ids }, frontmostPIDProvider: { nil },
+            displayTableProvider: { table })
+        defer { tracker.stop() }
+        tracker.installFixtureForTesting(app)
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: ids)
+        let initialTitles = ["Alpha\(delimiters)Beta", "Gamma"]
+        var publications: [[String]] = []
+        let subscription = tracker.snapshots.sink { snapshot in
+            publications.append(snapshot.orderedWindowIDs.compactMap { snapshot.windows[$0]?.title })
+        }
+        defer { subscription.cancel() }
+        tracker.scheduleEventReadForTesting(pid: pid, source: .titleChanged)
+        await drainMovementWork(tracker)
+        XCTAssertEqual(publications, [initialTitles, titles])
     }
 
     func testMinimizedSeatKeepsItsLastVisibleDisplay() {
@@ -393,7 +988,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
     ) -> AppTracker {
         let table = tableAB
         return AppTracker(
-            reader: DisplayAttributionNoopReader(),
+            reader: DisplayAttributionReader(),
             processProvider: DisplayAttributionFixedProcessProvider(),
             displayTableProvider: tableProvider ?? { table }
         )
@@ -454,10 +1049,85 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
     }
 }
 
-private struct DisplayAttributionNoopReader: AppTrackerWindowReading {
-    func windows(forPID pid: pid_t) -> [AXWindowSnapshot] { [] }
-    func windowReadResult(forPID pid: pid_t) -> AXWindowReadResult { .success([]) }
-    func inventoryWindows(forPID pid: pid_t, messagingTimeout: TimeInterval) -> AXWindowReadResult { .success([]) }
+@MainActor
+private final class DisplayMovementInventory: WindowInventoryTracking {
+    let tracker: AppTracker
+
+    init(tracker: AppTracker) { self.tracker = tracker }
+    var snapshots: AnyPublisher<DockSnapshot, Never> { tracker.snapshots }
+    func start() {}
+    func stop() {}
+}
+
+private final class DisplayMovementActions: WindowActionExecuting {
+    let ids = Mutex<[WindowID]>([])
+
+    func execute(_ request: PlatformActionRequest, snapshot: DockSnapshot, forcedMinimizedPrior: Bool,
+                 cancellation: OperationCancellation, onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?) -> Bool {
+        if let id = request.windowID { ids.withLock { $0.append(id) } }
+        return false
+    }
+}
+
+private struct DisplayAttributionReader: AppTrackerWindowReading {
+    var read: @Sendable () -> AXWindowReadResult = { .success([]) }
+
+    func windows(forPID pid: pid_t) -> [AXWindowSnapshot] { read().windowsOrEmpty }
+    func windowReadResult(forPID pid: pid_t) -> AXWindowReadResult { read() }
+    func inventoryWindows(forPID pid: pid_t, messagingTimeout: TimeInterval) -> AXWindowReadResult { read() }
+}
+
+private final class DisplayMovementReader: AppTrackerWindowReading, Sendable {
+    let currentElement: Mutex<AXElementKey>
+    var element: AXElementKey { currentElement.withLock { $0 } }
+    let bounds: Mutex<CGRect>
+    let title = Mutex("Window")
+    let unread = Mutex(false)
+    let reads = Mutex(0)
+    let windowID: CGWindowID
+
+    init(pid: pid_t, windowID: CGWindowID, bounds: CGRect) {
+        currentElement = Mutex(AXElementKey(e: AXUIElementCreateApplication(pid)))
+        self.windowID = windowID
+        self.bounds = Mutex(bounds)
+    }
+
+    func windows(forPID pid: pid_t) -> [AXWindowSnapshot] { windowReadResult(forPID: pid).windowsOrEmpty }
+
+    func windowReadResult(forPID pid: pid_t) -> AXWindowReadResult {
+        reads.withLock { $0 += 1 }
+        if unread.withLock({ $0 }) { return .unread(.cannotComplete) }
+        return .success([.init(pid: pid, cgWindowID: windowID, titleRead: .value(title.withLock { $0 }), bounds: bounds.withLock { $0 },
+                              role: kAXWindowRole, subrole: kAXStandardWindowSubrole, isMinimized: false,
+                              isFocusedWindow: false, element: element.e, isMinimizedRead: false)])
+    }
+
+    func inventoryWindows(forPID pid: pid_t, messagingTimeout: TimeInterval) -> AXWindowReadResult {
+        windowReadResult(forPID: pid)
+    }
+}
+
+private final class DisplayCaptureGate: Sendable {
+    private let armed = Mutex(false)
+    private let blocked = Mutex(false)
+    private let timeout = Mutex(false)
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    var isBlocked: Bool { blocked.withLock { $0 } }
+    var timedOut: Bool { timeout.withLock { $0 } }
+
+    func arm() { armed.withLock { $0 = true } }
+    func open() { semaphore.signal() }
+
+    func waitIfArmed() {
+        guard armed.withLock({ armed in
+            let wasArmed = armed
+            armed = false
+            return wasArmed
+        }) else { return }
+        blocked.withLock { $0 = true }
+        if semaphore.wait(timeout: .now() + 8) == .timedOut { timeout.withLock { $0 = true } }
+    }
 }
 
 private struct DisplayAttributionFixedProcessProvider: AppTrackerProcessProviding {

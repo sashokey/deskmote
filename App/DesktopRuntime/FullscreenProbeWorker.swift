@@ -20,7 +20,7 @@ enum FullscreenAXObservation: Sendable {
     }
 }
 
-final class FullscreenAXReadBatch: Sendable {
+final class FullscreenReadBatch: Sendable {
     private struct Sample {
         let observation: FullscreenAXObservation
         let uptime: TimeInterval
@@ -29,12 +29,29 @@ final class FullscreenAXReadBatch: Sendable {
     private static let freshnessInterval: TimeInterval = 0.25
     private let observations = Mutex<[pid_t: Sample]>([:])
     private let read: @Sendable (pid_t) -> FullscreenAXObservation
+    private let readCG: (@MainActor () -> [[String: Any]]?)?
     private let uptime: @Sendable () -> TimeInterval
+    @MainActor private var cgSample: (windows: [[String: Any]]?, uptime: TimeInterval)?
 
     init(uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         readCG: (@MainActor () -> [[String: Any]]?)? = nil,
          read: @escaping @Sendable (pid_t) -> FullscreenAXObservation) {
         self.read = read
+        self.readCG = readCG
         self.uptime = uptime
+    }
+
+    @MainActor
+    func cgWindows(
+        isImmediateSpaceChange: Bool = false, fallback: () -> [[String: Any]]?
+    ) -> [[String: Any]]? {
+        guard let readCG else { return fallback() }
+        if let sample = cgSample, isImmediateSpaceChange || uptime() - sample.uptime <= Self.freshnessInterval {
+            return sample.windows
+        }
+        let windows = readCG()
+        cgSample = (windows, uptime())
+        return windows
     }
 
     func observation(for pid: pid_t?) -> FullscreenAXObservation {
@@ -58,11 +75,11 @@ struct FullscreenProbeRequest: Sendable {
     let finalConfirmation: Bool
     let source: String
     let displayUUID: String?
-    let sharedRead: FullscreenAXReadBatch?
+    let sharedRead: FullscreenReadBatch?
 
     init(pid: pid_t?, screenFrame: CGRect, generation: UInt64, spaceGeneration: UInt64?,
          finalConfirmation: Bool, source: String, displayUUID: String? = nil,
-         sharedRead: FullscreenAXReadBatch? = nil) {
+         sharedRead: FullscreenReadBatch? = nil) {
         self.pid = pid
         self.screenFrame = screenFrame
         self.generation = generation
@@ -109,13 +126,16 @@ final class FullscreenProbeWorker {
         inFlight = true
         let read = read
         let readSpace = readSpace
+        let cancellation = OperationCancellation()
         work.launch { [weak self] generation in
-            guard let result = await AsyncWorkScope.performBlocking(on: .global(qos: .utility), operation: {
+            let completed = await AsyncWorkScope.performBlocking(on: .global(qos: .utility), cancellation: cancellation) { () -> FullscreenAXProbe? in
                 let probe = read(request)
+                guard !cancellation.isCancelled else { return nil }
                 let spaceVerdict = probe.verdict == .fullscreen ? nil : readSpace(request)
                 return FullscreenAXProbe(verdict: probe.verdict, overlayWindowID: probe.overlayWindowID,
                                          spaceVerdict: spaceVerdict)
-            }) else { return }
+            }
+            guard let result = completed ?? nil else { return }
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation) else { return }
                 self.inFlight = false

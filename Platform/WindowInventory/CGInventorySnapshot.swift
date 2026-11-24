@@ -68,6 +68,29 @@ struct AppTrackerCGWindowSnapshot: Equatable {
         return parse(windowInfo, parentWindowIDs: NativeWindowParentReader.parents(for: ids))
     }
 
+    static func capture(windowID: CGWindowID) -> AppTrackerCGWindowSnapshot {
+        capture(windowID: windowID, system: NativeWindowSystem())
+    }
+
+    static func capture(windowID: CGWindowID, system: any WindowSystemAccess) -> AppTrackerCGWindowSnapshot {
+        guard let descriptions = system.windowDescriptions(for: [windowID]), descriptions.count == 1,
+              nativeWindowNumber(in: descriptions[0]) == windowID else { return .failed }
+        let snapshot = parse(descriptions)
+        let visibilityKey = kCGWindowIsOnscreen as String
+        guard descriptions[0][visibilityKey] == nil, let owner = snapshot.ownerPIDByWindowID[windowID],
+              let visible = system.windowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) else {
+            return snapshot
+        }
+        let matches = visible.filter { nativeWindowNumber(in: $0) == windowID }
+        guard matches.count == 1, var match = matches.first else { return snapshot }
+        if match[visibilityKey] == nil { match[visibilityKey] = true }
+        let current = parse([match])
+        guard current.ownerPIDByWindowID[windowID] == owner, current.onScreenWindowIDs.contains(windowID) else {
+            return snapshot
+        }
+        return current
+    }
+
     static func captureOnScreenWindowIDs() -> Set<CGWindowID>? {
         guard let windowInfo = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
