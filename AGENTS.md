@@ -2,11 +2,11 @@
 
 ## Release approval
 
-Prepare releases as drafts. Apply this check before publishing a release or prerelease, including retries and recovery.
+The `Release` workflow publishes GitHub releases. It creates a draft internally to attach the verified ZIP. Apply this check before starting a publication run, including prereleases, retries, and recovery.
 
-1. Resolve the release tag to its full commit SHA. Find the standalone `CI` runs in this repository for that exact SHA. If a release-manifest-only push did not trigger `CI`, dispatch `ci.yml` at the release tag.
+1. Resolve the release candidate to its full commit SHA. Use `master` for a new release and the release tag for recovery. Find the standalone `CI` runs in this repository for that exact SHA. If none exists, dispatch `ci.yml` at the ref that resolves to the candidate.
 2. Wait for `CI` to finish and review every run and attempt for that SHA, including earlier attempts. Publish only when the history is available and every run, attempt, and required test step completed successfully. A skipped, cancelled, missing, or unknown result blocks publication. A test failure permanently disqualifies the SHA, even after a successful rerun. Use a new commit and require its own passing `CI`.
-3. Confirm the tag still points to the verified SHA immediately before publishing.
+3. Recheck the `master` SHA immediately before dispatching publication. For recovery, resolve the tag again. The `Release` workflow verifies the tag immediately before publishing.
 
 ## Environment
 
@@ -116,7 +116,10 @@ Report line coverage for `DeskMote.app` alone. Test sources and duplicated appli
 
 Publish changes directly to `master`. Use `vN` as the Git tag, release title, displayed version and ZIP version. Start at `v1` and increase `N` by one at every release, including corrections. The application and both extensions use `N.0.0` for `CFBundleShortVersionString` and `N` for `CFBundleVersion`.
 
-Set `version`, `draft`, `prerelease` and `notes` in `.github/release.json` on `master`. Check the release run for the published commit. The workflow waits for both variants to pass, then attaches only `DeskMote-vN.zip` to the release. Verify that the tag points to the tested SHA and that the release and artifact have the expected ZIP. A failed publication retains its verified package and any existing draft for recovery. Retry the failed jobs or use `resume_run_id` for the original release run when its retained artifact and tag match the request.
+1. Set `version`, `draft`, `prerelease` and `notes` in `.github/release.json` on `master`. Set `draft: false` for publication and reserve `draft: true` for an explicitly requested draft. Use `[skip ci]` in the release commit to suppress automatic push runs while establishing the required order.
+2. If an automatic draft build already started for a public release, cancel that `Release` run before it creates a tag and let standalone `CI` continue. Complete [Release approval](#release-approval) and verify that the version has no existing tag or release before starting a new publication run.
+3. Dispatch `release.yml` on verified `master` with inputs `version`, `prerelease` and `draft`. Pass `draft: false` for a public release. Use the configured GitHub connector for reads. If it lacks dispatch or cancellation, use the fallback GitHub MCP `actions_run_trigger` with `run_workflow` or `cancel_workflow_run`.
+4. Verify the successful `Release` run, the tag's exact SHA, the published release, and its single asset `DeskMote-vN.zip`. For a failed publication, retry the failed jobs or use `resume_run_id` when the retained artifact, tag, and original release request match.
 
 Keep the release tag at the tested commit from creation through the workflow's final verification. Defer any separate operations on that tag until publication finishes. GitHub checks the ref and writes the release in separate requests. If publication fails, check the tag and release before retrying.
 
