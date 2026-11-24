@@ -1233,6 +1233,33 @@ final class TaskbarBehaviorTests: XCTestCase {
         XCTAssertTrue(fixture.desktop.state.withLock { $0.terminated.isEmpty && $0.writes.isEmpty })
     }
 
+    func testVisibleSettingsActivationSurvivesTemporarilyUnreadableWindowIdentityAfterEarlyFocus() throws {
+        let desktop = BehaviorDesktop(editorBundleIdentifier: "com.apple.systempreferences")
+        let failures = Mutex(0)
+        desktop.state.withLock {
+            $0.windows[1001]?.status = .inactive
+            $0.focused = 2001
+            $0.beforeWindowIDRead = { id in
+                guard id == 1001, desktop.state.withLock({ $0.focused == id }) else { return }
+                let unreadable = failures.withLock { count in count += 1; return count <= 2 }
+                desktop.state.withLock {
+                    if unreadable { $0.unreadNativeWindowIDs.insert(id) }
+                    else { $0.unreadNativeWindowIDs.remove(id) }
+                }
+            }
+        }
+        defer { desktop.state.withLock { $0.beforeWindowIDRead = nil } }
+        desktop.publish()
+        let target = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
+        let executor = PlatformActionExecutor(reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
+        XCTAssertTrue(executor.execute(.init(kind: .activateWindow, windowID: target.id),
+                                       snapshot: desktop.values.value, forcedMinimizedPrior: false,
+                                       cancellation: OperationCancellation(), onHandoffActivePrediction: nil))
+        XCTAssertGreaterThan(failures.withLock { $0 }, 2)
+        XCTAssertEqual(desktop.state.withLock { $0.focused }, 1001)
+        XCTAssertFalse(desktop.state.withLock { $0.writes.contains("1001:minimized") })
+    }
+
     func testRestoreCanFocusTheSameAXElementWhenItsNativeNumberChanges() throws {
         let desktop = BehaviorDesktop()
         let element = try XCTUnwrap(desktop.elements[1001])

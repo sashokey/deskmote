@@ -100,8 +100,13 @@ extension PanelCoordinator {
         }
         guard let windows else { return nil }
         let dockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
+        let systemSurfaceBundleIDs = DockWindowEligibilityPolicy.systemSurfaceBundleIdentifiers.union(["com.apple.screencaptureui"])
+        let systemSurfacePIDs = Set(systemSurfaceBundleIDs
+            .flatMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0) }
+            .map(\.processIdentifier))
         return FullscreenCGEvidence.classify(
-            windows, on: screen, excludingPID: ProcessInfo.processInfo.processIdentifier, dockPID: dockPID)
+            windows, on: screen, excludingPID: ProcessInfo.processInfo.processIdentifier, dockPID: dockPID,
+            systemSurfacePIDs: systemSurfacePIDs)
     }
 
     func triggerAsyncFullscreenCheck(
@@ -173,7 +178,7 @@ extension PanelCoordinator {
         }
         applyFullscreenVisibility(verdict, source: request.source + suffix, expectedSpaceHoldGeneration: request.spaceGeneration,
                                   isFinalSpaceHoldWindowedConfirmation: request.finalConfirmation,
-                                  cgConfirmation: cgConfirmation)
+                                  cgConfirmation: cgConfirmation, overlayCandidate: overlayWindowID)
         if overlayWindowID != nil || !visibilityState.hideReasons.contains(.fullscreen) {
             reconcileOverlayWindowWatch(overlayWindowID: overlayWindowID)
         }
@@ -245,7 +250,8 @@ extension PanelCoordinator {
         source: String,
         expectedSpaceHoldGeneration: UInt64? = nil,
         isFinalSpaceHoldWindowedConfirmation: Bool = false,
-        cgConfirmation: FullscreenCGConfirmation? = nil
+        cgConfirmation: FullscreenCGConfirmation? = nil,
+        overlayCandidate: CGWindowID? = nil
     ) {
         guard !isSuspendedForPermissionLoss else { return }
         switch FullscreenSpaceHoldDecision.disposition(
@@ -262,7 +268,10 @@ extension PanelCoordinator {
         }
         fullscreenCGConfirmation = cgConfirmation
         visibilityState.setFullscreen(isFullscreen)
-        reconcilePanelVisibility()
+        #if DEBUG
+        diagnosticFullscreenCandidate = isFullscreen ? overlayCandidate ?? cgConfirmation?.overlayWindowID : nil
+        #endif
+        reconcilePanelVisibility(source: source)
         #if DEBUG
         logFullscreenVerdict(isFullscreen, source: source)
         #endif

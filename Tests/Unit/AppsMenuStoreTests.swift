@@ -110,6 +110,70 @@ final class AppsMenuStoreTests: XCTestCase {
         XCTAssertEqual(finderURLs, ["/System/Library/CoreServices/Finder.app"])
     }
 
+    func testCollidingDisplayNamesUseDistinctBundleNamesInBothSavedAndFreshCatalogs() async throws {
+        struct LegacyCatalog: Encodable {
+            let directories: [URL]
+            let applications: [AppsMenuApplication]
+        }
+
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let directory = TestFileSystem.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            .resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let installed = [
+            (id: "io.github.sashokey.deskmote", name: "DeskMote", file: "DeskMote"),
+            (id: "io.github.sashokey.deskmote.dev", name: "DeskMote", file: "DeskMote Dev"),
+            (id: "com.apple.siri.launcher", name: "Siri", file: "Siri"),
+            (id: "com.apple.campo", name: "Siri", file: "Siri AI"),
+            (id: "test.localized", name: "Localized Name", file: "Internal Name"),
+        ]
+        let oldApplications = try installed.map { item in
+            let url = directory.appendingPathComponent(item.file + ".app")
+            try createApplication(at: url, identifier: item.id, name: item.name)
+            return AppsMenuApplication(id: item.id, name: item.name, url: url, category: "other")
+        }
+        let oldCache = LegacyCatalog(directories: [directory], applications: oldApplications)
+        defaults.set(try JSONEncoder().encode(oldCache), forKey: "deskmote.appsMenu.catalog.v1")
+
+        let store = AppsMenuStore(defaults: defaults, applicationDirectories: [directory])
+        let expected = [
+            "io.github.sashokey.deskmote": "DeskMote",
+            "io.github.sashokey.deskmote.dev": "DeskMote Dev",
+            "com.apple.siri.launcher": "Siri",
+            "com.apple.campo": "Siri AI",
+            "test.localized": "Localized Name",
+        ]
+        let cached = try XCTUnwrap(store.catalogSnapshot)
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: cached.map { ($0.id, $0.name) }), expected)
+
+        let refreshed = await store.loadInstalledApplications()
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: refreshed.map { ($0.id, $0.name) }), expected)
+        XCTAssertEqual(Set(refreshed.map(\.url.path)), Set(oldApplications.map(\.url.path)))
+    }
+
+    func testNewStoreHasSavedCatalogBeforeRefreshingInstalledApps() async throws {
+        let suite = UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let directory = TestFileSystem.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = directory.appendingPathComponent("First.app")
+        try createApplication(at: first, identifier: "test.first")
+        let original = AppsMenuStore(defaults: defaults, applicationDirectories: [directory])
+        let firstScan = await original.loadInstalledApplications()
+        XCTAssertEqual(firstScan.map(\.id), ["test.first"])
+
+        try FileManager.default.removeItem(at: first)
+        try createApplication(at: directory.appendingPathComponent("Second.app"), identifier: "test.second")
+        let restarted = AppsMenuStore(defaults: defaults, applicationDirectories: [directory])
+        XCTAssertEqual(restarted.catalogSnapshot, firstScan)
+        let refreshed = await restarted.loadInstalledApplications()
+        XCTAssertEqual(refreshed.map(\.id), ["test.second"])
+        XCTAssertEqual(AppsMenuStore(defaults: defaults, applicationDirectories: [directory]).catalogSnapshot, refreshed)
+    }
+
     func testRunningCatalogIncludesWindowlessRegularAppsOnceAndExcludesTerminatedAndAccessoryApps() async {
         let path = URL(fileURLWithPath: "/Applications/Windowless.app")
         let otherSpace = URL(fileURLWithPath: "/Applications/OtherSpace.app")

@@ -107,7 +107,7 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         stopFullscreenMonitoring()
         spaceStore.stop()
         for unit in units {
-            unit.coordinator.tearDown()
+            unit.coordinator.tearDown(source: "runtime-suspended")
         }
         units = []
         overlaySpaceHost?.tearDown()
@@ -130,7 +130,7 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
             if desiredSet.contains(unit.key ?? "") {
                 survivors[unit.key] = unit
             } else {
-                unit.coordinator.tearDown()
+                unit.coordinator.tearDown(source: "topology-\(reason)")
             }
         }
         let initialRead = makeFullscreenReadBatch()

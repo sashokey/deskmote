@@ -79,6 +79,56 @@ final class FullscreenClassificationTests: XCTestCase {
         XCTAssertEqual(fullscreen?.overlayWindowID, 100)
     }
 
+    func testScreenshotThumbnailDoesNotHideTaskbarOrMaskFullscreenWindow() {
+        let screenshotPID: pid_t = 71548
+        let thumbnail: [String: Any] = [
+            kCGWindowNumber as String: 6283,
+            kCGWindowOwnerPID as String: screenshotPID,
+            kCGWindowLayer as String: Int(CGWindowLevelForKey(.mainMenuWindow)),
+            kCGWindowAlpha as String: 1,
+            kCGWindowBounds as String: screen.dictionaryRepresentation,
+        ]
+        let appWindow: [String: Any] = [
+            kCGWindowNumber as String: 100,
+            kCGWindowOwnerPID as String: 42,
+            kCGWindowLayer as String: Int(CGWindowLevelForKey(.mainMenuWindow)),
+            kCGWindowBounds as String: screen.dictionaryRepresentation,
+        ]
+
+        let desktop = FullscreenCGEvidence.classify(
+            [thumbnail], on: screen, excludingPID: -1, dockPID: nil, systemSurfacePIDs: [screenshotPID])
+        XCTAssertEqual(desktop?.state, .windowed)
+        XCTAssertNil(desktop?.overlayWindowID)
+
+        let fullscreen = FullscreenCGEvidence.classify(
+            [thumbnail, appWindow], on: screen, excludingPID: -1, dockPID: nil, systemSurfacePIDs: [screenshotPID])
+        XCTAssertEqual(fullscreen?.state, .fullscreen)
+        XCTAssertEqual(fullscreen?.overlayWindowID, 100)
+    }
+
+    func testNotificationCenterSurfaceDoesNotHideTaskbar() {
+        let notificationCenterPID: pid_t = 726
+        let overlay: [String: Any] = [
+            kCGWindowNumber as String: 28,
+            kCGWindowOwnerPID as String: notificationCenterPID,
+            kCGWindowLayer as String: 23,
+            kCGWindowAlpha as String: 1,
+            kCGWindowBounds as String: screen.dictionaryRepresentation,
+        ]
+        let evidence = FullscreenCGEvidence.classify(
+            [overlay], on: screen, excludingPID: -1, dockPID: nil, systemSurfacePIDs: [notificationCenterPID])
+        XCTAssertEqual(evidence?.state, .windowed)
+        XCTAssertNil(evidence?.overlayWindowID)
+
+        var appWindow = overlay
+        appWindow[kCGWindowOwnerPID as String] = 42
+        appWindow[kCGWindowNumber as String] = 100
+        let fullscreen = FullscreenCGEvidence.classify(
+            [overlay, appWindow], on: screen, excludingPID: -1, dockPID: nil, systemSurfacePIDs: [notificationCenterPID])
+        XCTAssertEqual(fullscreen?.state, .fullscreen)
+        XCTAssertEqual(fullscreen?.overlayWindowID, 100)
+    }
+
     func testOverlayWatchKeepsWaitingWhileTheWindowStillCoversTheScreen() {
         XCTAssertFalse(OverlayWindowWatch.shouldRecheck(isOnscreen: true, bounds: screen, displayWindowServerFrame: screen))
         let nudged = screen.insetBy(dx: 2, dy: 2)

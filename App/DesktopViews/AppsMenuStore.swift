@@ -1,6 +1,6 @@
 import AppKit
 
-struct AppsMenuApplication: Equatable, Sendable, Identifiable {
+struct AppsMenuApplication: Codable, Equatable, Sendable, Identifiable {
     let id: String
     let name: String
     let url: URL
@@ -26,10 +26,26 @@ final class AppsMenuStore {
     private static let pinsKey = "deskmote.appsMenu.pins"
     private static let catalogModeKey = "deskmote.appsMenu.catalogMode"
     private static let expandedKey = "deskmote.appsMenu.expanded"
+    private static let catalogKey = "deskmote.appsMenu.catalog.v1"
+    private static let maxCatalogCacheBytes = 1_048_576
+    private static let concurrentIconReads = 4
+
+    private struct StoredCatalog: Codable {
+        let directories: [URL]?
+        let applications: [AppsMenuApplication]
+    }
 
     private let defaults: UserDefaults
     private let applicationDirectories: [URL]?
     private let runningApplicationSnapshot: () -> [NSRunningApplication]
+    private let readIcon: @MainActor (URL) async -> NSImage
+    private let applicationIcons = NSCache<NSURL, NSImage>()
+    private var iconCompletions: [URL: [(NSImage) -> Void]] = [:]
+    private var queuedIconURLs: [URL] = []
+    private var activeIconReads = 0
+    private var catalogRead: Task<[AppsMenuApplication], Never>?
+    private var lastCatalogRefresh: ContinuousClock.Instant?
+    private(set) var catalogSnapshot: [AppsMenuApplication]?
 
     private(set) var pins: [AppsMenuPin]
     var catalogMode: AppsMenuCatalogMode {
@@ -46,10 +62,18 @@ final class AppsMenuStore {
     }
 
     init(defaults: UserDefaults = .standard, applicationDirectories: [URL]? = nil,
-         runningApplicationSnapshot: @escaping () -> [NSRunningApplication] = { NSWorkspace.shared.runningApplications }) {
+         runningApplicationSnapshot: @escaping () -> [NSRunningApplication] = { NSWorkspace.shared.runningApplications },
+         readIcon: (@MainActor (URL) async -> NSImage)? = nil) {
         self.defaults = defaults
         self.applicationDirectories = applicationDirectories
         self.runningApplicationSnapshot = runningApplicationSnapshot
+        self.readIcon = readIcon ?? { await Self.workspaceIcon(at: $0) }
+        applicationIcons.countLimit = 256
+        if let data = defaults.data(forKey: Self.catalogKey), data.count <= Self.maxCatalogCacheBytes,
+           let catalog = try? JSONDecoder().decode(StoredCatalog.self, from: data),
+           catalog.directories == applicationDirectories {
+            catalogSnapshot = Self.disambiguatedCatalog(catalog.applications) ?? catalog.applications
+        }
         pins = defaults.data(forKey: Self.pinsKey)
             .flatMap { try? JSONDecoder().decode([AppsMenuPin].self, from: $0) } ?? []
         catalogMode = defaults.string(forKey: Self.catalogModeKey).flatMap(AppsMenuCatalogMode.init(rawValue:)) ?? .list
@@ -61,7 +85,36 @@ final class AppsMenuStore {
     }
 
     func loadInstalledApplications() async -> [AppsMenuApplication] {
-        await Self.discoverInstalledApplications(in: applicationDirectories)
+        if let catalogSnapshot, let lastCatalogRefresh, lastCatalogRefresh.duration(to: .now) < .seconds(5) {
+            return catalogSnapshot
+        }
+        return await (catalogRead ?? beginCatalogRead()).value
+    }
+
+    func preloadInstalledApplications() {
+        if lastCatalogRefresh == nil, catalogRead == nil { _ = beginCatalogRead() }
+    }
+
+    private func beginCatalogRead() -> Task<[AppsMenuApplication], Never> {
+        let directories = applicationDirectories
+        let read = Task { [weak self] in
+            let applications = await Self.discoverInstalledApplications(in: directories)
+            self?.updateCatalogSnapshot(applications)
+            return applications
+        }
+        catalogRead = read
+        return read
+    }
+
+    private func updateCatalogSnapshot(_ applications: [AppsMenuApplication]) {
+        catalogRead = nil
+        lastCatalogRefresh = .now
+        guard applications != catalogSnapshot else { return }
+        catalogSnapshot = applications
+        let catalog = StoredCatalog(directories: applicationDirectories, applications: applications)
+        if let data = try? JSONEncoder().encode(catalog), data.count <= Self.maxCatalogCacheBytes {
+            defaults.set(data, forKey: Self.catalogKey)
+        }
     }
 
     @concurrent
@@ -119,7 +172,29 @@ final class AppsMenuStore {
                 appendApplication(at: candidate)
             }
         }
-        return applications.sorted {
+        return disambiguatedCatalog(applications) ?? sortedCatalog(applications)
+    }
+
+    private nonisolated static func disambiguatedCatalog(_ applications: [AppsMenuApplication]) -> [AppsMenuApplication]? {
+        let displayNames = applications.reduce(into: [String: Int]()) { counts, application in
+            counts[application.name, default: 0] += 1
+        }
+        guard displayNames.count < applications.count else { return nil }
+
+        let bundleNames = applications.map { $0.url.deletingPathExtension().lastPathComponent }
+        let bundleNameCounts = bundleNames.reduce(into: [String: Int]()) { counts, name in
+            counts[name, default: 0] += 1
+        }
+        let renamed = zip(applications, bundleNames).map { application, bundleName in
+            guard displayNames[application.name, default: 0] > 1, nonEmpty(bundleName) != nil,
+                  displayNames[bundleName] == nil, bundleNameCounts[bundleName] == 1 else { return application }
+            return AppsMenuApplication(id: application.id, name: bundleName, url: application.url, category: application.category)
+        }
+        return sortedCatalog(renamed)
+    }
+
+    private nonisolated static func sortedCatalog(_ applications: [AppsMenuApplication]) -> [AppsMenuApplication] {
+        applications.sorted {
             let order = $0.name.localizedStandardCompare($1.name)
             return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
         }
@@ -174,8 +249,42 @@ final class AppsMenuStore {
         }
     }
 
-    func icon(for application: AppsMenuApplication) -> NSImage {
-        NSWorkspace.shared.icon(forFile: application.url.path)
+    func requestIcon(at url: URL, completion: @escaping (NSImage) -> Void) {
+        if let icon = applicationIcons.object(forKey: url as NSURL) {
+            completion(icon)
+            return
+        }
+        if iconCompletions[url] != nil {
+            iconCompletions[url]?.append(completion)
+            return
+        }
+        iconCompletions[url] = [completion]
+        queuedIconURLs.append(url)
+        startNextIconRead()
+    }
+
+    private func startNextIconRead() {
+        guard activeIconReads < Self.concurrentIconReads, !queuedIconURLs.isEmpty else { return }
+        let url = queuedIconURLs.removeFirst()
+        activeIconReads += 1
+        let readIcon = self.readIcon
+        Task { [weak self] in
+            let icon = await readIcon(url)
+            guard let self else { return }
+            applicationIcons.setObject(icon, forKey: url as NSURL)
+            let completions = iconCompletions.removeValue(forKey: url) ?? []
+            activeIconReads -= 1
+            for completion in completions { completion(icon) }
+            startNextIconRead()
+        }
+    }
+
+    @concurrent
+    private nonisolated static func workspaceIcon(at url: URL) async -> sending NSImage {
+        let source = NSWorkspace.shared.icon(forFile: url.path)
+        let icon = source.copy() as? NSImage ?? source
+        icon.size = CGSize(width: 64, height: 64)
+        return icon
     }
 
     func launch(_ application: AppsMenuApplication) {

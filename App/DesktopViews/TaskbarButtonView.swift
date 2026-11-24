@@ -1,5 +1,29 @@
 import AppKit
 
+@MainActor
+struct TaskbarButtonSelection {
+    let opacity: CGFloat
+    private let borderEmphasis: CGFloat
+
+    init(active: Bool, hovered: Bool, pressed: Bool) {
+        switch (pressed, active, hovered) {
+        case (true, _, _): (opacity, borderEmphasis) = (0.45, 0)
+        case (false, true, true): (opacity, borderEmphasis) = (0.95, 0.2)
+        case (false, true, false): (opacity, borderEmphasis) = (0.65, 1)
+        case (false, false, true): (opacity, borderEmphasis) = (0.65, 0.5)
+        default: (opacity, borderEmphasis) = (0, 0)
+        }
+    }
+
+    func applyColors(to box: NSBox, appearance: NSAppearance) {
+        box.fillColor = .unemphasizedSelectedContentBackgroundColor
+        appearance.performAsCurrentDrawingAppearance {
+            let separator = NSColor.separatorColor
+            box.borderColor = separator.withAlphaComponent(separator.alphaComponent * borderEmphasis)
+        }
+    }
+}
+
 extension NSView {
     var containsCurrentMouse: Bool? {
         guard let window else { return nil }
@@ -249,34 +273,13 @@ final class TaskbarButtonView: NSButton {
 
     private func updateAppearance(animated: Bool) {
         state = isActiveWindow ? .on : .off
-        let opacity: CGFloat
-        let borderEmphasis: CGFloat
-        if pressed {
-            opacity = 0.45
-            borderEmphasis = 0
-        } else if isActiveWindow && hovered {
-            opacity = 0.95
-            borderEmphasis = 0.2
-        } else if isActiveWindow {
-            opacity = 0.65
-            borderEmphasis = 1
-        } else if hovered {
-            opacity = 0.65
-            borderEmphasis = 0.5
-        } else {
-            opacity = 0
-            borderEmphasis = 0
-        }
-        selectionView.fillColor = .unemphasizedSelectedContentBackgroundColor
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            let separator = NSColor.separatorColor
-            selectionView.borderColor = separator.withAlphaComponent(separator.alphaComponent * borderEmphasis)
-        }
+        let selection = TaskbarButtonSelection(active: isActiveWindow, hovered: hovered, pressed: pressed)
+        selection.applyColors(to: selectionView, appearance: effectiveAppearance)
         let duration = animated && !reduceMotion() ? TaskbarMotion.buttonTransition : 0
         let progress: CGFloat = isActiveWindow ? 1 : 0
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
-            selectionView.animator().alphaValue = opacity
+            selectionView.animator().alphaValue = selection.opacity
             animator().indicatorProgress = progress
             if duration == 0 { indicatorProgress = progress }
         }

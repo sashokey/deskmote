@@ -39,20 +39,26 @@ extension PanelCoordinator {
         return true
     }
 
-    func orderDockSurfaceFront() {
+    func orderDockSurfaceFront(source: String) {
         dockPanel?.orderFrontRegardless()
+        #if DEBUG
+        recordPanelVisibility(event: "order-front", source: source)
+        #endif
     }
 
-    func orderDockSurfaceOut() {
+    func orderDockSurfaceOut(source: String) {
         taskbarView?.taskbarContent.prepareForHiding()
         dockPanel?.orderOut(nil)
+        #if DEBUG
+        recordPanelVisibility(event: "order-out", source: source)
+        #endif
     }
 
     func presentInitialPanels() {
         guard let dock = dockPanel else { return }
         dock.layoutIfNeeded()
         relayout()
-        orderDockSurfaceFront()
+        orderDockSurfaceFront(source: "initial")
     }
 
     func configurePanel(_ panel: NSPanel, backgroundColor: NSColor, appliesLevelOverride: Bool) {

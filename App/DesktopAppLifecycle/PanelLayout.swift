@@ -15,7 +15,7 @@ extension PanelCoordinator {
         guard let panel = dockPanel else { return }
         let primary = fixedUnitDisplayUUID == nil ? screenProvider().first : nil
         guard let screen = resolvedPinnedScreen() ?? primary ?? panelCurrentScreen(panel: panel) else {
-            orderDockSurfaceOut()
+            orderDockSurfaceOut(source: "screen-unavailable")
             return
         }
         let frame = TaskbarMetrics.panelFrame(on: screen.frame)
@@ -31,7 +31,7 @@ extension PanelCoordinator {
         fullscreenProbeGeneration &+= 1
         taskbarView?.taskbarContent.prepareForHiding()
         relayout()
-        reconcilePanelVisibility()
+        reconcilePanelVisibility(source: "screen-parameters-changed")
         triggerAsyncFullscreenCheck(source: "screen-ax", sharedRead: sharedRead)
     }
 }

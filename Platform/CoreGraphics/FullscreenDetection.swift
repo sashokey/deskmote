@@ -62,12 +62,12 @@ struct FullscreenCGEvidence {
     let overlayWindowID: CGWindowID?
 
     static func classify(_ windows: [[String: Any]], on screen: CGRect, excludingPID: pid_t,
-                         dockPID: pid_t?) -> Self? {
+                         dockPID: pid_t?, systemSurfacePIDs: Set<pid_t> = []) -> Self? {
         var foundForegroundWindow = false
         var screenHeightWindows: [CGRect] = []
         for window in windows {
             let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
-            if ownerPID == excludingPID { continue }
+            if let ownerPID, ownerPID == excludingPID || systemSurfacePIDs.contains(ownerPID) { continue }
             let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
             if let layer, layer < 0 { continue }
             if let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue, alpha <= 0 { continue }

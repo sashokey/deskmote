@@ -38,7 +38,145 @@ final class TaskbarView: NSGlassEffectView {
 
 @MainActor
 private final class TaskbarAppsButton: NSButton {
+    private let selection = NSBox()
+    private let icon = TaskbarAppsIconView(frame: .zero)
+    private var hoverTracking: NSTrackingArea?
+    private var hovered = false
+    private var pressed = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setButtonType(.toggle)
+        isBordered = false
+        isTransparent = true
+        selection.boxType = .custom
+        selection.titlePosition = .noTitle
+        selection.borderWidth = 1
+        selection.cornerRadius = TaskbarMetrics.buttonCornerRadius
+        selection.contentViewMargins = .zero
+        selection.fillColor = .unemphasizedSelectedContentBackgroundColor
+        selection.frame = bounds
+        selection.autoresizingMask = [.width, .height]
+        selection.setAccessibilityElement(false)
+        addSubview(selection)
+        icon.frame = bounds
+        icon.autoresizingMask = [.width, .height]
+        icon.setAccessibilityElement(false)
+        addSubview(icon)
+        updateSelection()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var state: NSControl.StateValue {
+        didSet { updateSelection(animated: true) }
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        super.hitTest(point) == nil ? nil : self
+    }
+
+    override func updateTrackingAreas() {
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let pointer = window.map { convert($0.mouseLocationOutsideOfEventStream, from: nil) }
+        hovered = pointer.map(visibleRect.contains) ?? false
+        var options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
+        if hovered { options.insert(.assumeInside) }
+        let tracking = NSTrackingArea(rect: .zero, options: options, owner: self)
+        addTrackingArea(tracking)
+        hoverTracking = tracking
+        super.updateTrackingAreas()
+        updateSelection()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        updateSelection(animated: true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        updateSelection(animated: true)
+    }
+
+    override func highlight(_ flag: Bool) {
+        super.highlight(flag)
+        pressed = flag
+        updateSelection(animated: true)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateSelection()
+    }
+
+    private func updateSelection(animated: Bool = false) {
+        let appearance = TaskbarButtonSelection(active: state == .on, hovered: hovered, pressed: pressed)
+        appearance.applyColors(to: selection, appearance: effectiveAppearance)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = animated && window?.isVisible == true && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                ? TaskbarMotion.buttonTransition : 0
+            selection.animator().alphaValue = appearance.opacity
+            icon.showColor(hovered || state == .on)
+        }
+    }
+}
+
+@MainActor
+private final class TaskbarAppsIconView: NSView {
+    private static let icons: (color: NSImage, monochrome: NSImage) = {
+        let bundle = "/System/Applications/Apps.app"
+        let color = NSImage(contentsOfFile: bundle + "/Contents/Resources/AppIcon.icns")
+            ?? NSWorkspace.shared.icon(forFile: bundle)
+        let pixels = 128
+        var rect = CGRect(x: 0, y: 0, width: pixels, height: pixels)
+        guard let original = color.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+              let gray = CGContext(data: nil, width: pixels, height: pixels, bitsPerComponent: 8,
+                                   bytesPerRow: pixels * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+              let buffer = gray.data?.assumingMemoryBound(to: UInt8.self) else { return (color, color) }
+        gray.interpolationQuality = .high
+        gray.draw(original, in: CGRect(x: 0, y: 0, width: pixels, height: pixels))
+        for offset in stride(from: 0, to: gray.bytesPerRow * gray.height, by: 4) {
+            let luminance = UInt8((54 * Int(buffer[offset]) + 183 * Int(buffer[offset + 1]) + 19 * Int(buffer[offset + 2]) + 128) / 256)
+            buffer[offset] = luminance
+            buffer[offset + 1] = luminance
+            buffer[offset + 2] = luminance
+        }
+        guard let monochrome = gray.makeImage() else { return (color, color) }
+        return (color, NSImage(cgImage: monochrome, size: color.size))
+    }()
+
+    private let monochrome = NSImageView()
+    private let color = NSImageView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        monochrome.image = Self.icons.monochrome
+        color.image = Self.icons.color
+        for view in [monochrome, color] {
+            view.imageScaling = .scaleProportionallyUpOrDown
+            view.setAccessibilityElement(false)
+            addSubview(view)
+        }
+        color.alphaValue = 0
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        let side: CGFloat = 20
+        let imageFrame = CGRect(x: bounds.midX - side / 2, y: bounds.midY - side / 2, width: side, height: side)
+        monochrome.frame = imageFrame
+        color.frame = imageFrame
+    }
+
+    func showColor(_ shown: Bool) {
+        color.animator().alphaValue = shown ? 1 : 0
+    }
 }
 
 @MainActor
@@ -133,14 +271,9 @@ final class TaskbarContentView: NSView {
     func enableAppsMenu(store: AppsMenuStore = .shared) {
         guard appsButton == nil else { return }
         appsStore = store
+        store.preloadInstalledApplications()
         let title = String(localized: "Apps")
         let button = TaskbarAppsButton(frame: AppsMenuGeometry.buttonFrame)
-        button.setButtonType(.toggle)
-        button.bezelStyle = .accessoryBar
-        button.showsBorderOnlyWhileMouseInside = true
-        button.imagePosition = .imageOnly
-        button.image = NSImage(systemSymbolName: "square.grid.3x3.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 15, weight: .semibold))
         button.toolTip = title
         button.setAccessibilityLabel(title)
         button.setAccessibilityIdentifier("DeskMote.Apps")
@@ -164,6 +297,10 @@ final class TaskbarContentView: NSView {
         dismissPopups()
         cancelFileHover()
         let menu = AppsMenuView(frame: CGRect(origin: .zero, size: frame.size), store: appsStore,
+                                runningWindows: { [weak self] pid in
+                                    self?.groups.flatMap(\.windows).filter { $0.item.resourcePID == pid } ?? []
+                                },
+                                activateWindow: { [weak self] target in self?.actions.activate(target) },
                                 dismiss: { [weak self] in self?.dismissPopups() })
         popup.present(content: menu, frame: frame, anchorWindow: window)
         appsMenu = menu
@@ -391,11 +528,11 @@ final class TaskbarContentView: NSView {
         dismissTask = nil
     }
 
-    func dismissPopups() {
+    func dismissPopups(animate: Bool = true) {
         pointerAnchor = nil
         hoverTask?.cancel()
         cancelDismiss()
-        popup.dismiss()
+        if animate { popup.dismiss() } else { popup.dismissImmediately() }
         contextMenu.dismiss()
     }
 
@@ -404,7 +541,7 @@ final class TaskbarContentView: NSView {
     }
 
     func prepareForHiding() {
-        dismissPopups()
+        dismissPopups(animate: false)
         cancelFileHover()
         buttonViews.values.forEach { $0.cancelPendingPress() }
         overflowButton?.cancelPendingPress()

@@ -13,6 +13,94 @@ private final class TaskbarPopupPanel: NonConstrainingPanel {
 }
 
 @MainActor
+private final class AppsPopupViewport: NSView {
+    private enum Phase { case resting, opening, closing }
+
+    private static let key = "apps-popup-slide"
+    private let appsView: AppsMenuView
+    private var restingFrame: CGRect
+    private var phase: Phase = .resting
+    private var bottomInset: CGFloat { phase == .resting ? 0 : AppsMenuGeometry.popupGap }
+    private var travel: CGFloat { restingFrame.height + AppsMenuGeometry.popupGap }
+
+    init(menu: AppsMenuView, restingFrame: CGRect) {
+        appsView = menu
+        self.restingFrame = restingFrame
+        super.init(frame: menu.frame)
+        clipsToBounds = true
+        wantsLayer = true
+        menu.wantsLayer = true
+        addSubview(menu)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard phase == .resting else { return nil }
+        return super.hitTest(point)
+    }
+
+    func updateFrame(_ frame: CGRect) {
+        guard frame != restingFrame else { return }
+        restingFrame = frame
+        applyFrame()
+    }
+
+    func slideIn() {
+        phase = .opening
+        applyFrame()
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            Task { @MainActor in
+                guard let self, self.phase == .opening, self.window != nil else { return }
+                self.phase = .resting
+                self.applyFrame()
+            }
+        }
+        slide(fractions: [1, 0.53, 0.28, 0.12, 0.04, 0.006, 0],
+              times: [0, 0.16, 0.34, 0.50, 0.67, 0.84, 1], retainEnd: false)
+        CATransaction.commit()
+    }
+
+    func slideOut(completion: @escaping @Sendable () -> Void) {
+        let offset = appsView.layer?.presentation()?.transform.m42 ?? (phase == .opening ? -travel : 0)
+        let initial = min(1, max(0, -offset / max(1, travel)))
+        phase = .closing
+        appsView.stopMenuActions()
+        setAccessibilityHidden(true)
+        window?.makeFirstResponder(nil)
+        applyFrame()
+        let fractions: [CGFloat] = [0, 0.009, 0.042, 0.112, 0.234, 0.414, 0.70, 1]
+        CATransaction.begin()
+        CATransaction.setCompletionBlock(completion)
+        slide(fractions: fractions.map { initial + (1 - initial) * $0 },
+              times: [0, 0.13, 0.27, 0.42, 0.57, 0.71, 0.85, 1], retainEnd: true)
+        CATransaction.commit()
+    }
+
+    private func applyFrame() {
+        var viewportFrame = restingFrame
+        viewportFrame.origin.y -= bottomInset
+        viewportFrame.size.height += bottomInset
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let window, window.frame != viewportFrame { window.setFrame(viewportFrame, display: false) }
+        appsView.frame = CGRect(origin: CGPoint(x: 0, y: bottomInset), size: restingFrame.size)
+        CATransaction.commit()
+    }
+
+    private func slide(fractions: [CGFloat], times: [NSNumber], retainEnd: Bool) {
+        let motion = CAKeyframeAnimation(keyPath: "transform.translation.y")
+        motion.values = fractions.map { NSNumber(value: Double(-$0 * travel)) }
+        motion.keyTimes = times
+        motion.duration = 0.19
+        motion.isRemovedOnCompletion = !retainEnd
+        if retainEnd { motion.fillMode = .forwards }
+        appsView.layer?.add(motion, forKey: Self.key)
+    }
+}
+
+@MainActor
 protocol TaskbarPopupPresenting: AnyObject {
     var panel: NSPanel? { get }
     var isPresented: Bool { get }
@@ -22,9 +110,12 @@ protocol TaskbarPopupPresenting: AnyObject {
     func updateFrame(_ frame: CGRect)
     func makeKey()
     func dismiss()
+    func dismissImmediately()
 }
 
 extension TaskbarPopupPresenting {
+    func dismissImmediately() { dismiss() }
+
     func updateFrame(_ frame: CGRect) {
         guard let panel, panel.frame != frame else { return }
         panel.setFrame(frame, display: true)
@@ -37,17 +128,21 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
     var isPresented: Bool { panel != nil }
     private var resignKeyObserver: NSObjectProtocol?
     private let makePanel: (CGRect) -> NSPanel
+    private let reduceMotion: () -> Bool
+    private var closingPanel: NSPanel?
     var onPresent: ((NSPanel) -> Void)?
     var onDismiss: (() -> Void)?
 
-    init(makePanel: ((CGRect) -> NSPanel)? = nil) {
+    init(makePanel: ((CGRect) -> NSPanel)? = nil,
+         reduceMotion: @escaping () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }) {
+        self.reduceMotion = reduceMotion
         self.makePanel = makePanel ?? {
             TaskbarPopupPanel(contentRect: $0, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         }
     }
 
     func present(content: NSView, frame: CGRect, anchorWindow: NSWindow?) {
-        dismiss()
+        dismissImmediately()
         let panel = makePanel(frame)
         panel.isReleasedWhenClosed = false
         panel.backgroundColor = .clear
@@ -59,8 +154,13 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
         panel.collectionBehavior = PanelCollectionBehavior.standard
         panel.appearance = anchorWindow?.effectiveAppearance
         content.frame = CGRect(origin: .zero, size: frame.size)
-        panel.contentView = content
+        let viewport = (content as? AppsMenuView).map { AppsPopupViewport(menu: $0, restingFrame: frame) }
+        panel.contentView = (viewport as NSView?) ?? content
         self.panel = panel
+        if let viewport, !reduceMotion() {
+            panel.animationBehavior = .none
+            viewport.slideIn()
+        }
         panel.orderFrontRegardless()
         onPresent?(panel)
         resignKeyObserver = NotificationCenter.default.addObserver(
@@ -75,22 +175,59 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
 
     func makeKey() { panel?.makeKey() }
 
-    func dismiss() {
+    func updateFrame(_ frame: CGRect) {
+        guard let panel else { return }
+        if let viewport = panel.contentView as? AppsPopupViewport {
+            viewport.updateFrame(frame)
+        } else if panel.frame != frame {
+            panel.setFrame(frame, display: true)
+        }
+    }
+
+    func dismiss() { dismiss(animated: true) }
+
+    func dismissImmediately() {
+        if let closingPanel {
+            Self.close(closingPanel)
+            self.closingPanel = nil
+        }
+        dismiss(animated: false)
+    }
+
+    private func dismiss(animated: Bool) {
         if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
         resignKeyObserver = nil
+        let panel = self.panel
+        self.panel = nil
         if let panel {
             (panel.contentView as? TaskbarWindowListView)?.cancelPendingActions()
-            panel.orderOut(nil)
-            panel.contentView = nil
-            panel.close()
+            if animated, let viewport = panel.contentView as? AppsPopupViewport, !reduceMotion() {
+                closingPanel = panel
+                panel.ignoresMouseEvents = true
+                viewport.slideOut { [weak self, weak panel] in
+                    Task { @MainActor in
+                        guard let self, let panel, self.closingPanel === panel else { return }
+                        self.closingPanel = nil
+                        Self.close(panel)
+                    }
+                }
+            } else {
+                Self.close(panel)
+            }
         }
-        panel = nil
         onDismiss?()
+    }
+
+    private static func close(_ panel: NSPanel) {
+        panel.orderOut(nil)
+        panel.contentView = nil
+        panel.close()
     }
 
     isolated deinit {
         if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
         panel?.orderOut(nil)
+        closingPanel?.orderOut(nil)
     }
 }
 

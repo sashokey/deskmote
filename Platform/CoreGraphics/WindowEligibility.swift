@@ -5,6 +5,10 @@ import Foundation
 
 struct DockWindowEligibilityPolicy {
     static let selfBundleIdentifier = ApplicationIdentity.properWMIdentifier
+    static let systemSurfaceBundleIdentifiers: Set<String> = [
+        "com.apple.notificationcenterui",
+        "com.apple.controlcenter"
+    ]
 
     enum Decision: Equatable {
         case keep
@@ -77,7 +81,7 @@ struct DockWindowEligibilityPolicy {
 
     private func systemSurfaceVerdict(_ candidate: Candidate) -> Verdict? {
         if let bundleIdentifier = candidate.bundleIdentifier,
-           filteredBundleIdentifiers.contains(bundleIdentifier) {
+           Self.systemSurfaceBundleIdentifiers.contains(bundleIdentifier) {
             return .systemSurfaceBundle
         }
 
@@ -107,11 +111,6 @@ struct DockWindowEligibilityPolicy {
         guard let bounds else { return false }
         return bounds.width >= 80 && bounds.height >= 40
     }
-
-    private let filteredBundleIdentifiers: Set<String> = [
-        "com.apple.notificationcenterui",
-        "com.apple.controlcenter"
-    ]
 
     private let filteredAppNames: Set<String> = [
         "Notification Center",

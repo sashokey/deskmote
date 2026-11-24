@@ -13,6 +13,36 @@ private final class PanelInventory: WindowInventoryTracking {
 
 @MainActor
 final class PanelLifecycleTests: XCTestCase {
+    #if DEBUG
+    func testVisibilityJournalRecordsNativeLossEvenWhenThePanelIsStillRequested() throws {
+        let lines = Mutex<[Data]>([])
+        let journal = TaskbarVisibilityJournal { line in lines.withLock { $0.append(line) } }
+        var state = TaskbarVisibilitySample(windowNumber: 25, primaryDisplay: true,
+                                            requestedVisible: true, fullscreen: false, appKitVisible: true,
+                                            onActiveSpace: true, windowServerOnScreen: true,
+                                            occlusionVisible: true, alpha: "opaque", repairingMembership: false)
+        journal.capture(state)
+        journal.capture(state)
+        state.windowServerOnScreen = false
+        journal.capture(state)
+        journal.capture(state, event: "order-front", source: "space-ax-cg", candidateWindowID: 51)
+        journal.flush()
+        let recorded = lines.withLock { $0 }
+        let values = try recorded.map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any])
+        }
+        XCTAssertEqual(values.count, 3)
+        XCTAssertEqual(values.map { $0["event"] as? String }, ["observed", "observed", "order-front"])
+        let interrupted = try XCTUnwrap(values[1]["state"] as? [String: Any])
+        XCTAssertEqual(interrupted["primaryDisplay"] as? Bool, true)
+        XCTAssertEqual(interrupted["requestedVisible"] as? Bool, true)
+        XCTAssertEqual(interrupted["windowServerOnScreen"] as? Bool, false)
+        XCTAssertNotNil(values[1]["timestamp"] as? String)
+        XCTAssertEqual(values[2]["source"] as? String, "space-ax-cg")
+        XCTAssertEqual(values[2]["candidateWindowID"] as? Int, 51)
+    }
+    #endif
+
     private final class DetachedDockPanel: NSPanel {
         var onOrderOut: (() -> Void)?
 

@@ -54,7 +54,13 @@ extension PanelCoordinator {
         }
 
         spaceMembershipRepairInFlight = true
+        #if DEBUG
+        recordPanelVisibility(event: "membership-repair-start", source: "attempt-\(attempt)")
+        #endif
         PanelCollectionBehavior.restoreMembership(of: broken) { [weak self] in
+            #if DEBUG
+            self?.recordPanelVisibility(event: "membership-repair-restored", source: "attempt-\(attempt)")
+            #endif
             DispatchQueue.main.asyncAfter(deadline: .now() + AllSpacesMembership.verifyDelay) { [weak self] in
                 self?.repairAllSpacesMembershipIfNeeded(attempt: attempt + 1)
             }
@@ -68,6 +74,7 @@ extension PanelCoordinator {
         guard !panels.isEmpty else { return }
         if !host.pin(panels: panels) {
             #if DEBUG
+            recordPanelVisibility(event: "overlay-pin-failed", source: "resident-panels")
             let windowNumbers = panels.map(\.windowNumber)
             logger.error("[overlay-space] pin failed windows=\(windowNumbers, privacy: .public)")
             #endif

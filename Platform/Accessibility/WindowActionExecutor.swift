@@ -381,11 +381,10 @@ struct AccessibilityWindowActionExecutor: Sendable {
         rebindAfterRestore: Bool = false
     ) -> Bool {
         var handle = handle
-        guard canAct(on: handle) else { return false }
-        let wasMinimized = knownMinimized || reader.boolAttribute(kAXMinimizedAttribute as CFString, from: handle.element) == true
         var canRebind = false
         var restoredNumber = knownCGWindowID
         var rebindDeadline: TimeInterval = 0
+        var visibleRetryDeadline: TimeInterval?
 
         func revalidateHandle() -> Bool {
             if canAct(on: handle) { return true }
@@ -405,13 +404,27 @@ struct AccessibilityWindowActionExecutor: Sendable {
 
         func waitsForCurrentHandle() -> Bool {
             while !revalidateHandle() {
-                guard canRebind, !cancellation.isCancelled,
-                      ProcessInfo.processInfo.systemUptime < rebindDeadline else { return false }
+                guard !cancellation.isCancelled else { return false }
+                let now = ProcessInfo.processInfo.systemUptime
+                if canRebind {
+                    guard now < rebindDeadline else { return false }
+                } else {
+                    guard !knownMinimized, knownCGWindowID != nil, canAct(pid: handle.pid) else { return false }
+                    if visibleRetryDeadline == nil {
+                        visibleRetryDeadline = now + min(0.15, max(0, confirmationTimeout))
+                        #if DEBUG
+                        ClickLatencyTrace.markCurrent("visibleIdentityRetry")
+                        #endif
+                    }
+                    guard let visibleRetryDeadline, now < visibleRetryDeadline else { return false }
+                }
                 usleep(2_000)
             }
             return true
         }
 
+        guard waitsForCurrentHandle() else { return false }
+        let wasMinimized = knownMinimized || reader.boolAttribute(kAXMinimizedAttribute as CFString, from: handle.element) == true
         if wasMinimized {
             if preActivateForRestore, let wid = knownCGWindowID {
                 postSkyLightFrontSwitchOnly(pid: handle.pid, windowID: wid, element: handle.element)

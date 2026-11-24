@@ -20,6 +20,9 @@ final class PanelCoordinator: NSObject {
     var displayTopologySubscription: AnyCancellable?
     #if DEBUG
     let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "dock-panel")
+    let taskbarVisibilityJournal = TaskbarVisibilityJournal.live()
+    var panelVisibilitySampler: Timer?
+    var diagnosticFullscreenCandidate: CGWindowID?
     #endif
     var fullscreenProbeWorker: FullscreenProbeWorker?
     var fullscreenFrameProvider: (() -> CGRect?)?
@@ -87,17 +90,23 @@ final class PanelCoordinator: NSObject {
         pinResidentPanelsIfNeeded()
         subscribeSettings()
         setupFullscreenMonitor()
+        #if DEBUG
+        startPanelVisibilitySampling()
+        #endif
         return true
     }
 
     isolated deinit {
+        #if DEBUG
+        panelVisibilitySampler?.invalidate()
+        #endif
         fullscreenProbeWorker?.stop()
         fullscreenSpaceHoldTimer?.invalidate()
         overlayWindowWatchTimer?.invalidate()
         taskbarView?.taskbarContent.prepareForHiding()
     }
 
-    func tearDown() {
+    func tearDown(source: String = "teardown") {
         guard !isSuspendedForPermissionLoss else { return }
         isSuspendedForPermissionLoss = true
         fullscreenProbeGeneration &+= 1
@@ -111,7 +120,11 @@ final class PanelCoordinator: NSObject {
         displayTopologySubscription?.cancel()
         displayTopologySubscription = nil
         taskbarPresenter?.setPanelVisible(false)
-        orderDockSurfaceOut()
+        #if DEBUG
+        panelVisibilitySampler?.invalidate()
+        panelVisibilitySampler = nil
+        #endif
+        orderDockSurfaceOut(source: source)
         taskbarPresenter = nil
         dockContentHost = nil
         taskbarView = nil
