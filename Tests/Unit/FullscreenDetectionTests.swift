@@ -47,6 +47,38 @@ final class FullscreenClassificationTests: XCTestCase {
             .fullscreen)
     }
 
+    func testDockTrackingSurfaceDoesNotProduceFullscreenEvidence() {
+        let screen = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+        let dockPID: pid_t = 41
+        let trackingSurface: [String: Any] = [
+            kCGWindowNumber as String: 15,
+            kCGWindowOwnerPID as String: dockPID,
+            kCGWindowLayer as String: 20,
+            kCGWindowAlpha as String: 1,
+            kCGWindowSharingState as String: 0,
+            kCGWindowIsOnscreen as String: true,
+            kCGWindowBounds as String: screen.dictionaryRepresentation,
+        ]
+        let desktopWindow: [String: Any] = [
+            kCGWindowNumber as String: 100,
+            kCGWindowOwnerPID as String: 42,
+            kCGWindowLayer as String: 0,
+            kCGWindowBounds as String: CGRect(x: 0, y: 30, width: 2560, height: 1376).dictionaryRepresentation,
+        ]
+
+        let evidence = FullscreenCGEvidence.classify(
+            [trackingSurface, desktopWindow], on: screen, excludingPID: -1, dockPID: dockPID)
+        XCTAssertEqual(evidence?.state, .windowed)
+        XCTAssertNil(evidence?.overlayWindowID)
+
+        var fullscreenWindow = desktopWindow
+        fullscreenWindow[kCGWindowBounds as String] = screen.dictionaryRepresentation
+        let fullscreen = FullscreenCGEvidence.classify(
+            [trackingSurface, fullscreenWindow], on: screen, excludingPID: -1, dockPID: dockPID)
+        XCTAssertEqual(fullscreen?.state, .fullscreen)
+        XCTAssertEqual(fullscreen?.overlayWindowID, 100)
+    }
+
     func testOverlayWatchKeepsWaitingWhileTheWindowStillCoversTheScreen() {
         XCTAssertFalse(OverlayWindowWatch.shouldRecheck(isOnscreen: true, bounds: screen, displayWindowServerFrame: screen))
         let nudged = screen.insetBy(dx: 2, dy: 2)

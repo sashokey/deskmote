@@ -99,7 +99,9 @@ extension PanelCoordinator {
             capture()
         }
         guard let windows else { return nil }
-        return FullscreenCGEvidence.classify(windows, on: screen, excludingPID: ProcessInfo.processInfo.processIdentifier)
+        let dockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
+        return FullscreenCGEvidence.classify(
+            windows, on: screen, excludingPID: ProcessInfo.processInfo.processIdentifier, dockPID: dockPID)
     }
 
     func triggerAsyncFullscreenCheck(

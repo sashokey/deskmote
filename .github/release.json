@@ -1,6 +1,6 @@
 {
-  "version": "v3",
-  "draft": false,
+  "version": "v4",
+  "draft": true,
   "prerelease": false,
-  "notes": "- Fixed delayed taskbar buttons when opening apps or moving windows between displays. Improved active-window selection for Steam and rapid switching between apps.\n- Improved fullscreen detection and grouped taskbar lists. Preserved manual window sizing during animated height adjustments and restored managed heights when quitting.\n- Fixed input monitoring recovery and improved Battery Run estimates across power transitions, observation gaps, and clock changes.\n- Improved Finder file creation, air-quality page parsing, and widget recovery.\n- Strengthened WindowLab identity checks and release verification."
+  "notes": "- Fixed the taskbar disappearing and adjusted windows returning to full height when revealing the auto-hidden macOS Dock on the desktop.\n- Stabilized regression tests for focus handoff after closing windows and for window height adjustment."
 }

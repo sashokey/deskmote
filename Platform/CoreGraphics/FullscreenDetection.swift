@@ -61,16 +61,24 @@ struct FullscreenCGEvidence {
     let state: State
     let overlayWindowID: CGWindowID?
 
-    static func classify(_ windows: [[String: Any]], on screen: CGRect, excludingPID: pid_t) -> Self? {
+    static func classify(_ windows: [[String: Any]], on screen: CGRect, excludingPID: pid_t,
+                         dockPID: pid_t?) -> Self? {
         var foundForegroundWindow = false
         var screenHeightWindows: [CGRect] = []
         for window in windows {
-            if (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == excludingPID { continue }
-            if let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue, layer < 0 { continue }
+            let ownerPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            if ownerPID == excludingPID { continue }
+            let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
+            if let layer, layer < 0 { continue }
             if let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue, alpha <= 0 { continue }
             guard let rawBounds = window[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: rawBounds as CFDictionary),
                   !bounds.isNull, !bounds.isInfinite else { return nil }
+            if let dockPID, ownerPID == dockPID, layer == Int(CGWindowLevelForKey(.dockWindow)),
+               (window[kCGWindowSharingState as String] as? NSNumber)?.uint32Value == CGWindowSharingType.none.rawValue,
+               FullscreenWindowClassifier.matchesScreenFrame(bounds, screen) {
+                continue
+            }
             let overlap = bounds.intersection(screen)
             guard !overlap.isNull else { continue }
             if !foundForegroundWindow, overlap.width > screen.width * 0.7,
