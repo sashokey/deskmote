@@ -30,6 +30,9 @@ private final class AppsPopupViewport: NSView {
         clipsToBounds = true
         wantsLayer = true
         menu.wantsLayer = true
+        menu.clipsToBounds = true
+        menu.layer?.cornerRadius = menu.cornerRadius
+        menu.layer?.cornerCurve = .continuous
         addSubview(menu)
     }
 
@@ -147,7 +150,6 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
         panel.isReleasedWhenClosed = false
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = true
         panel.level = .popUpMenu
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
@@ -155,6 +157,7 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
         panel.appearance = anchorWindow?.effectiveAppearance
         content.frame = CGRect(origin: .zero, size: frame.size)
         let viewport = (content as? AppsMenuView).map { AppsPopupViewport(menu: $0, restingFrame: frame) }
+        panel.hasShadow = viewport == nil
         panel.contentView = (viewport as NSView?) ?? content
         self.panel = panel
         if let viewport, !reduceMotion() {

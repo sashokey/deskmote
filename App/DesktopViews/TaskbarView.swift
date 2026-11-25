@@ -44,8 +44,12 @@ private final class TaskbarAppsButton: NSButton {
     private var hovered = false
     private var pressed = false
 
+    override var isFlipped: Bool { true }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        let visualBounds = CGRect(origin: .zero, size: AppsMenuGeometry.buttonFrame.size)
+        clipsToBounds = true
         setButtonType(.toggle)
         isBordered = false
         isTransparent = true
@@ -55,12 +59,12 @@ private final class TaskbarAppsButton: NSButton {
         selection.cornerRadius = TaskbarMetrics.buttonCornerRadius
         selection.contentViewMargins = .zero
         selection.fillColor = .unemphasizedSelectedContentBackgroundColor
-        selection.frame = bounds
-        selection.autoresizingMask = [.width, .height]
+        selection.frame = visualBounds
+        selection.autoresizingMask = [.width]
         selection.setAccessibilityElement(false)
         addSubview(selection)
-        icon.frame = bounds
-        icon.autoresizingMask = [.width, .height]
+        icon.frame = visualBounds
+        icon.autoresizingMask = [.width]
         icon.setAccessibilityElement(false)
         addSubview(icon)
         updateSelection()
@@ -69,7 +73,10 @@ private final class TaskbarAppsButton: NSButton {
     required init?(coder: NSCoder) { nil }
 
     override var state: NSControl.StateValue {
-        didSet { updateSelection(animated: true) }
+        didSet {
+            hovered = containsCurrentMouse ?? hovered
+            updateSelection(animated: true)
+        }
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -80,11 +87,9 @@ private final class TaskbarAppsButton: NSButton {
 
     override func updateTrackingAreas() {
         if let hoverTracking { removeTrackingArea(hoverTracking) }
-        let pointer = window.map { convert($0.mouseLocationOutsideOfEventStream, from: nil) }
-        hovered = pointer.map(visibleRect.contains) ?? false
-        var options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
-        if hovered { options.insert(.assumeInside) }
-        let tracking = NSTrackingArea(rect: .zero, options: options, owner: self)
+        hovered = containsCurrentMouse ?? false
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                      owner: self)
         addTrackingArea(tracking)
         hoverTracking = tracking
         super.updateTrackingAreas()
@@ -92,12 +97,17 @@ private final class TaskbarAppsButton: NSButton {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        hovered = true
-        updateSelection(animated: true)
+        updateHover(whenDetached: true)
     }
 
     override func mouseExited(with event: NSEvent) {
-        hovered = false
+        updateHover(whenDetached: false)
+    }
+
+    private func updateHover(whenDetached: Bool) {
+        let isInside = containsCurrentMouse ?? whenDetached
+        guard hovered != isInside else { return }
+        hovered = isInside
         updateSelection(animated: true)
     }
 
@@ -273,7 +283,7 @@ final class TaskbarContentView: NSView {
         appsStore = store
         store.preloadInstalledApplications()
         let title = String(localized: "Apps")
-        let button = TaskbarAppsButton(frame: AppsMenuGeometry.buttonFrame)
+        let button = TaskbarAppsButton(frame: interactionFrame(for: AppsMenuGeometry.buttonFrame))
         button.toolTip = title
         button.setAccessibilityLabel(title)
         button.setAccessibilityIdentifier("DeskMote.Apps")
@@ -344,6 +354,7 @@ final class TaskbarContentView: NSView {
     override func layout() {
         super.layout()
         lastLayoutBounds = bounds
+        appsButton?.frame = interactionFrame(for: AppsMenuGeometry.buttonFrame)
         let groupLookup = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         if measuredLayoutGroups == nil {
             let font = NSFont.systemFont(ofSize: TaskbarMetrics.fontSize)

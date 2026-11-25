@@ -87,7 +87,7 @@ final class TaskbarRendererTests: XCTestCase {
         let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
             .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
         let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        XCTAssertEqual(selection.frame, button.bounds)
+        XCTAssertEqual(selection.frame, CGRect(x: 0, y: 0, width: 29, height: 28))
         XCTAssertEqual(selection.cornerRadius, TaskbarMetrics.buttonCornerRadius)
         XCTAssertEqual(selection.alphaValue, 0)
         let reference = TaskbarButtonView(frame: button.frame)
@@ -116,14 +116,15 @@ final class TaskbarRendererTests: XCTestCase {
         content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
         let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
             .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
+        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
         func chromaticPixels() throws -> Int {
             let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 58, pixelsHigh: 56,
                                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
-            bitmap.size = button.bounds.size
+            bitmap.size = selection.bounds.size
             button.layoutSubtreeIfNeeded()
             button.effectiveAppearance.performAsCurrentDrawingAppearance {
-                button.cacheDisplay(in: button.bounds, to: bitmap)
+                button.cacheDisplay(in: selection.frame, to: bitmap)
             }
             var count = 0
             for y in 10..<46 {
@@ -136,15 +137,12 @@ final class TaskbarRendererTests: XCTestCase {
             }
             return count
         }
-        func pointerEvent(_ type: NSEvent.EventType) throws -> NSEvent {
-            try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: .zero, modifierFlags: [],
-                                                timestamp: 0, windowNumber: panel.windowNumber, context: nil,
-                                                eventNumber: 1, trackingNumber: 1, userData: nil))
-        }
         XCTAssertEqual(try chromaticPixels(), 0)
-        button.mouseEntered(with: try pointerEvent(.mouseEntered))
+        panel.pointer = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: button)
         XCTAssertGreaterThan(try chromaticPixels(), 15)
-        button.mouseExited(with: try pointerEvent(.mouseExited))
+        panel.pointer = .zero
+        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: button)
         XCTAssertEqual(try chromaticPixels(), 0)
         button.state = .on
         XCTAssertGreaterThan(try chromaticPixels(), 15)
@@ -171,29 +169,88 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertFalse(panel.isVisible)
     }
 
+    func testAppsButtonHoversAtTheBottomScreenPixelAtBothScales() throws {
+        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
+        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        defer { panel.close() }
+        let content = TaskbarContentView(frame: frame, popup: Popup())
+        panel.contentView = content
+        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
+        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
+            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
+        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
+        content.layoutSubtreeIfNeeded()
+
+        for scale: CGFloat in [1, 2] {
+            let point = CGPoint(x: button.frame.midX, y: 32 - 0.5 / scale)
+            panel.pointer = content.convert(point, to: nil)
+            button.updateTrackingAreas()
+            let area = try XCTUnwrap(button.trackingAreas.first { $0.options.contains(.mouseEnteredAndExited) })
+            let trackingRect = area.options.contains(.inVisibleRect) ? button.visibleRect : area.rect
+            XCTAssertTrue(trackingRect.contains(button.convert(point, from: content)))
+            XCTAssertFalse(trackingRect.contains(button.convert(CGPoint(x: 40, y: point.y), from: content)))
+            XCTAssertTrue(content.hitTest(panel.pointer) === button)
+            XCTAssertGreaterThan(selection.alphaValue, 0)
+            XCTAssertEqual(button.convert(selection.frame, to: content), CGRect(x: 10, y: 2, width: 29, height: 28))
+        }
+        XCTAssertFalse(panel.isVisible)
+    }
+
+    func testAppsButtonHoverFollowsTheCurrentPointerWhenTrackingEventsArriveLate() throws {
+        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
+        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        defer { panel.close() }
+        let content = TaskbarContentView(frame: frame, popup: Popup())
+        panel.contentView = content
+        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
+        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
+            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
+        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
+        let inside = content.convert(CGPoint(x: 24, y: 15), to: nil)
+        let outside = content.convert(CGPoint(x: 90, y: 15), to: nil)
+
+        panel.pointer = inside
+        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
+        XCTAssertGreaterThan(selection.alphaValue, 0)
+        try sendTrackingEvent(.mouseExited, at: outside, to: button)
+        XCTAssertGreaterThan(selection.alphaValue, 0)
+        panel.pointer = outside
+        try sendTrackingEvent(.mouseExited, at: outside, to: button)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
+        XCTAssertEqual(selection.alphaValue, 0)
+
+        panel.pointer = inside
+        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
+        button.state = .on
+        panel.pointer = outside
+        button.state = .off
+        XCTAssertEqual(selection.alphaValue, 0)
+    }
+
     func testAppsButtonGlyphIsCenteredInTheRenderedHoverAtBothScales() throws {
         let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32))
         content.appearance = NSAppearance(named: .darkAqua)
-        let panel = NSPanel(contentRect: content.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let panel = RecordingPopupPanel(contentRect: content.frame, styleMask: .borderless, backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         defer { panel.close() }
         panel.contentView = content
         content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
         let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
             .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let hover = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero, modifierFlags: [],
-                                                        timestamp: 0, windowNumber: panel.windowNumber, context: nil,
-                                                        eventNumber: 1, trackingNumber: 1, userData: nil))
-        button.mouseEntered(with: hover)
+        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
+        panel.pointer = button.convert(CGPoint(x: selection.frame.midX, y: selection.frame.midY), to: nil)
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: button)
         button.layoutSubtreeIfNeeded()
         for scale in [1.0, 2.0] {
             let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(29 * scale),
                                                        pixelsHigh: Int(28 * scale), bitsPerSample: 8,
                                                        samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                                        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
-            bitmap.size = button.bounds.size
+            bitmap.size = selection.bounds.size
             button.effectiveAppearance.performAsCurrentDrawingAppearance {
-                button.cacheDisplay(in: button.bounds, to: bitmap)
+                button.cacheDisplay(in: selection.frame, to: bitmap)
             }
             var glyph = CGRect.null
             var weightedX = 0.0
@@ -223,7 +280,7 @@ final class TaskbarRendererTests: XCTestCase {
         _ = NSApplication.shared
         let screen = try XCTUnwrap(NSScreen.main)
         let frame = TaskbarMetrics.panelFrame(on: screen.frame)
-        let panel = NSPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         defer { panel.close() }
         let popup = Popup()
@@ -237,13 +294,13 @@ final class TaskbarRendererTests: XCTestCase {
         content.admitWindowList = { explicit in admissions.append(explicit); return true }
         let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
             .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        XCTAssertEqual(button.frame, AppsMenuGeometry.buttonFrame)
+        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
+        XCTAssertEqual(button.convert(selection.frame, to: content), AppsMenuGeometry.buttonFrame)
         button.performClick(nil)
         XCTAssertTrue(popup.content is AppsMenuView)
         XCTAssertEqual(admissions, [true])
         XCTAssertTrue(content.hasExplicitPopup)
         XCTAssertEqual(button.state, .on)
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
         XCTAssertGreaterThan(selection.alphaValue, 0)
         let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero, modifierFlags: [],
                                                        timestamp: 0, windowNumber: panel.windowNumber, context: nil,
@@ -692,6 +749,7 @@ final class TaskbarRendererTests: XCTestCase {
         let list = TaskbarWindowListView(windows: groups()[0].windows, availableHeight: 120, icon: { _ in nil },
                                         activate: { activated.append($0.id) }, close: { _ in }, fileHover: { _ in })
         controller.present(content: list, frame: list.bounds, anchorWindow: nil)
+        XCTAssertTrue(panel.hasShadow)
         XCTAssertEqual(panel.frontRequests, 1)
         XCTAssertEqual(panel.keyRequests, 0)
         controller.makeKey()
@@ -784,6 +842,7 @@ final class TaskbarRendererTests: XCTestCase {
         defer { controller.dismissImmediately() }
         let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] })) {}
         controller.present(content: menu, frame: frame, anchorWindow: nil)
+        XCTAssertFalse(panel.hasShadow)
         XCTAssertEqual(panel.frameAtFront, animatedFrame)
         let viewport = try XCTUnwrap(panel.contentView)
         XCTAssertTrue(viewport.clipsToBounds)
@@ -831,12 +890,51 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertFalse(panel.isVisible)
     }
 
+    func testAppsPopupClipsItsMaterialToRoundedCornersInHiddenPanel() throws {
+        let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
+        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let controller = TaskbarPopupController(makePanel: { _ in panel }, reduceMotion: { true })
+        defer { controller.dismissImmediately() }
+        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] })) {}
+        controller.present(content: menu, frame: frame, anchorWindow: nil)
+        let viewport = try XCTUnwrap(panel.contentView)
+        viewport.layoutSubtreeIfNeeded()
+        let glassLayer = try XCTUnwrap(menu.layer)
+        let materialSample = CALayer()
+        materialSample.frame = glassLayer.bounds
+        materialSample.backgroundColor = NSColor(white: 0.53, alpha: 1).cgColor
+        glassLayer.addSublayer(materialSample)
+        defer { materialSample.removeFromSuperlayer() }
+
+        for scale in [1, 2] {
+            let width = Int(frame.width) * scale
+            let height = Int(frame.height) * scale
+            let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+            let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: bitmap)?.cgContext)
+            context.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
+            glassLayer.render(in: context)
+            for (x, y) in [(1, 1), (width - 2, 1), (1, height - 2), (width - 2, height - 2)] {
+                let corner = try XCTUnwrap(bitmap.colorAt(x: x, y: y))
+                XCTAssertLessThan(corner.alphaComponent, 0.05, "Corner at \(x), \(y) at \(scale)x")
+            }
+            XCTAssertGreaterThan(try XCTUnwrap(bitmap.colorAt(x: width / 2, y: 2 * scale)).alphaComponent, 0.95)
+            if let path = ProcessInfo.processInfo.environment["DESKMOTE_RENDER_PATH"] {
+                let url = URL(fileURLWithPath: path, isDirectory: true).appendingPathComponent("apps-corners-\(scale)x.png")
+                try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
+            }
+        }
+        XCTAssertFalse(panel.isVisible)
+    }
+
     func testAppsPopupPresentsAndDismissesImmediatelyWithReduceMotion() {
         let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
         let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         let controller = TaskbarPopupController(makePanel: { _ in panel }, reduceMotion: { true })
         let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] })) {}
         controller.present(content: menu, frame: frame, anchorWindow: nil)
+        XCTAssertFalse(panel.hasShadow)
         XCTAssertEqual(panel.frameAtFront, frame)
         XCTAssertEqual(panel.alphaAtFront, 1)
         XCTAssertNil(menu.layer?.animation(forKey: "apps-popup-slide"))

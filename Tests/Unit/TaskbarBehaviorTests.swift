@@ -2900,9 +2900,16 @@ final class WindowLiftBehaviorTests: XCTestCase {
         let desktop = BehaviorDesktop()
         desktop.state.withLock { $0.windows[2001]?.bounds = CGRect(x: 200, y: 140, width: 900, height: 600) }
         let probe = BehaviorLiftProbeGate(desktop)
-        let (controller, host) = makeController(desktop, probe: probe, workspaceNotificationCenter: NotificationCenter())
-        defer { withExtendedLifetime(host) {} }
         let key = WindowLiftAvoidance.WindowKey(pid: -41000, cgWindowID: 1001)
+        var validationFailed = false
+        let (controller, host) = makeController(desktop, probe: probe, workspaceNotificationCenter: NotificationCenter(),
+            diagnosticReporter: { message in
+                if message.hasPrefix("lift validation transient pid=\(key.pid) wid=\(key.cgWindowID) "),
+                   message.contains("stage=frameUnavailable ") {
+                    validationFailed = true
+                }
+            })
+        defer { withExtendedLifetime(host) {} }
         let native = CGRect(x: 0, y: 30, width: 1920, height: 1050)
         let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
         controller.poll()
@@ -2914,10 +2921,9 @@ final class WindowLiftBehaviorTests: XCTestCase {
         desktop.state.withLock { $0.windows[1001]?.bounds = native }
         controller.poll()
         await controller.scanTask?.value
-        let maintenance = controller.writeTasks[key]
-        XCTAssertNotNil(maintenance)
+        await wait { validationFailed }
+        XCTAssertEqual(controller.managedFrames[key]?.settledQuartz, adjusted)
         desktop.state.withLock { $0.windows[1001]?.bounds = adjusted }
-        await maintenance?.value
         let stopped = await controller.stopAndRestore()
         XCTAssertEqual(stopped, .complete)
         XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds }, native)
