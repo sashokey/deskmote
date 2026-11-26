@@ -32,9 +32,11 @@ Use the repository's default branch, `master`, for explicitly authorized direct 
 
 Use DeskMote’s history and release tag archives to identify the source corresponding to distributed binaries. Use reverse engineering to establish behavior from the exact native binary or reference build. Implement the behavior independently with DeskMote's license. Keep research binaries, third-party code, reference captures and personal observations outside the repository.
 
+When the user reports a bug, including a message that says only `баг`, open the first response with whether a fix is known, plausible but unverified, or still unknown. State the expected scope of code changes and the added runtime cost in CPU, GPU and RAM. Label estimates and identify any costs that are unknown.
+
 Use the following procedure for fixes.
 
-1. Identify the affected subsystem, the last known working revision and the first build with evidence. When reporting a defect, lead with whether there is a supported fix and its runtime cost. Distinguish observations, hypotheses and confirmed causes.
+1. Identify the affected subsystem, the last known working revision and the first build with evidence. Distinguish observations, hypotheses and confirmed causes.
 2. Add a regression test and make the smallest applicable change.
 3. Preserve DeskMote's open-window model and module boundaries.
 4. Check the diff for launchers, unrelated file operations, Dock changes and extra settings. Limit the Finder service to the two file creation commands and protect the existing taskbar behavior.
