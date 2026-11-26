@@ -9,7 +9,6 @@ struct TaskbarViewActions {
     var quit: (TaskbarGroupPresentation) -> Void = { _ in }
     var reorder: (String, String, Bool) -> Void = { _, _, _ in }
     var backgroundMenu: (NSEvent, NSView) -> Void = { _, _ in }
-    var popupPresented: (NSPanel) -> Void = { _ in }
     var contextMenuVisibilityChanged: (Bool) -> Void = { _ in }
 }
 
@@ -48,7 +47,7 @@ private final class TaskbarAppsButton: NSButton {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        let visualBounds = CGRect(origin: .zero, size: AppsMenuGeometry.buttonFrame.size)
+        let visualBounds = AppsMenuGeometry.buttonFrame.offsetBy(dx: -frameRect.minX, dy: -frameRect.minY)
         clipsToBounds = true
         setButtonType(.toggle)
         isBordered = false
@@ -222,6 +221,8 @@ final class TaskbarContentView: NSView {
     private var appsStore: AppsMenuStore?
     private var appsButton: NSButton?
     private weak var appsMenu: AppsMenuView?
+    private var preparedAppsMenu: AppsMenuView?
+    private var appsPreparation: Task<Void, Never>?
     private var pointerAnchor: PointerAnchor?
     private var hoverTask: Task<Void, Never>?
     private var dismissTask: Task<Void, Never>?
@@ -235,6 +236,9 @@ final class TaskbarContentView: NSView {
     private var dragPointer = CGPoint.zero
     private var animateNextLayout = false
     private var groupDrag = TaskbarGroupDrag()
+    #if DEBUG
+    private var groupDragResources: ActionResourceLog.Span?
+    #endif
     private var suppressClick = false
     private var measuredLayoutGroups: [String: TaskbarLayoutGroup]?
     private var lastLayoutBounds: CGRect?
@@ -258,7 +262,6 @@ final class TaskbarContentView: NSView {
         setAccessibilityRole(.toolbar)
         setAccessibilityLabel("DeskMote")
         contextMenu.visibilityChanged = { [weak self] visible in self?.actions.contextMenuVisibilityChanged(visible) }
-        popup.onPresent = { [weak self] panel in self?.actions.popupPresented(panel) }
         popup.onDismiss = { [weak self] in
             self?.cancelDismiss()
             self?.listGroupID = nil
@@ -273,17 +276,32 @@ final class TaskbarContentView: NSView {
     required init?(coder: NSCoder) { nil }
 
     isolated deinit {
+        #if DEBUG
+        groupDragResources?.finish()
+        #endif
         hoverTask?.cancel()
         dismissTask?.cancel()
         fileHover.cancel()
+        appsPreparation?.cancel()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil {
+            prepareAppsMenu()
+        } else {
+            appsPreparation?.cancel()
+            appsPreparation = nil
+            preparedAppsMenu = nil
+        }
     }
 
     func enableAppsMenu(store: AppsMenuStore = .shared) {
         guard appsButton == nil else { return }
         appsStore = store
-        store.preloadInstalledApplications()
+        store.preloadCatalog()
         let title = String(localized: "Apps")
-        let button = TaskbarAppsButton(frame: interactionFrame(for: AppsMenuGeometry.buttonFrame))
+        let button = TaskbarAppsButton(frame: interactionFrame(for: AppsMenuGeometry.buttonHitFrame))
         button.toolTip = title
         button.setAccessibilityLabel(title)
         button.setAccessibilityIdentifier("DeskMote.Apps")
@@ -292,6 +310,31 @@ final class TaskbarContentView: NSView {
         addSubview(button)
         appsButton = button
         needsLayout = true
+        prepareAppsMenu()
+    }
+
+    private func prepareAppsMenu() {
+        guard window != nil, let store = appsStore, preparedAppsMenu == nil, appsPreparation == nil else { return }
+        appsPreparation = Task { [weak self] in
+            _ = await store.loadCatalog()
+            guard !Task.isCancelled, let self else { return }
+            self.appsPreparation = nil
+            guard self.preparedAppsMenu == nil,
+                  let window = self.window, let screen = window.screen ?? NSScreen.main else { return }
+            let frame = self.appsFrame(window: window, screen: screen)
+            guard !frame.isEmpty else { return }
+            self.preparedAppsMenu = self.makeAppsMenu(frame: frame, store: store, deferCatalog: false)
+        }
+    }
+
+    private func makeAppsMenu(frame: CGRect, store: AppsMenuStore, deferCatalog: Bool) -> AppsMenuView {
+        AppsMenuView(frame: CGRect(origin: .zero, size: frame.size), store: store,
+                     runningWindows: { [weak self] pid in
+                         self?.groups.flatMap(\.windows).filter { $0.item.resourcePID == pid } ?? []
+                     },
+                     activateWindow: { [weak self] target in self?.actions.activate(target) },
+                     deferCatalog: deferCatalog,
+                     dismiss: { [weak self] in self?.dismissPopups() })
     }
 
     @objc private func toggleAppsMenu() {
@@ -304,14 +347,17 @@ final class TaskbarContentView: NSView {
         guard let window, let screen = window.screen ?? NSScreen.main, admitWindowList(true) else { return }
         let frame = appsFrame(window: window, screen: screen)
         guard !frame.isEmpty else { return }
-        dismissPopups()
+        #if DEBUG
+        let span = ActionResourceLog.begin("apps.menu.open")
+        defer { span?.finish() }
+        #endif
+        dismissPopups(animate: false)
         cancelFileHover()
-        let menu = AppsMenuView(frame: CGRect(origin: .zero, size: frame.size), store: appsStore,
-                                runningWindows: { [weak self] pid in
-                                    self?.groups.flatMap(\.windows).filter { $0.item.resourcePID == pid } ?? []
-                                },
-                                activateWindow: { [weak self] target in self?.actions.activate(target) },
-                                dismiss: { [weak self] in self?.dismissPopups() })
+        appsPreparation?.cancel()
+        appsPreparation = nil
+        let menu = preparedAppsMenu ?? makeAppsMenu(frame: frame, store: appsStore, deferCatalog: true)
+        preparedAppsMenu = menu
+        menu.prepareForPresentation(size: frame.size)
         popup.present(content: menu, frame: frame, anchorWindow: window)
         appsMenu = menu
         appsButton.state = .on
@@ -342,6 +388,10 @@ final class TaskbarContentView: NSView {
     }
 
     private func refreshImages() {
+        #if DEBUG
+        let span = ActionResourceLog.begin("taskbar.render.icons")
+        defer { span?.finish() }
+        #endif
         let lookup = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         for button in layoutResult.buttons {
             guard let group = lookup[button.groupID],
@@ -352,9 +402,13 @@ final class TaskbarContentView: NSView {
     }
 
     override func layout() {
+        #if DEBUG
+        let span = draggedGroupID == nil ? ActionResourceLog.begin("taskbar.render") : nil
+        defer { span?.finish() }
+        #endif
         super.layout()
         lastLayoutBounds = bounds
-        appsButton?.frame = interactionFrame(for: AppsMenuGeometry.buttonFrame)
+        appsButton?.frame = interactionFrame(for: AppsMenuGeometry.buttonHitFrame)
         let groupLookup = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         if measuredLayoutGroups == nil {
             let font = NSFont.systemFont(ofSize: TaskbarMetrics.fontSize)
@@ -482,6 +536,10 @@ final class TaskbarContentView: NSView {
         guard !suppressClick,
               let button = layoutResult.buttons.first(where: { $0.id == id }),
               let group = groups.first(where: { $0.id == button.groupID }) else { return }
+        #if DEBUG
+        let span = ActionResourceLog.begin("taskbar.button.click")
+        defer { span?.finish() }
+        #endif
         if button.isCombined { showWindowList(group: group, anchor: button.frame, openedByClick: true) }
         else if let item = group.windows.first(where: { button.windowIDs.contains($0.id) }) {
             dismissPopups()
@@ -584,6 +642,10 @@ final class TaskbarContentView: NSView {
             }
             return
         }
+        #if DEBUG
+        let span = ActionResourceLog.begin(group.id == "overflow" ? "taskbar.menu.overflow" : "taskbar.menu.windows")
+        defer { span?.finish() }
+        #endif
         let view = TaskbarWindowListView(windows: group.windows,
                                       availableHeight: screen.visibleFrame.height - TaskbarMetrics.height - 24,
                                       delay: delay,
@@ -620,6 +682,10 @@ final class TaskbarContentView: NSView {
         guard canUseWindowActions(), buttonViews[buttonID] != nil,
               let button = layoutResult.buttons.first(where: { $0.id == buttonID }),
               let group = groups.first(where: { $0.id == button.groupID }) else { return }
+        #if DEBUG
+        let span = ActionResourceLog.begin("taskbar.menu.context")
+        defer { span?.finish() }
+        #endif
         dismissPopups()
         let entries = TaskbarContextMenuModel.actions(button: button, group: group).map { action in
             switch action {
@@ -638,6 +704,10 @@ final class TaskbarContentView: NSView {
                         representedWindows.contains { $0.item.representsSameProcess(as: live.item) }
                     }
                     guard !survivors.isEmpty else { return }
+                    #if DEBUG
+                    let span = ActionResourceLog.begin("taskbar.application.quit")
+                    defer { span?.finish() }
+                    #endif
                     self.actions.quit(TaskbarGroupPresentation(id: current.id, name: current.name, windows: survivors))
                 })
             }
@@ -646,6 +716,10 @@ final class TaskbarContentView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        #if DEBUG
+        let span = ActionResourceLog.begin("taskbar.menu.background")
+        defer { span?.finish() }
+        #endif
         onBackgroundClick()
         dismissPopups()
         actions.backgroundMenu(event, self)
@@ -670,6 +744,10 @@ final class TaskbarContentView: NSView {
         cancelFileHover()
         let rectangles = layoutResult.buttons.filter { $0.groupID == id }.map(\.frame)
         guard let first = rectangles.first else { return }
+        #if DEBUG
+        groupDragResources?.finish()
+        groupDragResources = ActionResourceLog.begin("taskbar.group.drag")
+        #endif
         let frame = rectangles.dropFirst().reduce(first) { $0.union($1) }
         draggedGroupID = id
         dragMembers = group.windows.map(\.id)
@@ -703,6 +781,11 @@ final class TaskbarContentView: NSView {
 
     private func endGroupDrag(event: NSEvent?, cancelled: Bool) {
         guard let id = draggedGroupID else { return }
+        #if DEBUG
+        let span = groupDragResources
+        groupDragResources = nil
+        defer { span?.finish() }
+        #endif
         let inside = event.map { bounds.contains(convert($0.locationInWindow, from: nil)) } ?? false
         let target = !cancelled && inside ? groupDrag.target : nil
         if let target {

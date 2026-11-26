@@ -28,14 +28,12 @@ extension PanelCoordinator {
             view: view, runtime: runtime, ordering: stripOrderStore,
             topology: displayTopologyStore, spaces: spaceStore, displayUUID: fixedUnitDisplayUUID,
             backgroundMenu: { [weak self] event, source in self?.onRequestTaskbarMenu?(event, source) },
-            popupPresented: { [weak self] popup in
-                self?.overlaySpaceHost?.pin(panels: [popup])
-            },
             contextMenuVisibilityChanged: { [weak self] visible in
                 guard let self, visible else { return }
                 _ = self.onAccessoryInteraction?(self, .explicit)
             }
         )
+        taskbarPresenter?.setPanelVisible(false)
         return true
     }
 
@@ -58,7 +56,8 @@ extension PanelCoordinator {
         guard let dock = dockPanel else { return }
         dock.layoutIfNeeded()
         relayout()
-        orderDockSurfaceFront(source: "initial")
+        dockContentHost?.layoutContent()
+        applyPanelVisibility(source: "initial")
     }
 
     func configurePanel(_ panel: NSPanel, backgroundColor: NSColor, appliesLevelOverride: Bool) {

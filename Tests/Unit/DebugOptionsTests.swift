@@ -34,6 +34,28 @@ final class DebugSwitchTests: XCTestCase {
 }
 
 #if DEBUG
+final class ActionResourceLogTests: XCTestCase {
+    func testConvertsAppleSiliconCPUTicksAndKeepsSignedFootprintDelta() throws {
+        let before = ActionResourceLog.Sample(wallTicks: 100_000, cpuTicks: 72_000, footprintBytes: 10_200)
+        let after = ActionResourceLog.Sample(wallTicks: 124_000, cpuTicks: 108_000, footprintBytes: 10_000)
+        let delta = ActionResourceLog.Delta(before: before, after: after, nanosecondsPerTick: 125.0 / 3)
+        XCTAssertEqual(try XCTUnwrap(delta.elapsedMilliseconds), 1, accuracy: 0.00001)
+        XCTAssertEqual(try XCTUnwrap(delta.cpuMilliseconds), 1.5, accuracy: 0.00001)
+        XCTAssertEqual(try XCTUnwrap(delta.cpuPercentOneCore), 150, accuracy: 0.00001)
+        XCTAssertEqual(delta.footprintDeltaBytes, -200)
+    }
+
+    func testUnavailableOrRegressedCountersDoNotBecomeZeroUsage() {
+        let before = ActionResourceLog.Sample(wallTicks: 100, cpuTicks: 50, footprintBytes: 10)
+        let after = ActionResourceLog.Sample(wallTicks: 100, cpuTicks: 49, footprintBytes: nil)
+        let delta = ActionResourceLog.Delta(before: before, after: after, nanosecondsPerTick: 1)
+        XCTAssertEqual(delta.elapsedMilliseconds, 0)
+        XCTAssertNil(delta.cpuMilliseconds)
+        XCTAssertNil(delta.cpuPercentOneCore)
+        XCTAssertNil(delta.footprintDeltaBytes)
+    }
+}
+
 final class ClickLatencyTraceTests: XCTestCase {
     func testCancelledCaptureCannotWriteStagesToReplacementTrace() async throws {
         let journal = Mutex<[Data]>([])

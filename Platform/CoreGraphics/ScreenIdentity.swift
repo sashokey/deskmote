@@ -27,8 +27,8 @@ enum DisplayIdentity {
             if index == 0 { primaryUUID = uuid }
             return WindowDisplayAttribution.Display(
                 uuid: uuid,
-                cgFrame: WindowLiftAvoidance.windowServerFrame(fromAppKit: screen.frame, primaryDisplayHeight: primaryHeight),
-                usableWindowServerFrame: WindowLiftAvoidance.windowServerFrame(fromAppKit: screen.visibleFrame,
+                cgFrame: windowServerFrame(fromAppKit: screen.frame, primaryDisplayHeight: primaryHeight),
+                usableWindowServerFrame: windowServerFrame(fromAppKit: screen.visibleFrame,
                                                                 primaryDisplayHeight: primaryHeight)
             )
         }
@@ -36,6 +36,10 @@ enum DisplayIdentity {
             displays: displays,
             primaryUUID: primaryUUID
         )
+    }
+
+    static func windowServerFrame(fromAppKit frame: CGRect, primaryDisplayHeight: CGFloat) -> CGRect {
+        CGRect(x: frame.minX, y: primaryDisplayHeight - frame.maxY, width: frame.width, height: frame.height)
     }
 
     @MainActor

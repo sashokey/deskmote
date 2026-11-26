@@ -17,7 +17,7 @@ private final class TokenExecutor: WindowActionExecuting {
     let release = DispatchSemaphore(value: 0)
     func execute(_ request: PlatformActionRequest, snapshot: DockSnapshot,
                  forcedMinimizedPrior: Bool, cancellation: OperationCancellation,
-                 onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?) -> Bool {
+                 onHandoffTarget: (@Sendable (WindowID) -> Void)?) -> Bool {
         started.withLock { $0 = true }
         _ = release.wait(timeout: .now() + 3)
         return true

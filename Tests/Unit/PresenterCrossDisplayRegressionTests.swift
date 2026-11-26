@@ -27,7 +27,6 @@ private final class CrossDisplayInventory: WindowInventoryTracking {
 private final class CrossDisplayPopup: TaskbarPopupPresenting {
     var panel: NSPanel? { nil }
     var isPresented: Bool { false }
-    var onPresent: ((NSPanel) -> Void)?
     var onDismiss: (() -> Void)?
 
     func present(content: NSView, frame: CGRect, anchorWindow: NSWindow?) {}
@@ -63,7 +62,7 @@ final class PresenterCrossDisplayRegressionTests: XCTestCase {
             fallbackImage: { NSImage(size: NSSize(width: 32, height: 32)) })
         let presenter = TaskbarPresenter(view: view, runtime: runtime, ordering: ordering,
             topology: topology, spaces: spaces, displayUUID: "fixture", backgroundMenu: { _, _ in },
-            popupPresented: { _ in }, contextMenuVisibilityChanged: { _ in }, icons: icons)
+            contextMenuVisibilityChanged: { _ in }, icons: icons)
         var iconRequests = 0
         view.taskbarContent.iconProvider = { _ in iconRequests += 1; return nil }
         runtime.start()

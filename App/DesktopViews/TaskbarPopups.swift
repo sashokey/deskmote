@@ -12,14 +12,50 @@ private final class TaskbarPopupPanel: NonConstrainingPanel {
     override var canBecomeMain: Bool { false }
 }
 
+typealias AppsPopupFrameSource = @MainActor (NSView, @escaping @MainActor (TimeInterval) -> Void) -> @MainActor () -> Void
+
+@MainActor
+private final class AppsPopupDisplayLink: NSObject {
+    private let startedAt = CACurrentMediaTime()
+    private let tick: @MainActor (TimeInterval) -> Void
+    private var link: CADisplayLink?
+
+    init(view: NSView, tick: @escaping @MainActor (TimeInterval) -> Void) {
+        self.tick = tick
+        super.init()
+        let link = view.displayLink(target: self, selector: #selector(frame(_:)))
+        self.link = link
+        link.add(to: .main, forMode: .common)
+    }
+
+    @objc private func frame(_ link: CADisplayLink) {
+        tick(max(0, link.targetTimestamp - startedAt))
+    }
+
+    func invalidate() {
+        link?.invalidate()
+        link = nil
+    }
+}
+
 @MainActor
 private final class AppsPopupViewport: NSView {
     private enum Phase { case resting, opening, closing }
 
     private static let key = "apps-popup-slide"
+    private static let duration: TimeInterval = 0.19
+    private static let openingTimes: [CGFloat] = [0, 0.16, 0.34, 0.50, 0.67, 0.84, 1]
+    private static let openingFractions: [CGFloat] = [1, 0.53, 0.28, 0.12, 0.04, 0.006, 0]
     private let appsView: AppsMenuView
     private var restingFrame: CGRect
     private var phase: Phase = .resting
+    private var openingFraction: CGFloat = 0
+    private var firstVisibleFrame = false
+    private var stopFrames: (@MainActor () -> Void)?
+    #if DEBUG
+    private var openingResources: ActionResourceLog.Span?
+    private var closingResources: ActionResourceLog.Span?
+    #endif
     private var bottomInset: CGFloat { phase == .resting ? 0 : AppsMenuGeometry.popupGap }
     private var travel: CGFloat { restingFrame.height + AppsMenuGeometry.popupGap }
 
@@ -39,8 +75,15 @@ private final class AppsPopupViewport: NSView {
     required init?(coder: NSCoder) { nil }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard phase == .resting else { return nil }
+        guard phase != .closing else { return nil }
+        let local = convert(point, from: superview)
+        guard bounds.contains(local), appsView.frame.contains(local) else { return nil }
         return super.hitTest(point)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { stopFrameUpdates() }
     }
 
     func updateFrame(_ frame: CGRect) {
@@ -49,35 +92,99 @@ private final class AppsPopupViewport: NSView {
         applyFrame()
     }
 
-    func slideIn() {
+    func prepareOpening() {
+        #if DEBUG
+        openingResources = ActionResourceLog.begin("apps.menu.slideIn")
+        #endif
         phase = .opening
+        openingFraction = 1
         applyFrame()
-        CATransaction.begin()
-        CATransaction.setCompletionBlock { [weak self] in
-            Task { @MainActor in
-                guard let self, self.phase == .opening, self.window != nil else { return }
-                self.phase = .resting
-                self.applyFrame()
-            }
-        }
-        slide(fractions: [1, 0.53, 0.28, 0.12, 0.04, 0.006, 0],
-              times: [0, 0.16, 0.34, 0.50, 0.67, 0.84, 1], retainEnd: false)
-        CATransaction.commit()
     }
 
+    func startFrameUpdates(_ source: AppsPopupFrameSource) {
+        guard phase == .opening || appsView.catalogDeferredUntilFrame else { return }
+        stopFrames = source(self) { [weak self] elapsed in self?.advance(elapsed: elapsed) }
+    }
+
+    private func advance(elapsed: TimeInterval) {
+        if phase == .opening {
+            if elapsed < Self.duration {
+                let progress = CGFloat(elapsed / Self.duration)
+                let times = Self.openingTimes
+                let fractions = Self.openingFractions
+                if let next = times.firstIndex(where: { $0 > progress }) {
+                    let weight = (progress - times[next - 1]) / (times[next] - times[next - 1])
+                    openingFraction = fractions[next - 1] + (fractions[next] - fractions[next - 1]) * weight
+                }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                appsView.setFrameOrigin(CGPoint(x: 0, y: bottomInset - openingFraction * travel))
+                CATransaction.commit()
+            } else {
+                phase = .resting
+                openingFraction = 0
+                applyFrame()
+                #if DEBUG
+                finishOpeningResources()
+                #endif
+            }
+        }
+        guard phase != .closing else { return }
+        if appsView.catalogDeferredUntilFrame, appsView.frame.intersects(bounds) {
+            if firstVisibleFrame { appsView.presentedFirstFrame() }
+            firstVisibleFrame = true
+        }
+        if phase == .resting, !appsView.catalogDeferredUntilFrame { stopFrameUpdates() }
+    }
+
+    func stopFrameUpdates() {
+        stopFrames?()
+        stopFrames = nil
+        #if DEBUG
+        finishOpeningResources()
+        #endif
+    }
+
+    func detachMenu() {
+        stopFrameUpdates()
+        appsView.layer?.removeAnimation(forKey: Self.key)
+        appsView.removeFromSuperview()
+        #if DEBUG
+        closingResources?.finish()
+        closingResources = nil
+        #endif
+    }
+
+    func stopMenuActions() { appsView.stopMenuActions() }
+
     func slideOut(completion: @escaping @Sendable () -> Void) {
-        let offset = appsView.layer?.presentation()?.transform.m42 ?? (phase == .opening ? -travel : 0)
-        let initial = min(1, max(0, -offset / max(1, travel)))
+        stopFrameUpdates()
+        #if DEBUG
+        let span = ActionResourceLog.begin("apps.menu.slideOut")
+        closingResources = span
+        #endif
+        let initial = openingFraction
         phase = .closing
-        appsView.stopMenuActions()
         setAccessibilityHidden(true)
         window?.makeFirstResponder(nil)
         applyFrame()
         let fractions: [CGFloat] = [0, 0.009, 0.042, 0.112, 0.234, 0.414, 0.70, 1]
+        let motion = CAKeyframeAnimation(keyPath: "transform.translation.y")
+        motion.values = fractions.map { NSNumber(value: Double(-(initial + (1 - initial) * $0) * travel)) }
+        motion.keyTimes = [0, 0.13, 0.27, 0.42, 0.57, 0.71, 0.85, 1]
+        motion.duration = Self.duration
+        motion.isRemovedOnCompletion = false
+        motion.fillMode = .forwards
         CATransaction.begin()
+        #if DEBUG
+        CATransaction.setCompletionBlock {
+            span?.finish()
+            completion()
+        }
+        #else
         CATransaction.setCompletionBlock(completion)
-        slide(fractions: fractions.map { initial + (1 - initial) * $0 },
-              times: [0, 0.13, 0.27, 0.42, 0.57, 0.71, 0.85, 1], retainEnd: true)
+        #endif
+        appsView.layer?.add(motion, forKey: Self.key)
         CATransaction.commit()
     }
 
@@ -88,26 +195,23 @@ private final class AppsPopupViewport: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if let window, window.frame != viewportFrame { window.setFrame(viewportFrame, display: false) }
-        appsView.frame = CGRect(origin: CGPoint(x: 0, y: bottomInset), size: restingFrame.size)
+        let offset = phase == .opening ? openingFraction * travel : 0
+        appsView.frame = CGRect(origin: CGPoint(x: 0, y: bottomInset - offset), size: restingFrame.size)
         CATransaction.commit()
     }
 
-    private func slide(fractions: [CGFloat], times: [NSNumber], retainEnd: Bool) {
-        let motion = CAKeyframeAnimation(keyPath: "transform.translation.y")
-        motion.values = fractions.map { NSNumber(value: Double(-$0 * travel)) }
-        motion.keyTimes = times
-        motion.duration = 0.19
-        motion.isRemovedOnCompletion = !retainEnd
-        if retainEnd { motion.fillMode = .forwards }
-        appsView.layer?.add(motion, forKey: Self.key)
+    #if DEBUG
+    private func finishOpeningResources() {
+        openingResources?.finish()
+        openingResources = nil
     }
+    #endif
 }
 
 @MainActor
 protocol TaskbarPopupPresenting: AnyObject {
     var panel: NSPanel? { get }
     var isPresented: Bool { get }
-    var onPresent: ((NSPanel) -> Void)? { get set }
     var onDismiss: (() -> Void)? { get set }
     func present(content: NSView, frame: CGRect, anchorWindow: NSWindow?)
     func updateFrame(_ frame: CGRect)
@@ -132,13 +236,18 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
     private var resignKeyObserver: NSObjectProtocol?
     private let makePanel: (CGRect) -> NSPanel
     private let reduceMotion: () -> Bool
+    private let appsFrameSource: AppsPopupFrameSource
     private var closingPanel: NSPanel?
-    var onPresent: ((NSPanel) -> Void)?
     var onDismiss: (() -> Void)?
 
     init(makePanel: ((CGRect) -> NSPanel)? = nil,
-         reduceMotion: @escaping () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }) {
+         reduceMotion: @escaping () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion },
+         appsFrameSource: @escaping AppsPopupFrameSource = { view, tick in
+             let clock = AppsPopupDisplayLink(view: view, tick: tick)
+             return { clock.invalidate() }
+         }) {
         self.reduceMotion = reduceMotion
+        self.appsFrameSource = appsFrameSource
         self.makePanel = makePanel ?? {
             TaskbarPopupPanel(contentRect: $0, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         }
@@ -162,10 +271,10 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
         self.panel = panel
         if let viewport, !reduceMotion() {
             panel.animationBehavior = .none
-            viewport.slideIn()
+            viewport.prepareOpening()
         }
         panel.orderFrontRegardless()
-        onPresent?(panel)
+        viewport?.startFrameUpdates(appsFrameSource)
         resignKeyObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
         ) { [weak self, weak panel] _ in
@@ -204,7 +313,13 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
         self.panel = nil
         if let panel {
             (panel.contentView as? TaskbarWindowListView)?.cancelPendingActions()
-            if animated, let viewport = panel.contentView as? AppsPopupViewport, !reduceMotion() {
+            let viewport = panel.contentView as? AppsPopupViewport
+            #if DEBUG
+            let span = viewport == nil ? nil : ActionResourceLog.begin("apps.menu.close")
+            defer { span?.finish() }
+            #endif
+            viewport?.stopMenuActions()
+            if animated, let viewport, !reduceMotion() {
                 closingPanel = panel
                 panel.ignoresMouseEvents = true
                 viewport.slideOut { [weak self, weak panel] in
@@ -222,6 +337,7 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
     }
 
     private static func close(_ panel: NSPanel) {
+        (panel.contentView as? AppsPopupViewport)?.detachMenu()
         panel.orderOut(nil)
         panel.contentView = nil
         panel.close()
@@ -229,8 +345,8 @@ final class TaskbarPopupController: TaskbarPopupPresenting {
 
     isolated deinit {
         if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
-        panel?.orderOut(nil)
-        closingPanel?.orderOut(nil)
+        if let panel { Self.close(panel) }
+        if let closingPanel { Self.close(closingPanel) }
     }
 }
 

@@ -1,15 +1,12 @@
 import AppKit
-import ApplicationServices
-import Combine
 import QuartzCore
-import SwiftUI
 #if DEBUG
 import os
 #endif
 
 extension PanelCoordinator {
     func resolvedPinnedScreen() -> NSScreen? {
-        guard let pinnedUUID = fixedDisplayUUID else { return nil }
+        guard let pinnedUUID = fixedUnitDisplayUUID else { return nil }
         let screens = screenProvider()
         let outcome = TaskbarScreenResolution.resolve(
             pinnedUUID: pinnedUUID,
@@ -24,38 +21,67 @@ extension PanelCoordinator {
         }
     }
 
-    func reconcilePanelVisibility(source: String = "visibility-reconcile") {
+    func applySpaceFullscreen(_ fullscreen: Bool, source: String) {
+        setSpaceVisibility(fullscreen ? .fullscreen : .desktop, source: source)
+    }
+
+    func applySpaceUnavailable(source: String) {
+        setSpaceVisibility(.unknown, source: source)
+    }
+
+    func spaceWillChange() {
+        guard !isSuspendedForPermissionLoss else { return }
+        taskbarView?.taskbarContent.prepareForHiding()
+        #if DEBUG
+        recordPanelVisibility(event: "space-pending", source: "space-notification")
+        #endif
+    }
+
+    private func setSpaceVisibility(_ next: PanelVisibilityState, source: String) {
+        guard !isSuspendedForPermissionLoss else { return }
+        if visibilityState != next {
+            visibilityState = next
+            if next == .fullscreen { lastHideWasForFullscreen = true }
+            #if DEBUG
+            recordPanelVisibility(event: "visibility-decision", source: source)
+            #endif
+        }
         applyPanelVisibility(source: source)
     }
 
     func applyPanelVisibility(source: String = "visibility-reconcile") {
         guard !isSuspendedForPermissionLoss else { return }
-        let shouldShow = visibilityState.isVisible && currentScreen != nil
+        let shouldShow = visibilityState.isVisible && hasMatchingPanelScreen
         guard shouldShow != panelsAreVisible else { return }
+        #if DEBUG
+        let span = ActionResourceLog.begin(shouldShow ? "taskbar.panel.show" : "taskbar.panel.hide")
+        defer { span?.finish() }
+        #endif
         panelsAreVisible = shouldShow
         taskbarPresenter?.setPanelVisible(shouldShow)
-        if shouldShow {
-            let fadeIn = lastHideWasForFullscreen
+        if shouldShow, let panel = dockPanel {
+            let fadeIn = lastHideWasForFullscreen && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             lastHideWasForFullscreen = false
-            let fadingPanels = [dockPanel].compactMap { $0 }
-            if fadeIn { for panel in fadingPanels { panel.alphaValue = 0 } }
+            if fadeIn { panel.alphaValue = 0 }
             orderDockSurfaceFront(source: source)
-            pinResidentPanelsIfNeeded()
             if fadeIn {
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.32
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    for panel in fadingPanels { panel.animator().alphaValue = 1 }
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.32
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().alphaValue = 1
                 }
             }
-            repairAllSpacesMembershipIfNeeded()
         } else {
-            lastHideWasForFullscreen = visibilityState.hideReasons.contains(.fullscreen)
             orderDockSurfaceOut(source: source)
-            for panel in [dockPanel] { panel?.alphaValue = 1 }
+            dockPanel?.alphaValue = 1
         }
     }
 
+    private var hasMatchingPanelScreen: Bool {
+        guard let currentScreen else { return false }
+        guard let fixedUnitDisplayUUID else { return true }
+        return DisplayIdentity.uuidString(for: currentScreen) == fixedUnitDisplayUUID
+    }
 }
 
 #if DEBUG
@@ -63,13 +89,11 @@ struct TaskbarVisibilitySample: Encodable, Equatable, Sendable {
     let windowNumber: Int
     let primaryDisplay: Bool?
     let requestedVisible: Bool
-    let fullscreen: Bool
+    let spaceState: String
     let appKitVisible: Bool
     let onActiveSpace: Bool
-    var windowServerOnScreen: Bool?
     let occlusionVisible: Bool
     let alpha: String
-    let repairingMembership: Bool
 }
 
 @MainActor
@@ -80,10 +104,6 @@ final class TaskbarVisibilityJournal {
         let event: String
         let source: String?
         let state: TaskbarVisibilitySample
-        let foregroundPID: pid_t?
-        let candidateWindowID: CGWindowID?
-        let candidateOwnerPID: pid_t?
-        let candidateLayer: Int?
     }
 
     private static let queue = BoundedDiagnosticQueue(label: "io.github.sashokey.deskmote.taskbar-visibility")
@@ -99,9 +119,7 @@ final class TaskbarVisibilityJournal {
         return TaskbarVisibilityJournal { try? file.append($0) }
     }
 
-    func capture(_ state: TaskbarVisibilitySample, event: String = "observed", source: String? = nil,
-                 foregroundPID: pid_t? = nil, candidateWindowID: CGWindowID? = nil,
-                 candidateOwnerPID: pid_t? = nil, candidateLayer: Int? = nil) {
+    func capture(_ state: TaskbarVisibilitySample, event: String = "observed", source: String? = nil) {
         guard event != "observed" || state != previous else { return }
         previous = state
         let date = Date()
@@ -111,9 +129,7 @@ final class TaskbarVisibilityJournal {
             let clock = ISO8601DateFormatter()
             clock.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let record = Line(timestamp: clock.string(from: date), revision: revision, event: event,
-                              source: source, state: state, foregroundPID: foregroundPID,
-                              candidateWindowID: candidateWindowID, candidateOwnerPID: candidateOwnerPID,
-                              candidateLayer: candidateLayer)
+                              source: source, state: state)
             guard var data = try? JSONEncoder().encode(record) else { return }
             data.append(0x0A)
             write(data)
@@ -124,48 +140,42 @@ final class TaskbarVisibilityJournal {
 }
 
 extension PanelCoordinator {
-    func startPanelVisibilitySampling() {
-        guard taskbarVisibilityJournal != nil else { return }
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.recordPanelVisibility() }
+    private static let visibilityLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "dock-panel")
+
+    func startPanelVisibilityObservation() {
+        guard let panel = dockPanel else { return }
+        panelVisibilityObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: panel, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.isSuspendedForPermissionLoss else { return }
+                self.recordPanelVisibility(event: "observed", source: "appkit-occlusion")
+            }
         }
-        timer.tolerance = 0.04
-        RunLoop.main.add(timer, forMode: .common)
-        panelVisibilitySampler = timer
     }
 
-    func recordPanelVisibility(event: String = "observed", source: String? = nil) {
-        guard let journal = taskbarVisibilityJournal, let panel = dockPanel else { return }
-        let number = CGWindowID(exactly: panel.windowNumber).flatMap { $0 > 0 ? $0 : nil }
-        let candidate = event == "order-out" ? diagnosticFullscreenCandidate : nil
-        let windowIDs = [number, candidate].compactMap { $0 }
-        let descriptions = windowIDs.isEmpty ? nil : NativeWindowSystem().windowDescriptions(for: windowIDs)
-        let panelDescription = number.flatMap { id in
-            descriptions?.first { nativeWindowNumber(in: $0) == id }
-        }
-        let candidateDescription = candidate.flatMap { id in
-            descriptions?.first { nativeWindowNumber(in: $0) == id }
-        }
-        let primary = currentScreen.flatMap { screen in screenProvider().first.map { $0.frame == screen.frame } }
-        let onScreen = (panelDescription?[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue
-            ?? number.flatMap { id in
-                NativeWindowSystem().windowInfo([.optionOnScreenOnly], kCGNullWindowID)?
-                    .contains { nativeWindowNumber(in: $0) == id }
-            }
+    func stopPanelVisibilityObservation() {
+        if let panelVisibilityObserver { NotificationCenter.default.removeObserver(panelVisibilityObserver) }
+        panelVisibilityObserver = nil
+    }
+
+    func recordPanelVisibility(event: String, source: String) {
+        guard let panel = dockPanel else { return }
+        let appKitVisible = panel.isVisible
+        let onActiveSpace = appKitVisible && panel.isOnActiveSpace
+        let occlusionVisible = panel.occlusionState.contains(.visible)
+        Self.visibilityLogger.log(level: event == "observed" ? .debug : .default,
+                                  "event=\(event, privacy: .public) source=\(source, privacy: .public) panel=\(panel.windowNumber, privacy: .public) space=\(self.visibilityState.rawValue, privacy: .public) requested=\(self.panelsAreVisible, privacy: .public) visible=\(appKitVisible, privacy: .public) activeSpace=\(onActiveSpace, privacy: .public) occlusionVisible=\(occlusionVisible, privacy: .public)")
+        guard let taskbarVisibilityJournal else { return }
         let state = TaskbarVisibilitySample(
-            windowNumber: panel.windowNumber, primaryDisplay: primary,
-            requestedVisible: panelsAreVisible && !isSuspendedForPermissionLoss,
-            fullscreen: visibilityState.hideReasons.contains(.fullscreen), appKitVisible: panel.isVisible,
-            onActiveSpace: panel.isOnActiveSpace,
-            windowServerOnScreen: onScreen,
-            occlusionVisible: panel.occlusionState.contains(.visible),
-            alpha: panel.alphaValue < 0.01 ? "transparent" : panel.alphaValue > 0.99 ? "opaque" : "fading",
-            repairingMembership: spaceMembershipRepairInFlight
+            windowNumber: panel.windowNumber,
+            primaryDisplay: currentScreen.flatMap { screen in screenProvider().first.map { $0.frame == screen.frame } },
+            requestedVisible: panelsAreVisible,
+            spaceState: visibilityState.rawValue, appKitVisible: appKitVisible,
+            onActiveSpace: onActiveSpace, occlusionVisible: occlusionVisible,
+            alpha: panel.alphaValue < 0.01 ? "transparent" : panel.alphaValue > 0.99 ? "opaque" : "fading"
         )
-        journal.capture(state, event: event, source: source, foregroundPID: lastActiveApplicationPID,
-                        candidateWindowID: candidate,
-                        candidateOwnerPID: (candidateDescription?[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-                        candidateLayer: (candidateDescription?[kCGWindowLayer as String] as? NSNumber)?.intValue)
+        taskbarVisibilityJournal.capture(state, event: event, source: source)
     }
 }
 #endif

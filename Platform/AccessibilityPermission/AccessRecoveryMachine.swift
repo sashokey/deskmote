@@ -17,8 +17,6 @@ enum PermissionPhase: Equatable {
     case running
     case uncertain
     case suspended(episode: UInt64)
-    case restoringWindows(episode: UInt64)
-    case restorationFailed(episode: UInt64)
     case relaunching(episode: UInt64)
     case relaunchFailed(episode: UInt64, message: String)
     case terminating
@@ -28,7 +26,6 @@ enum PermissionEvent: Equatable {
     case launched(location: AppInstallLocation, trusted: Bool)
     case trustVerdict(PermissionLossDetector.Verdict)
     case grantObserved(episode: UInt64)
-    case restorationFinished(episode: UInt64, result: WindowRestorationCompletion)
     case relaunchSucceeded(episode: UInt64)
     case relaunchFailed(episode: UInt64, message: String)
     case retryRequested
@@ -49,9 +46,6 @@ enum PermissionEffect: Equatable {
     case recheckNow
     case startWatchdog
     case stopWatchdog
-    case freezeLift
-    case unfreezeLift
-    case restoreLiftedWindows(episode: UInt64)
     case suspendPanelsAndStores
 
     case launchNewInstance(episode: UInt64)
@@ -65,8 +59,6 @@ enum PermissionPresentation: Equatable {
     case stalled
     case recoveryWaiting
     case recoveryStalled
-    case restoringWindows
-    case restorationFailed
     case relaunching
     case relaunchFailed(message: String)
 }
@@ -98,15 +90,6 @@ struct PermissionRecoveryMachine: Equatable {
         case let .grantObserved(episode):
             return handleGrantObserved(episode: episode)
 
-        case let .restorationFinished(episode, result):
-            guard case let .restoringWindows(current) = phase, current == episode else { return [] }
-            guard result == .complete else {
-                phase = .restorationFailed(episode: current)
-                return [.updateGuide]
-            }
-            phase = .relaunching(episode: current)
-            return [.updateGuide, .launchNewInstance(episode: current)]
-
         case let .relaunchSucceeded(episode):
             guard case let .relaunching(current) = phase, current == episode else { return [] }
             return [.terminateSelf]
@@ -118,9 +101,6 @@ struct PermissionRecoveryMachine: Equatable {
 
         case .retryRequested:
             switch phase {
-            case let .restorationFailed(current):
-                phase = .restoringWindows(episode: current)
-                return [.updateGuide, .restoreLiftedWindows(episode: current)]
             case let .relaunchFailed(current, _):
                 phase = .relaunching(episode: current)
                 return [.updateGuide, .launchNewInstance(episode: current)]
@@ -171,7 +151,7 @@ struct PermissionRecoveryMachine: Equatable {
             switch phase {
             case .running, .uncertain:
                 phase = .running
-                return [.unfreezeLift]
+                return []
             default:
                 return []
             }
@@ -179,7 +159,7 @@ struct PermissionRecoveryMachine: Equatable {
         case .uncertain:
             guard case .running = phase else { return [] }
             phase = .uncertain
-            return [.freezeLift]
+            return []
 
         case .lost:
             switch phase {
@@ -188,7 +168,6 @@ struct PermissionRecoveryMachine: Equatable {
                 phase = .suspended(episode: episode)
                 return [
                     .stopWatchdog,
-                    .freezeLift,
                     .suspendPanelsAndStores,
                     .setActivationPolicy(.regular),
                     .showGuide,
@@ -214,8 +193,8 @@ struct PermissionRecoveryMachine: Equatable {
             ]
 
         case let .suspended(current) where current == episode:
-            phase = .restoringWindows(episode: current)
-            return [.stopPermissionEpisode, .updateGuide, .restoreLiftedWindows(episode: current)]
+            phase = .relaunching(episode: current)
+            return [.stopPermissionEpisode, .updateGuide, .launchNewInstance(episode: current)]
 
         default:
             return []
@@ -247,12 +226,6 @@ struct PermissionRecoveryMachine: Equatable {
             case .waiting, .granted: return .recoveryWaiting
             case .stalled: return .recoveryStalled
             }
-
-        case .restoringWindows:
-            return .restoringWindows
-
-        case .restorationFailed:
-            return .restorationFailed
 
         case .relaunching:
             return .relaunching

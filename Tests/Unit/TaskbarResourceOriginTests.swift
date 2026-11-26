@@ -25,7 +25,6 @@ private final class OriginInventory: WindowInventoryTracking {
 private final class OriginPopup: TaskbarPopupPresenting {
     var panel: NSPanel? { nil }
     var isPresented: Bool { false }
-    var onPresent: ((NSPanel) -> Void)?
     var onDismiss: (() -> Void)?
     func present(content: NSView, frame: CGRect, anchorWindow: NSWindow?) {}
     func makeKey() {}
@@ -73,7 +72,7 @@ final class TaskbarResourceOriginTests: XCTestCase {
             }, fallbackImage: { NSImage(size: NSSize(width: 32, height: 32)) })
         let presenter = TaskbarPresenter(view: view, runtime: runtime, ordering: ordering,
             topology: topology, spaces: spaces, displayUUID: "fixture", backgroundMenu: { _, _ in },
-            popupPresented: { _ in }, contextMenuVisibilityChanged: { _ in }, icons: icons)
+            contextMenuVisibilityChanged: { _ in }, icons: icons)
         runtime.start()
         defer { runtime.stop(); withExtendedLifetime(presenter) {} }
         let deadline = ContinuousClock.now + .seconds(2)

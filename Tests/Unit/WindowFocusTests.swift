@@ -4,6 +4,136 @@ import Synchronization
 import XCTest
 
 final class WindowFocusTests: XCTestCase {
+    func testRestoreReturnsTheExactNativeFocusAlreadyVerifiedByTheCommand() throws {
+        for capturedStatus: WindowStatus in [.minimized, .inactive] {
+            let desktop = BehaviorDesktop()
+            let element = try XCTUnwrap(desktop.elements[1001])
+            let record = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
+            desktop.state.withLock {
+                $0.windows[1001]?.status = .minimized
+                $0.focused = nil
+            }
+            var snapshot = desktop.values.value
+            snapshot.windows[record.id] = recordWithExactTarget(record, status: capturedStatus, element: element)
+            let before = ProcessInfo.processInfo.systemUptime
+            let result = activateWithConfirmation(desktop, window: record.id, snapshot: snapshot)
+
+            XCTAssertTrue(result.success)
+            let confirmation = try XCTUnwrap(result.focus)
+            XCTAssertEqual(confirmation.pid, record.pid)
+            XCTAssertEqual(confirmation.windowID, 1001)
+            XCTAssertEqual(confirmation.element, AXElementKey(e: element))
+            XCTAssertGreaterThanOrEqual(confirmation.observedAt, before)
+            XCTAssertLessThanOrEqual(confirmation.observedAt, ProcessInfo.processInfo.systemUptime)
+        }
+    }
+
+    func testRestoreConfirmationCarriesTheReboundNumberForTheSameAXElement() throws {
+        let desktop = BehaviorDesktop()
+        let element = try XCTUnwrap(desktop.elements[1001])
+        let original = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
+        let record = recordWithExactTarget(original, status: .minimized, element: element)
+        desktop.state.withLock {
+            $0.windows[1001] = record
+            $0.focused = 2001
+            $0.afterAttributeWrite = { [weak desktop] id, attribute in
+                if id == 1001, attribute == kAXMinimizedAttribute as String {
+                    desktop?.state.withLock {
+                        $0.nativeWindowIDOverrides[1001] = 1009
+                        $0.windows[1001]?.cgWindowID = 1009
+                    }
+                }
+            }
+        }
+        desktop.publish()
+        let result = activateWithConfirmation(desktop, window: record.id, snapshot: desktop.values.value)
+
+        XCTAssertTrue(result.success)
+        let focus = try XCTUnwrap(result.focus)
+        XCTAssertEqual(focus.windowID, 1009)
+        XCTAssertEqual(focus.pid, record.pid)
+        XCTAssertEqual(focus.element, AXElementKey(e: element))
+    }
+
+    func testActivationOfAWindowThatWasNotRestoredDoesNotReturnAFocusConfirmation() throws {
+        let desktop = BehaviorDesktop()
+        let element = try XCTUnwrap(desktop.elements[1001])
+        let record = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
+        var snapshot = desktop.values.value
+        snapshot.windows[record.id] = recordWithExactTarget(record, status: record.status, element: element)
+        let result = activateWithConfirmation(desktop, window: record.id, snapshot: snapshot)
+
+        XCTAssertTrue(result.success)
+        XCTAssertNil(result.focus)
+    }
+
+    func testRestoreDoesNotPublishAnAliasedSiblingAsTheFocusedWindow() throws {
+        let desktop = BehaviorDesktop()
+        let record = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
+        desktop.state.withLock {
+            $0.windows[1001]?.status = .minimized
+            $0.focused = 1002
+            $0.nativeWindowIDOverrides[1002] = 1001
+            $0.denyFocus = true
+        }
+        desktop.publish()
+        let result = activateWithConfirmation(desktop, window: record.id, snapshot: desktop.values.value)
+
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(desktop.state.withLock { $0.focused }, 1002)
+        XCTAssertNil(result.focus)
+    }
+
+    private func recordWithExactTarget(_ record: WindowRecord, status: WindowStatus,
+                                       element: AXUIElement) -> WindowRecord {
+        WindowRecord(id: record.id, appID: record.appID, pid: record.pid,
+            bundleIdentifier: record.bundleIdentifier, title: record.title, bounds: record.bounds,
+            status: status, cgWindowID: record.cgWindowID, groupID: record.groupID,
+            applicationOrigin: record.applicationOrigin, processGeneration: record.processGeneration,
+            actionTarget: WindowActionTarget(element: AXElementKey(e: element)))
+    }
+
+    private func activateWithConfirmation(_ desktop: BehaviorDesktop, window: WindowID,
+                                          snapshot: DockSnapshot) -> WindowActionResult {
+        let executor: any WindowActionExecuting = PlatformActionExecutor(reader: AXWindowReader(accessibility: desktop),
+            system: desktop, focusBackend: desktop)
+        return executor.executeWithFocusConfirmation(.init(kind: .activateWindow, windowID: window),
+            snapshot: snapshot, forcedMinimizedPrior: false, cancellation: OperationCancellation(), onHandoffTarget: nil)
+    }
+
+    func testMinimizedRestoreFocusesTheExactWindowOnceWhenItsSiblingReceivedNativeFocus() throws {
+        let desktop = BehaviorDesktop()
+        let element = try XCTUnwrap(desktop.elements[1001])
+        desktop.state.withLock {
+            $0.windows[1001]?.status = .minimized
+            $0.focused = nil
+            $0.afterAttributeWrite = { [weak desktop] window, attribute in
+                if window == 1001, attribute == kAXMinimizedAttribute as String {
+                    _ = desktop?.setFrontmost(pid: -41000, windowID: 1002, mode: 0)
+                }
+            }
+        }
+        let requests = Mutex<[String]>([])
+        let backend = SkyLightWindowFocus(frontRequest: { pid, window, mode in
+            requests.withLock { $0.append("front:\(window)") }
+            return desktop.setFrontmost(pid: pid, windowID: window, mode: mode)
+                ? CGError.success.rawValue : CGError.failure.rawValue
+        }, keyRequest: { pid, window in
+            requests.withLock { $0.append("key:\(window)") }
+            return desktop.makeKey(pid: pid, windowID: window) ? CGError.success.rawValue : CGError.failure.rawValue
+        })
+        let executor = AccessibilityWindowActionExecutor(reader: AXWindowReader(accessibility: desktop),
+            focusBackend: backend, system: desktop)
+        let handle = AccessibilityWindowActionExecutor.fastHandle(
+            from: AXWindowHandle(pid: -41000, title: nil, bounds: nil, element: element),
+            target: .init(pid: -41000, title: nil, bounds: nil, cgWindowID: 1001))
+
+        XCTAssertTrue(executor.activate(handle, knownCGWindowID: 1001, knownMinimized: true,
+                                        awaitOnScreenBeforeFocus: true))
+        XCTAssertEqual(desktop.state.withLock { $0.focused }, 1001)
+        XCTAssertEqual(requests.withLock { $0 }, ["front:1001", "key:1001"])
+    }
+
     func testMinimizedWindowCanRestoreWithExactAccessibilityIdentityWhenWindowServerOmitsIt() {
         let start = ProcessGeneration(timeval(tv_sec: 10, tv_usec: 3))
         let record = WindowRecord(id: WindowID(rawValue: "one"), appID: AppID(rawValue: "app"), pid: 42,
@@ -75,7 +205,7 @@ final class WindowFocusTests: XCTestCase {
             desktop.state.withLock { $0.focused = focused }
             XCTAssertEqual(executor.execute(.init(kind: .activateWindow, windowID: record.id),
                 snapshot: snapshot, forcedMinimizedPrior: false, cancellation: OperationCancellation(),
-                onHandoffActivePrediction: nil), succeeds)
+                onHandoffTarget: nil), succeeds)
         }
     }
 

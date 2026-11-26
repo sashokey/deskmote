@@ -1,4 +1,7 @@
 import AppKit
+#if DEBUG
+import os
+#endif
 
 @MainActor
 final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
@@ -9,16 +12,35 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
     private static let tilePitch: CGFloat = 84
     private static let tileIconSize: CGFloat = 38
     private static let pinShiftAnimationKey = "apps-pin-shift"
+    #if DEBUG
+    private static let pinDropLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "apps-pins")
+    #endif
 
     private struct PinnedLayout: Equatable {
         let pins: [AppsMenuPin]
         let expanded: Bool
     }
 
+    private enum PinDrop: Equatable {
+        case group(UUID)
+        case insert(beside: UUID, after: Bool)
+
+        var groupTarget: UUID? {
+            if case .group(let target) = self { return target }
+            return nil
+        }
+    }
+
     private struct PinDrag {
         let source: UUID
         let order: [UUID]
         let frames: [UUID: CGRect]
+        let canGroup: Bool
+        var drop: PinDrop?
+
+        func insertionIndex(in order: [UUID], beside target: UUID, after: Bool) -> Int? {
+            order.firstIndex(of: target).map { $0 + (after ? 1 : 0) }
+        }
     }
 
     private struct CatalogContent {
@@ -49,8 +71,13 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
     private let footer = AppsMenuCanvas()
     private let footerRule = AppsMenuBox(radius: 0, fill: .white.withAlphaComponent(0.12))
     private let runningScroll = AppsMenuRunningScrollView(horizontal: true)
+    private var fileManagerButton: AppsMenuButton?
     private var runningTooltip: AppsMenuRunningTooltip?
-    private var applications: [AppsMenuApplication]?
+    private var catalog: AppsMenuCatalog?
+    private var applications: [AppsMenuApplication]? { catalog?.all }
+    private var catalogNotice: String? {
+        catalog?.allUnavailable == true ? String(localized: "macOS app catalog is unavailable.") : nil
+    }
     private var applicationsByID: [String: AppsMenuApplication] = [:]
     private var runningApps: [NSRunningApplication] = []
     private var runningObservation: NSKeyValueObservation?
@@ -76,15 +103,18 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
     private var folderShield: AppsMenuCanvas?
     private var folderGlass: NSGlassEffectView?
     private var folderScroll: AppsMenuScrollView?
-    private var folderTitle: AppsMenuButton?
     private var renameField: NSTextField?
     private var catalogButtons: [AppsMenuButton] = []
     private var pinButtons: [UUID: AppsMenuButton] = [:]
     private var pinDrag: PinDrag?
-    private var runningButtons: [AppsMenuButton] = []
-    private var folderButtons: [AppsMenuButton] = []
+    #if DEBUG
+    private var pinDragResources: ActionResourceLog.Span?
+    #endif
     private weak var hoveredButton: AppsMenuButton?
     private var acceptsMenuActions = true
+    private(set) var catalogDeferredUntilFrame: Bool
+    private var hasPresented = false
+    private var displayedMode: AppsMenuCatalogMode?
 
     #if DESKMOTE_TEST
     var preparedViewModes: Set<AppsMenuCatalogMode> { Set(allContents.keys) }
@@ -97,6 +127,7 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
          reduceMotion: @escaping () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion },
          runningWindows: @escaping (pid_t) -> [TaskbarWindowPresentation] = { _ in [] },
          activateWindow: @escaping (WindowActionIdentity) -> Void = { _ in },
+         deferCatalog: Bool = false,
          dismiss: @escaping () -> Void) {
         self.store = store
         self.presentViewModes = presentViewModes
@@ -104,6 +135,7 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
         self.runningWindows = runningWindows
         self.activateWindow = activateWindow
         self.dismiss = dismiss
+        catalogDeferredUntilFrame = deferCatalog
         super.init(frame: frame)
         style = .regular
         cornerRadius = 20
@@ -142,15 +174,20 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
         searchField.target = self
         searchField.action = #selector(searchFieldChanged)
         searchField.delegate = self
-        if let snapshot = store.catalogSnapshot { applyCatalog(snapshot) }
-        runningApps = store.runningApplications()
+        if !deferCatalog {
+            if let snapshot = store.catalogSnapshot { applyCatalog(snapshot) }
+            runningApps = store.runningApplications()
+        }
         layoutContents()
-        loadCatalog()
+        if !deferCatalog { loadCatalog() }
     }
 
     required init?(coder: NSCoder) { nil }
 
     isolated deinit {
+        #if DEBUG
+        pinDragResources?.finish()
+        #endif
         stopObservingApplications()
         catalogTask?.cancel()
         viewModePreparation?.cancel()
@@ -164,10 +201,14 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         stopObservingApplications()
-        guard window != nil else {
+        guard window != nil, !catalogDeferredUntilFrame else {
             refreshHover()
             return
         }
+        startObservingApplications()
+    }
+
+    private func startObservingApplications() {
         runningObservation = NSWorkspace.shared.observe(\.runningApplications, options: [.new]) { [weak self] _, _ in
             Task { @MainActor [weak self] in self?.observeApplicationPolicies() }
         }
@@ -177,54 +218,79 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
         observeApplicationPolicies()
     }
 
+    func prepareForPresentation(size: CGSize) {
+        acceptsMenuActions = true
+        var rebuild = false
+        if hasPresented {
+            rebuild = !query.isEmpty || alphabetAnchor != nil || category != nil
+            query = ""
+            alphabetAnchor = nil
+            category = nil
+            browsingPosition = .zero
+            alphabetPosition = .zero
+            categoryPosition = .zero
+            searchField.stringValue = ""
+            clearFolder()
+        }
+        if !catalogDeferredUntilFrame {
+            if let latest = store.catalogSnapshot, catalog != latest {
+                applyCatalog(latest)
+                rebuild = true
+            }
+            rebuild = rebuild || displayedMode != store.catalogMode ||
+                pinnedLayout != PinnedLayout(pins: store.pins, expanded: store.expanded)
+        }
+        hasPresented = true
+        setFrameSize(size)
+        if size != lastSize {
+            layoutContents()
+        } else if rebuild {
+            rebuildCatalog(position: .zero)
+        }
+        if catalogScroll.contentView.bounds.origin != .zero { scroll(catalogScroll, to: .zero) }
+        if runningScroll.contentView.bounds.origin != .zero { scroll(runningScroll, to: .zero) }
+        if !catalogDeferredUntilFrame { loadCatalog() }
+    }
+
+    func presentedFirstFrame() {
+        guard catalogDeferredUntilFrame, acceptsMenuActions, window != nil else { return }
+        catalogDeferredUntilFrame = false
+        startObservingApplications()
+        if fileManagerButton == nil { rebuildRunningFooter() }
+        loadCatalog()
+    }
+
     func focusSearch() {
         window?.makeFirstResponder(searchField)
     }
 
     func stopMenuActions() {
         acceptsMenuActions = false
+        catalogTask?.cancel()
+        catalogTask = nil
         viewModePreparation?.cancel()
+        viewModePreparation = nil
         resetPinDrag()
         runningTooltip?.removeFromSuperview()
     }
 
-    override func cancelOperation(_ sender: Any?) {
-        guard acceptsMenuActions else { return }
-        if pinDrag != nil {
-            resetPinDrag()
-        } else if renameField != nil {
-            finishRenaming(save: false)
-        } else if folderID != nil {
-            closeFolder()
-        } else if !query.isEmpty {
-            searchField.stringValue = ""
-            searchField.currentEditor()?.string = ""
-            searchFieldChanged()
-            focusSearch()
-        } else if alphabetAnchor != nil {
-            closeAlphabet()
-        } else if category != nil {
-            showCategory(nil)
-        } else {
-            dismiss()
-        }
-    }
-
     private func loadCatalog() {
+        catalogTask?.cancel()
         let store = self.store
         catalogTask = Task { [weak self] in
-            let applications = await store.loadInstalledApplications()
-            guard !Task.isCancelled, let self, self.applications != applications else { return }
-            applyCatalog(applications)
+            let snapshot = await store.loadCatalog()
+            guard !Task.isCancelled, let self, self.catalog != snapshot else { return }
+            applyCatalog(snapshot)
             rebuildCatalog()
         }
     }
 
-    private func applyCatalog(_ applications: [AppsMenuApplication]) {
+    private func applyCatalog(_ snapshot: AppsMenuCatalog) {
         viewModePreparation?.cancel()
         viewModePreparation = nil
-        self.applications = applications
-        applicationsByID = Dictionary(applications.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        catalog = snapshot
+        let available = snapshot.installed + (snapshot.all ?? [])
+        applicationsByID = Dictionary(available.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         pinnedContent = nil
         allContents.removeAll()
     }
@@ -252,6 +318,10 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
     @objc private func searchFieldChanged() {
         let newQuery = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard newQuery != query else { return }
+        #if DEBUG
+        let span = ActionResourceLog.begin("apps.search")
+        defer { span?.finish() }
+        #endif
         let changesScreen = query.isEmpty != newQuery.isEmpty
         if query.isEmpty {
             browsingPosition = alphabetAnchor == nil ? catalogScroll.contentView.bounds.origin : alphabetPosition
@@ -270,37 +340,17 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
         guard let field = notification.object as? NSTextField, field === renameField else { return }
         Task { @MainActor [weak self, weak field] in
             guard let self, let field, field === renameField else { return }
-            finishRenaming(save: true, focusTitle: false)
+            finishRenaming()
         }
     }
 
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        guard acceptsMenuActions else { return false }
-        if commandSelector == #selector(cancelOperation(_:)) {
-            cancelOperation(control)
-            return true
-        }
-        if control === renameField, commandSelector == #selector(insertNewline(_:)) {
-            finishRenaming(save: true)
-            return true
-        }
-        guard control === searchField, !textView.hasMarkedText() else { return false }
-        if commandSelector == #selector(moveDown(_:)), let button = catalogButtons.first {
-            focus(button)
-            return true
-        }
-        if commandSelector == #selector(insertNewline(_:)), let app = searchResults.first {
-            launch(app)
-            return true
-        }
-        return false
-    }
-
-    private func rebuildCatalog(position: CGPoint? = nil, restoreFocus: String? = nil,
+    private func rebuildCatalog(position: CGPoint? = nil, reveal identifier: String? = nil,
                                 transition: CatalogTransition = .none) {
+        #if DEBUG
+        let span = ActionResourceLog.begin("apps.catalog.render")
+        defer { span?.finish() }
+        #endif
         resetPinDrag()
-        let focusID = restoreFocus ?? focusedIdentifier(in: catalogButtons)
-        let keyboardFocus = restoreFocus == nil && (window?.firstResponder as? AppsMenuButton)?.showsKeyboardFocus == true
         let previousPins = transition == .pinned || transition == .expand ? pinButtons : [:]
         let scrollPosition = position ?? catalogScroll.contentView.bounds.origin
         let height = query.isEmpty ? footer.frame.minY : surface.bounds.height
@@ -331,6 +381,7 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
             pinnedContent = pinned
             let cacheable = category == nil && applications != nil
             let mode = store.catalogMode
+            displayedMode = mode
             let all = (cacheable ? allContents[mode] : nil) ?? buildContent { buildAll(in: $0, mode: mode) }
             if cacheable { allContents[mode] = all }
             if displayedPinned !== pinned.document {
@@ -360,8 +411,10 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
             setDocument(content.document, height: content.height + 12, in: catalogScroll, position: scrollPosition)
             if transition == .content { animateEntry(content.document) }
         }
-        updateKeyLoop()
-        if let focusID, folderID == nil { self.restoreFocus(on: focusID, in: catalogButtons, keyboard: keyboardFocus) }
+        if let identifier, folderID == nil,
+           let button = catalogButtons.first(where: { $0.identifier?.rawValue == identifier }) {
+            button.scrollToVisible(button.bounds)
+        }
         prepareViewModes()
     }
 
@@ -455,12 +508,17 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
     }
 
     private func buildSearch(in document: AppsMenuCanvas) -> CGFloat {
-        guard let applications else { return addStatus(String(localized: "Loading apps…"), at: 12, to: document) }
+        let notice = catalogNotice
+        guard let applications else {
+            return addStatus(notice ?? String(localized: "Loading apps…"), at: 12, to: document)
+        }
+        if let notice { _ = addStatus(notice, at: 12, to: document) }
+        let noticeOffset: CGFloat = notice == nil ? 0 : 40
         searchResults = applications.filter { $0.name.localizedStandardContains(query) }
         if searchResults.isEmpty {
-            return addStatus(String(localized: "No matching apps"), at: 12, to: document)
+            return addStatus(String(localized: "No matching apps"), at: 12 + noticeOffset, to: document)
         }
-        return buildRows(searchResults, top: 6, in: document)
+        return buildRows(searchResults, top: 6 + noticeOffset, in: document)
     }
 
     private func buildPinned(in document: AppsMenuCanvas) -> CGFloat {
@@ -477,7 +535,7 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
                                             id: "expand", in: document) { [weak self] _ in
                 guard let self else { return }
                 store.expanded.toggle()
-                rebuildCatalog(restoreFocus: "expand", transition: .expand)
+                rebuildCatalog(reveal: "expand", transition: .expand)
             }
             button.toolTip = title
         }
@@ -510,17 +568,23 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
                                id: "mode", in: document) { [weak self] button in
             self?.showViewModes(at: button)
         }
+        let notice = catalogNotice
+        if let notice {
+            let height = addStatus(notice, at: 42, to: document)
+            if applications?.isEmpty != false { return height }
+        }
         guard let applications else {
             return addStatus(String(localized: "Loading apps…"), at: 42, to: document)
         }
         guard !applications.isEmpty else {
             return addStatus(String(localized: "No apps available"), at: 42, to: document)
         }
+        let noticeOffset: CGFloat = notice == nil ? 0 : 34
         switch mode {
         case .list, .grid:
-            return buildAlphabetical(applications, grid: mode == .grid, top: 44.5, in: document)
+            return buildAlphabetical(applications, grid: mode == .grid, top: 44.5 + noticeOffset, in: document)
         case .category:
-            return buildCategories(applications, top: 34, in: document)
+            return buildCategories(applications, top: 34 + noticeOffset, in: document)
         }
     }
 
@@ -562,13 +626,13 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
     private func openAlphabet(at letter: String) {
         alphabetAnchor = letter
         alphabetPosition = catalogScroll.contentView.bounds.origin
-        rebuildCatalog(position: .zero, restoreFocus: "jump-\(letter)", transition: .content)
+        rebuildCatalog(position: .zero, reveal: "jump-\(letter)", transition: .content)
     }
 
     private func closeAlphabet(jumpTo letter: String? = nil) {
         let anchor = alphabetAnchor
         alphabetAnchor = nil
-        rebuildCatalog(position: alphabetPosition, restoreFocus: (letter ?? anchor).map { "section-\($0)" },
+        rebuildCatalog(position: alphabetPosition, reveal: (letter ?? anchor).map { "section-\($0)" },
                        transition: .content)
         guard let letter, let heading = catalogButtons.first(where: { $0.identifier?.rawValue == "section-\(letter)" }) else { return }
         let origin = heading.convert(heading.bounds, to: browsingDocument).minY
@@ -608,7 +672,11 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
                                   width: max(0, surface.bounds.width - leading * 2), height: 40)
             button.pendingContent = { [weak self] button in
                 guard let self else { return }
-                addFileIcon(app.url, at: CGRect(x: horizontal(6), y: 8, width: 24, height: 24), to: button)
+                let icon = AppsMenuListIconView(frame: CGRect(x: horizontal(6), y: 8, width: 24, height: 24),
+                                               artworkSize: Self.tileIconSize)
+                icon.setAccessibilityElement(false)
+                button.addSubview(icon)
+                store.requestIcon(at: app.url) { [weak icon] artwork in icon?.artwork = artwork }
                 let text = makeLabel(app.name, size: 12, weight: .medium)
                 let textX = max(33, horizontal(45))
                 text.frame = CGRect(x: textX, y: 11, width: max(0, button.frame.width - textX - 6), height: 18)
@@ -678,9 +746,9 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
         if selection != nil {
             let mode = catalogButtons.first { $0.identifier?.rawValue == "mode" }
             let y = (mode?.convert(.zero, to: browsingDocument).y ?? 0) - 20
-            rebuildCatalog(position: CGPoint(x: 0, y: max(0, y)), restoreFocus: "category-back", transition: .content)
+            rebuildCatalog(position: CGPoint(x: 0, y: max(0, y)), reveal: "category-back", transition: .content)
         } else {
-            rebuildCatalog(position: categoryPosition, restoreFocus: oldCategory.map { "category-\($0)" }, transition: .content)
+            rebuildCatalog(position: categoryPosition, reveal: oldCategory.map { "category-\($0)" }, transition: .content)
         }
     }
 
@@ -694,7 +762,7 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
                     guard let self, store.catalogMode != mode || category != nil else { return }
                     store.catalogMode = mode
                     category = nil
-                    rebuildCatalog(restoreFocus: "mode")
+                    rebuildCatalog(reveal: "mode")
                 }
             }
             item.state = store.catalogMode == mode ? .on : .off
@@ -769,11 +837,15 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
         let topPadding: CGFloat = pinned ? 5 : 0
         let button = AppsMenuButton(title: name, style: pinned ? .pinned : .glassRow, action: action)
         button.frame = CGRect(x: x - width / 2, y: top - 7 - topPadding, width: width, height: 79 + topPadding)
+        let artworkSize = isFolder ? 32 : min(Self.tileIconSize, width)
+        let artwork = CGRect(x: (width - artworkSize) / 2, y: (isFolder ? 7 : 4) + topPadding,
+                             width: artworkSize, height: artworkSize)
+        if pinned { button.pinArtwork = artwork }
         let renderArtwork: (AppsMenuButton) -> Void = { [weak self] button in
             guard let self else { return }
             if isFolder {
                 let preview = AppsMenuBox(radius: 8, fill: .white.withAlphaComponent(0.14))
-                preview.frame = CGRect(x: (width - 32) / 2, y: 7 + topPadding, width: 32, height: 32)
+                preview.frame = artwork
                 button.addSubview(preview)
                 for (index, app) in apps.prefix(4).enumerated() {
                     let x = preview.frame.minX + 3 + CGFloat(index % 2) * 13
@@ -781,9 +853,7 @@ final class AppsMenuView: NSGlassEffectView, NSSearchFieldDelegate {
                     addFileIcon(app.url, at: CGRect(x: x, y: y, width: 13, height: 13), to: button)
                 }
             } else if let app = apps.first {
-                let size = min(Self.tileIconSize, width)
-                let frame = CGRect(x: (width - size) / 2, y: 4 + topPadding, width: size, height: size)
-                addFileIcon(app.url, at: frame, to: button)
+                addFileIcon(app.url, at: artwork, to: button)
             }
         }
         if folder { renderArtwork(button) } else { button.pendingContent = renderArtwork }
@@ -886,42 +956,90 @@ private extension AppsMenuView {
     func movePin(_ id: UUID, offset: Int) {
         guard let index = store.pins.firstIndex(where: { $0.id == id }) else { return }
         updatePins { $0.movePin(id, to: index + offset) }
-        if folderID == nil, let button = pinButtons[id] { focus(button) }
+        if folderID == nil, let button = pinButtons[id] { button.scrollToVisible(button.bounds) }
     }
 
     func dragPin(_ id: UUID, from start: CGPoint, event: NSEvent, finished: Bool) {
         guard acceptsMenuActions, let source = pinButtons[id], let parent = source.superview else { return }
         if pinDrag == nil, !finished {
             let order = store.pins.map(\.id).filter { pinButtons[$0] != nil }
-            guard order.count > 1 else { return }
-            pinDrag = PinDrag(source: id, order: order, frames: pinButtons.mapValues(\.frame))
+            guard order.count > 1, let pin = store.pins.first(where: { $0.id == id }) else { return }
+            #if DEBUG
+            pinDragResources = ActionResourceLog.begin("apps.pin.drag")
+            #endif
+            pinDrag = PinDrag(source: id, order: order, frames: pinButtons.mapValues(\.frame),
+                              canGroup: pin.name == nil && pin.applicationIDs.count == 1)
             source.wantsLayer = true
             source.layer?.zPosition = 1
+            refreshHover()
         }
         guard let drag = pinDrag, drag.source == id, let originalFrame = drag.frames[id] else { return }
         let point = parent.convert(event.locationInWindow, from: nil)
         let clip = catalogScroll.contentView
         let inViewport = clip.bounds.contains(clip.convert(event.locationInWindow, from: nil))
-        let target = inViewport ? drag.order.firstIndex { drag.frames[$0]?.contains(point) == true } : nil
+        let drop = inViewport ? pinDrop(at: point, in: drag) : nil
         if finished {
+            #if DEBUG
+            let previous = store.pins
+            #endif
             resetPinDrag()
-            guard let target, let index = store.pins.firstIndex(where: { $0.id == drag.order[target] }) else { return }
-            updatePins { $0.movePin(id, to: index) }
+            switch drop {
+            case .group(let target):
+                updatePins { $0.groupPin(id, into: target) }
+            case .insert(let target, let after):
+                let order = store.pins.map(\.id).filter { $0 != id }
+                if let index = drag.insertionIndex(in: order, beside: target, after: after) {
+                    updatePins { $0.movePin(id, to: index) }
+                }
+            case nil:
+                break
+            }
+            #if DEBUG
+            let outcome = switch drop {
+            case .group: "group"
+            case .insert: "insert"
+            case nil: inViewport ? "no-target" : "outside-viewport"
+            }
+            Self.pinDropLogger.info("drop outcome=\(outcome, privacy: .public) changed=\(previous != self.store.pins, privacy: .public) before=\(previous.count, privacy: .public) after=\(self.store.pins.count, privacy: .public)")
+            #endif
+            refreshHover()
             return
         }
+        if drag.drop != drop {
+            pinDrag?.drop = drop
+            showPinDrop(drop, in: drag)
+        }
+        let initial = parent.convert(start, from: nil)
+        let frame = originalFrame.offsetBy(dx: point.x - initial.x, dy: point.y - initial.y)
+        if source.frame != frame { source.frame = frame }
+    }
+
+    private func pinDrop(at point: CGPoint, in drag: PinDrag) -> PinDrop? {
+        guard let target = drag.order.first(where: { drag.frames[$0]?.contains(point) == true }),
+              target != drag.source, let slot = drag.frames[target] else { return nil }
+        if drag.canGroup, let artwork = pinButtons[target]?.pinArtwork,
+           artwork.offsetBy(dx: slot.minX, dy: slot.minY).contains(point) {
+            return .group(target)
+        }
+        return .insert(beside: target, after: point.x >= slot.midX)
+    }
+
+    private func showPinDrop(_ drop: PinDrop?, in drag: PinDrag) {
+        if let target = drag.drop?.groupTarget { pinButtons[target]?.isPinDropTarget = false }
+        if let target = drop?.groupTarget { pinButtons[target]?.isPinDropTarget = true }
         var reordered = drag.order
-        if let target {
-            reordered.removeAll { $0 == id }
-            reordered.insert(id, at: target)
+        if case .insert(let target, let after) = drop {
+            reordered.removeAll { $0 == drag.source }
+            if let index = drag.insertionIndex(in: reordered, beside: target, after: after) {
+                reordered.insert(drag.source, at: index)
+            }
         }
         let animate = window != nil && !reduceMotion()
-        for (pin, slot) in zip(reordered, drag.order) where pin != id {
+        for (pin, slot) in zip(reordered, drag.order) where pin != drag.source {
             guard let button = pinButtons[pin], let frame = drag.frames[slot], button.frame != frame else { continue }
             if animate { slidePin(button, to: frame) }
             else { button.frame = frame }
         }
-        let initial = parent.convert(start, from: nil)
-        source.frame = originalFrame.offsetBy(dx: point.x - initial.x, dy: point.y - initial.y)
     }
 
     private func slidePin(_ button: AppsMenuButton, to frame: CGRect) {
@@ -942,6 +1060,12 @@ private extension AppsMenuView {
 
     func resetPinDrag() {
         guard let drag = pinDrag else { return }
+        #if DEBUG
+        let span = pinDragResources
+        pinDragResources = nil
+        defer { span?.finish() }
+        #endif
+        if let target = drag.drop?.groupTarget { pinButtons[target]?.isPinDropTarget = false }
         for (id, frame) in drag.frames {
             pinButtons[id]?.layer?.removeAnimation(forKey: Self.pinShiftAnimationKey)
             pinButtons[id]?.frame = frame
@@ -961,6 +1085,10 @@ private extension AppsMenuView {
 
     func openFolder(_ id: UUID, rename: Bool = false) {
         guard store.pins.contains(where: { $0.id == id && $0.name != nil }) else { return }
+        #if DEBUG
+        let span = ActionResourceLog.begin("apps.folder.open")
+        defer { span?.finish() }
+        #endif
         folderID = id
         var draft: String?
         if rename, let folder = store.pins.first(where: { $0.id == id }) {
@@ -968,25 +1096,34 @@ private extension AppsMenuView {
         }
         rebuildFolder(draft: draft)
         if let folderGlass { animateEntry(folderGlass) }
-        if !rename, let folderTitle { focus(folderTitle) }
     }
 
-    func closeFolder() {
-        let closedID = folderID
+    private func clearFolder() {
+        guard folderID != nil else { return }
         folderID = nil
         renameField = nil
         folderScroll = nil
-        folderTitle = nil
-        folderButtons.removeAll()
         folderGlass?.removeFromSuperview()
         folderGlass = nil
         folderShield?.removeFromSuperview()
         folderShield = nil
         setCatalogAccessibilityHidden(false)
+    }
+
+    func closeFolder() {
+        #if DEBUG
+        let span = folderID == nil ? nil : ActionResourceLog.begin("apps.folder.close")
+        defer { span?.finish() }
+        #endif
+        let closedID = folderID
+        clearFolder()
         if let document = catalogScroll.documentView { animateEntry(document) }
         refreshHover()
-        updateKeyLoop()
-        if let closedID, let button = pinButtons[closedID] { focus(button) } else { focusSearch() }
+        if let closedID, let button = pinButtons[closedID] {
+            button.scrollToVisible(button.bounds)
+        } else {
+            focusSearch()
+        }
     }
 
     func rebuildFolder(draft: String? = nil) {
@@ -997,16 +1134,14 @@ private extension AppsMenuView {
         let apps = folder.applicationIDs.compactMap { applicationsByID[$0] }
         let position = folderScroll?.contentView.bounds.origin ?? .zero
         let editing = draft ?? renameField?.stringValue
-        let focused = focusedIdentifier(in: folderButtons)
         renameField = nil
-        folderButtons.removeAll()
         folderGlass?.removeFromSuperview()
         folderShield?.removeFromSuperview()
         setCatalogAccessibilityHidden(true)
         let shield = AppsMenuCanvas(frame: surface.bounds)
         shield.setAccessibilityElement(false)
         shield.onClick = { [weak self] in
-            self?.finishRenaming(save: true, focusTitle: false)
+            self?.finishRenaming()
             self?.closeFolder()
         }
         folderShield = shield
@@ -1033,7 +1168,6 @@ private extension AppsMenuView {
         title.usesNativeContent = true
         title.font = .systemFont(ofSize: 18, weight: .semibold)
         title.frame = renameFrame
-        folderTitle = title
         if editing == nil { register(title, in: body, folder: true) }
         let scroll = AppsMenuScrollView(horizontal: false)
         scroll.onClipChanged = { [weak self] in self?.refreshHover() }
@@ -1070,11 +1204,6 @@ private extension AppsMenuView {
             body.addSubview(field)
             if draft != nil { field.selectText(nil) } else { window?.makeFirstResponder(field) }
         }
-        updateKeyLoop()
-        if let focused, editing == nil {
-            if let button = folderButtons.first(where: { $0.identifier?.rawValue == focused }) { focus(button) }
-            else { focus(title) }
-        }
     }
 
     func setCatalogAccessibilityHidden(_ hidden: Bool) {
@@ -1108,15 +1237,14 @@ private extension AppsMenuView {
         runningObservation = nil
     }
 
-    func finishRenaming(save: Bool, focusTitle: Bool = true) {
+    func finishRenaming() {
         guard let field = renameField, let id = folderID else { return }
         renameField = nil
-        if save, let folder = store.pins.first(where: { $0.id == id }), field.stringValue != displayName(for: folder) {
+        if let folder = store.pins.first(where: { $0.id == id }), field.stringValue != displayName(for: folder) {
             store.renameFolder(id, to: field.stringValue)
             rebuildCatalog()
         }
         rebuildFolder()
-        if focusTitle, let folderTitle { focus(folderTitle) }
     }
 
     func refreshRunningApps() {
@@ -1127,16 +1255,23 @@ private extension AppsMenuView {
     }
 
     func rebuildRunningFooter() {
-        let focusID = focusedIdentifier(in: runningButtons)
         let pitch: CGFloat = 46
         let available = max(0, surface.bounds.width - horizontal(108))
-        let total = CGFloat(runningApps.count) * pitch
+        let manager = catalogDeferredUntilFrame ? nil : store.systemFileManager
+        let managerProcess = manager.flatMap { manager in
+            runningApps.first { $0.bundleIdentifier == manager.id }
+        }
+        let applications = runningApps.filter { manager == nil || $0.bundleIdentifier != manager?.id }
+        let fixedWidth = manager == nil ? 0 : min(pitch, available)
+        let scrollAvailable = available - fixedWidth
+        let total = CGFloat(applications.count) * pitch
         let nextIconPreview: CGFloat = 28
-        let width = total > available && available >= pitch + nextIconPreview
-            ? floor((available - nextIconPreview) / pitch) * pitch + nextIconPreview
-            : min(total, available)
+        let width = total > scrollAvailable && scrollAvailable >= pitch + nextIconPreview
+            ? floor((scrollAvailable - nextIconPreview) / pitch) * pitch + nextIconPreview
+            : min(total, scrollAvailable)
         let position = runningScroll.contentView.bounds.origin
-        runningScroll.frame = CGRect(x: (surface.bounds.width - width) / 2, y: 6, width: width, height: 56)
+        let left = (surface.bounds.width - width - fixedWidth) / 2
+        runningScroll.frame = CGRect(x: left + fixedWidth, y: 6, width: width, height: 56)
         let document = AppsMenuCanvas(frame: CGRect(x: 0, y: 0, width: total, height: 56))
         let iconSize = Self.tileIconSize
         let iconTopInset: CGFloat = 3
@@ -1146,38 +1281,63 @@ private extension AppsMenuView {
         let iconTop = (footer.bounds.height - pairHeight - iconTopInset) / 2 - runningScroll.frame.minY
         let iconFrame = CGRect(x: (pitch - iconSize) / 2, y: iconTop, width: iconSize, height: iconSize)
         let dotFrame = CGRect(x: (pitch - dotSize) / 2, y: iconFrame.maxY + dotGap, width: dotSize, height: dotSize)
-        runningButtons.removeAll()
-        for (index, app) in runningApps.enumerated() {
+        fileManagerButton?.removeFromSuperview()
+        fileManagerButton = nil
+        if let manager, fixedWidth > 0 {
+            let button = makeFooterButton(name: manager.name, url: manager.url, process: managerProcess,
+                                          iconFrame: iconFrame, dotFrame: dotFrame, allowsQuit: false) { [store] in
+                store.launch(manager)
+            }
+            button.identifier = NSUserInterfaceItemIdentifier("running-system-file-manager")
+            button.frame = CGRect(x: left, y: runningScroll.frame.minY, width: fixedWidth, height: 50)
+            footer.addSubview(button)
+            fileManagerButton = button
+        }
+        for (index, app) in applications.enumerated() {
             let name = app.localizedName ?? app.bundleIdentifier ?? app.bundleURL?.deletingPathExtension().lastPathComponent
                 ?? String(app.processIdentifier)
-            let button = AppsMenuButton(title: name, style: .running) { [weak self] _ in
-                self?.dismiss()
-                app.activate(options: [])
+            let button = makeFooterButton(name: name, url: app.bundleURL, process: app, iconFrame: iconFrame,
+                                          dotFrame: dotFrame, allowsQuit: true) { [store] in
+                store.reopen(app)
             }
-            button.contextMenu = { [weak self] in self?.runningAppMenu(for: app) }
             button.identifier = NSUserInterfaceItemIdentifier("running-\(app.processIdentifier)")
             button.frame = CGRect(x: CGFloat(index) * pitch, y: 0, width: pitch, height: 50)
-            if let url = app.bundleURL {
-                addFileIcon(url, at: iconFrame, to: button)
-            } else {
-                addIcon(app.icon ?? NSImage(named: NSImage.applicationIconName), at: iconFrame, to: button)
-            }
-            let indicator = AppsMenuBox(radius: dotSize / 2, fill: .labelColor.withAlphaComponent(0.76))
-            indicator.frame = dotFrame
-            button.addSubview(indicator)
             document.addSubview(button)
-            attachNavigation(to: button)
-            runningButtons.append(button)
         }
         runningScroll.hasHorizontalScroller = total > width && width > 0
         runningScroll.documentView = document
         scroll(runningScroll, to: position)
-        updateKeyLoop()
-        if let focusID, folderID == nil, query.isEmpty { restoreFocus(on: focusID, in: runningButtons) }
     }
 
-    func runningAppMenu(for app: NSRunningApplication) -> NSMenu? {
+    private func makeFooterButton(name: String, url: URL?, process: NSRunningApplication?,
+                                  iconFrame: CGRect, dotFrame: CGRect, allowsQuit: Bool,
+                                  open: @escaping () -> Void) -> AppsMenuButton {
+        let button = AppsMenuButton(title: name, style: .running) { [weak self] _ in
+            guard let self, acceptsMenuActions else { return }
+            dismiss()
+            open()
+        }
+        if let url {
+            addFileIcon(url, at: iconFrame, to: button)
+        } else {
+            addIcon(process?.icon ?? NSImage(named: NSImage.applicationIconName), at: iconFrame, to: button)
+        }
+        if let process {
+            button.contextMenu = { [weak self] in self?.runningAppMenu(for: process, allowsQuit: allowsQuit) }
+            let indicator = AppsMenuBox(radius: dotFrame.width / 2, fill: .labelColor.withAlphaComponent(0.76))
+            indicator.frame = dotFrame
+            button.addSubview(indicator)
+        }
+        attachHover(to: button)
+        return button
+    }
+
+    private func runningAppMenu(for app: NSRunningApplication, allowsQuit: Bool) -> NSMenu? {
         guard acceptsMenuActions, !app.isTerminated else { return nil }
+        #if DEBUG
+        let span = ActionResourceLog.begin("apps.menu.runningApplication")
+        defer { span?.finish() }
+        #endif
         let menu = NSMenu()
         menu.autoenablesItems = false
         let windows = runningWindows(app.processIdentifier)
@@ -1211,9 +1371,13 @@ private extension AppsMenuView {
             dismiss()
             if show { app.activate(options: []) } else { app.hide() }
         })
-        if app.bundleIdentifier != "com.apple.finder" {
+        if allowsQuit {
             menu.addItem(TaskbarNativeMenuFactory.actionItem(title: String(localized: "Quit")) { [weak self] in
                 guard let self, acceptsMenuActions, !app.isTerminated else { return }
+                #if DEBUG
+                let span = ActionResourceLog.begin("apps.application.quit")
+                defer { span?.finish() }
+                #endif
                 dismiss()
                 app.terminate()
             })
@@ -1237,8 +1401,8 @@ private extension AppsMenuView {
 
     func register(_ button: AppsMenuButton, in view: NSView, folder: Bool = false) {
         view.addSubview(button)
-        attachNavigation(to: button)
-        if folder { folderButtons.append(button) } else { catalogButtons.append(button) }
+        attachHover(to: button)
+        if !folder { catalogButtons.append(button) }
     }
 
     func renderVisibleCatalogButtons() {
@@ -1251,18 +1415,13 @@ private extension AppsMenuView {
         }
     }
 
-    func attachNavigation(to button: AppsMenuButton) {
-        button.onNavigate = { [weak self, weak button] direction in
-            guard let self, let button else { return false }
-            return navigate(from: button, toward: direction)
-        }
-        button.onEscape = { [weak self] in self?.cancelOperation(nil) }
+    func attachHover(to button: AppsMenuButton) {
         button.onPointerChanged = { [weak self] in self?.refreshHover() }
     }
 
     func refreshHover() {
         let target: AppsMenuButton?
-        if let window, window.isKeyWindow, let parent = surface.superview {
+        if pinDrag == nil, let window, window.isKeyWindow, let parent = surface.superview {
             let point = parent.convert(window.mouseLocationOutsideOfEventStream, from: nil)
             target = surface.hitTest(point) as? AppsMenuButton
         } else {
@@ -1289,81 +1448,8 @@ private extension AppsMenuView {
         }
     }
 
-    var activeButtons: [AppsMenuButton] {
-        if folderID != nil { return folderButtons }
-        return query.isEmpty ? catalogButtons + runningButtons : catalogButtons
-    }
-
-    func updateKeyLoop() {
-        var views: [NSView] = activeButtons
-        if let renameField {
-            views.insert(renameField, at: 0)
-        } else if folderID == nil {
-            views.insert(searchField, at: 0)
-        }
-        for (index, view) in views.enumerated() {
-            view.nextKeyView = views[(index + 1) % views.count]
-        }
-    }
-
-    func focus(_ button: AppsMenuButton, keyboard: Bool = false) {
-        guard let window, window.makeFirstResponder(button) else { return }
-        if keyboard { button.showKeyboardFocus() }
-        button.scrollToVisible(button.bounds)
-    }
-
-    func focusedIdentifier(in buttons: [AppsMenuButton]) -> String? {
-        guard let responder = window?.firstResponder as? AppsMenuButton,
-              buttons.contains(where: { $0 === responder }) else { return nil }
-        return responder.identifier?.rawValue
-    }
-
-    func restoreFocus(on identifier: String, in buttons: [AppsMenuButton], keyboard: Bool = false) {
-        if let button = buttons.first(where: { $0.identifier?.rawValue == identifier }) { focus(button, keyboard: keyboard) }
-        else { focusSearch() }
-    }
-
     func applicationIdentifier(_ app: AppsMenuApplication, inFolder: Bool) -> NSUserInterfaceItemIdentifier {
         NSUserInterfaceItemIdentifier((inFolder ? "folder-app-" : "catalog-app-") + app.id)
-    }
-
-    func navigate(from button: AppsMenuButton, toward direction: AppsMenuDirection) -> Bool {
-        let frame = button.convert(button.bounds, to: surface)
-        func nearest(in buttons: [AppsMenuButton]) -> AppsMenuButton? {
-            var best: (button: AppsMenuButton, distance: CGFloat)?
-            for candidate in buttons where candidate !== button && candidate.isEnabled {
-                let rect = candidate.convert(candidate.bounds, to: surface)
-                let dx = rect.midX - frame.midX
-                let dy = rect.midY - frame.midY
-                let distance: CGFloat
-                switch direction {
-                case .left: distance = dx < -0.5 ? -dx + abs(dy) * 3 : .infinity
-                case .right: distance = dx > 0.5 ? dx + abs(dy) * 3 : .infinity
-                case .up: distance = dy < -0.5 ? -dy + abs(dx) * 3 : .infinity
-                case .down: distance = dy > 0.5 ? dy + abs(dx) * 3 : .infinity
-                }
-                if distance < (best?.distance ?? .infinity) { best = (candidate, distance) }
-            }
-            return best?.button
-        }
-        let inFooter = runningButtons.contains { $0 === button }
-        var sameArea = folderID != nil ? folderButtons : inFooter ? runningButtons : catalogButtons
-        if alphabetAnchor != nil, button.identifier?.rawValue.hasPrefix("jump-") == true {
-            sameArea = sameArea.filter { $0.identifier?.rawValue.hasPrefix("jump-") == true }
-        }
-        let otherArea: [AppsMenuButton]
-        if folderID == nil, query.isEmpty, direction == (inFooter ? .up : .down) {
-            otherArea = inFooter ? catalogButtons : runningButtons
-        } else { otherArea = [] }
-        if let target = nearest(in: sameArea) ?? nearest(in: otherArea) {
-            focus(target, keyboard: true)
-            return true
-        }
-        if direction == .up, folderID == nil {
-            focusSearch()
-            return true
-        }
-        return false
     }
 
     func makeLabel(_ title: String, size: CGFloat, weight: NSFont.Weight = .regular,
@@ -1395,6 +1481,75 @@ private extension AppsMenuView {
     func menuSymbol(_ name: String, size: CGFloat) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: size, weight: .semibold))
+    }
+}
+
+private final class AppsMenuListIconView: NSImageView {
+    private let artworkSize: CGFloat
+    private var renderedScale: CGFloat?
+    private var renderedAppearance: NSAppearance?
+
+    var artwork: NSImage? {
+        didSet {
+            renderedScale = nil
+            updateArtwork()
+        }
+    }
+
+    init(frame: CGRect, artworkSize: CGFloat) {
+        self.artworkSize = artworkSize
+        super.init(frame: frame)
+        imageScaling = .scaleProportionallyUpOrDown
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateArtwork()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateArtwork()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateArtwork()
+    }
+
+    private func updateArtwork() {
+        guard let artwork else {
+            image = nil
+            return
+        }
+        let scale = window?.backingScaleFactor ?? 1
+        let appearance = effectiveAppearance
+        guard renderedScale != scale || renderedAppearance !== appearance else { return }
+        renderedScale = scale
+        renderedAppearance = appearance
+        let pixels = Int((artworkSize * scale).rounded(.up))
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            image = artwork
+            return
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.cgContext.scaleBy(x: scale, y: scale)
+        context.cgContext.clear(CGRect(x: 0, y: 0, width: artworkSize, height: artworkSize))
+        appearance.performAsCurrentDrawingAppearance {
+            artwork.draw(in: CGRect(x: 0, y: 0, width: artworkSize, height: artworkSize))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        let rendered = NSImage(size: bounds.size)
+        bitmap.size = bounds.size
+        rendered.addRepresentation(bitmap)
+        image = rendered
     }
 }
 
@@ -1533,13 +1688,6 @@ private final class AppsMenuRunningTooltip: NSGlassEffectView {
     }
 }
 
-private enum AppsMenuDirection: String {
-    case left = "\u{f702}"
-    case right = "\u{f703}"
-    case up = "\u{f700}"
-    case down = "\u{f701}"
-}
-
 private final class AppsMenuButton: NSButton {
     enum Style {
         case standard, pinned, running, glassRow
@@ -1547,10 +1695,14 @@ private final class AppsMenuButton: NSButton {
 
     let onActivate: (AppsMenuButton) -> Void
     var contextMenu: (() -> NSMenu?)?
-    var onNavigate: ((AppsMenuDirection) -> Bool)?
-    var onEscape: (() -> Void)?
     var onPointerChanged: (() -> Void)?
     var onDrag: ((CGPoint, NSEvent, Bool) -> Void)?
+    var pinArtwork: CGRect?
+    var isPinDropTarget = false {
+        didSet {
+            if oldValue != isPinDropTarget { updateSelection() }
+        }
+    }
     var pendingContent: ((AppsMenuButton) -> Void)?
     var usesNativeContent = false { didSet { isTransparent = !usesNativeContent } }
     private let selection: AppsMenuBox
@@ -1560,14 +1712,11 @@ private final class AppsMenuButton: NSButton {
     var hoverTransitionDuration: TimeInterval { style == .pinned ? 0.09 : TaskbarMotion.buttonTransition }
     private var tracking: NSTrackingArea?
     private var pressed = false
-    private var focused = false
-    private var keyboardFocus = false
-    var showsKeyboardFocus: Bool { focused && keyboardFocus }
     private var mouseDownPoint: CGPoint?
     private var dragged = false
 
     override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { isEnabled }
+    override var acceptsFirstResponder: Bool { false }
 
     init(title: String, style: Style = .standard, action: @escaping (AppsMenuButton) -> Void) {
         onActivate = action
@@ -1654,23 +1803,6 @@ private final class AppsMenuButton: NSButton {
         updateSelection()
     }
 
-    override func becomeFirstResponder() -> Bool {
-        guard super.becomeFirstResponder() else { return false }
-        focused = true
-        keyboardFocus = NSApp.currentEvent?.type == .keyDown
-        updateSelection()
-        scrollToVisible(bounds)
-        return true
-    }
-
-    override func resignFirstResponder() -> Bool {
-        guard super.resignFirstResponder() else { return false }
-        focused = false
-        keyboardFocus = false
-        updateSelection()
-        return true
-    }
-
     override func hitTest(_ point: NSPoint) -> NSView? {
         isEnabled && super.hitTest(point) != nil ? self : nil
     }
@@ -1684,23 +1816,6 @@ private final class AppsMenuButton: NSButton {
         return menu.popUp(positioning: nil, at: CGPoint(x: bounds.midX, y: bounds.maxY), in: self)
     }
 
-    override func keyDown(with event: NSEvent) {
-        showKeyboardFocus()
-        let characters = event.charactersIgnoringModifiers ?? ""
-        if let direction = AppsMenuDirection(rawValue: characters), onNavigate?(direction) == true { return }
-        switch characters {
-        case "\u{1b}": onEscape?()
-        case "\r", "\u{3}", " ": performClick(nil)
-        default: super.keyDown(with: event)
-        }
-    }
-
-    func showKeyboardFocus() {
-        guard focused, !keyboardFocus else { return }
-        keyboardFocus = true
-        updateSelection()
-    }
-
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         updateSelection()
@@ -1708,10 +1823,15 @@ private final class AppsMenuButton: NSButton {
 
     private func updateSelection() {
         selection.frame = bounds
-        selection.borderWidth = focused && keyboardFocus ? 1 : 0
-        selection.borderColor = .labelColor.withAlphaComponent(0.8)
-        selection.fillColor = pressed && usesGlassHover
-            ? .unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.25) : .clear
+        if isPinDropTarget {
+            selection.fillColor = .unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.5)
+            selection.borderColor = .separatorColor
+            selection.borderWidth = 1
+        } else {
+            selection.fillColor = pressed && usesGlassHover
+                ? .unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.25) : .clear
+            selection.borderWidth = 0
+        }
     }
 
     @objc private func invoke() { onActivate(self) }
@@ -1787,18 +1907,6 @@ private class AppsMenuScrollView: NSScrollView {
 
 private final class AppsMenuRunningScrollView: AppsMenuScrollView {
     private let fade = CAGradientLayer()
-
-    override func scrollWheel(with event: NSEvent) {
-        if event.modifierFlags.contains(.shift), event.scrollingDeltaX == 0, event.scrollingDeltaY != 0,
-           let documentView, documentView.bounds.width > contentView.bounds.width {
-            let multiplier: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 16
-            let bounds = contentView.bounds.offsetBy(dx: -event.scrollingDeltaY * multiplier, dy: 0)
-            contentView.scroll(to: contentView.constrainBoundsRect(bounds).origin)
-            reflectScrolledClipView(contentView)
-        } else {
-            super.scrollWheel(with: event)
-        }
-    }
 
     override func reflectScrolledClipView(_ clip: NSClipView) {
         super.reflectScrolledClipView(clip)

@@ -1,17 +1,16 @@
 import AppKit
 import Combine
 import CoreGraphics
+import OSLog
 import QuartzCore
 import SwiftUI
-#if DEBUG
-import os
-#endif
 
 @MainActor
 struct ApplicationEnvironment {
     var bundleURL = Bundle.main.bundleURL
     var permissionService = PermissionService()
     var permissionProbe: @Sendable () -> Bool = { PermissionService().hasRequiredPermissions() }
+    var runtimeAccessibilityAccess = RuntimeAccessibilityAccess()
     var makeModules: @MainActor (@escaping UtilityWindowRegistration) -> [DeskMoteModule] = DeskMoteModuleRegistry.production
     var moduleSessionIsActive: @MainActor () -> Bool = {
         let session = CGSessionCopyCurrentDictionary() as? [String: Any]
@@ -26,7 +25,6 @@ struct ApplicationEnvironment {
     var setActivationPolicy: @MainActor @Sendable (NSApplication.ActivationPolicy) -> Void = { _ = NSApp.setActivationPolicy($0) }
     var activateApplication: @MainActor @Sendable () -> Void = { NSApp.activate(ignoringOtherApps: true) }
     var terminate: @MainActor @Sendable () -> Void = { NSApp.terminate(nil) }
-    var replyToTermination: @MainActor @Sendable (NSApplication, Bool) -> Void = { $0.reply(toApplicationShouldTerminate: $1) }
     var makeStatusItem: @MainActor @Sendable () -> any StatusItemPresenting = { NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength) }
     var makePermissionWindow: @MainActor @Sendable (NSRect, NSWindow.StyleMask) -> NSWindow = {
         NSWindow(contentRect: $0, styleMask: $1, backing: .buffered, defer: false)
@@ -34,7 +32,6 @@ struct ApplicationEnvironment {
     var makePanels: @MainActor @Sendable (AppRuntime, StripOrderStore, DisplayTopologyStore) -> TaskbarScreenOrchestrator = {
         TaskbarScreenOrchestrator(runtime: $0, stripOrderStore: $1, displayTopologyStore: $2)
     }
-    var makeLift: @MainActor @Sendable (WindowLiftAvoidanceHost) -> WindowLiftAvoidanceController = { WindowLiftAvoidanceController(host: $0) }
     var launchInstance: @MainActor @Sendable (URL) async -> Result<Void, Error> = { url in
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
@@ -65,27 +62,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
     lazy var stripOrderStore = StripOrderStore(inventoryLog: inventoryLog)
     private var panelCoordinator: TaskbarScreenOrchestrator?
-    private var windowLiftAvoidanceController: WindowLiftAvoidanceController?
     private lazy var launchAtLoginService = LaunchAtLoginService()
     private lazy var settingsCoordinator = SettingsCoordinator(
         launchAtLoginService: launchAtLoginService
     )
     private var startupTask: Task<Void, Never>?
-    private var terminationTask: Task<Void, Never>?
     #if DEBUG
     private var mainLoopStallProbe: Timer?
     #endif
+    private var spaceCompatibilityAlert: NSAlert?
     private var permissionWindow: NSWindow?
     private var permissionHostingView: NSHostingView<PermissionOnboardingWindowContent>?
     private var permissionService: PermissionService { environment.permissionService }
     private var installLocation: AppInstallLocation = .other
     private var permissionCoordinator: PermissionRecoveryCoordinator?
-    private var permissionWatchdogTimer: Timer?
-    private var permissionWatchdogGate = PermissionWatchdogGate()
+    private var permissionWatchdogTimer: DispatchSourceTimer?
+    private let permissionWatchdogGate = PermissionWatchdogGate()
     private let permissionProbeQueue = DispatchQueue(label: "io.github.sashokey.deskmote.permission-probe", qos: .utility)
-    #if DEBUG
     private var cachedAccessibilityTrusted = false
-    #endif
     private var hasStartedApp = false
     private lazy var modules = environment.makeModules { [weak self] window in
         self?.runtime.registerUtilityWindow(window)
@@ -98,15 +92,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return toggle
         }
     }
-    #if DEBUG
     private let permissionLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "permissions")
-    #endif
     private lazy var statusMenuController = StatusMenuController(
         settingsCoordinator: settingsCoordinator,
-        statusItem: environment.makeStatusItem(), modules: modules, quit: environment.terminate
+        statusItem: environment.makeStatusItem(), modules: modules, quit: { [weak self] in
+            self?.requestTermination(source: "status-menu")
+        }
     )
 
-    override convenience init() { self.init(environment: ApplicationEnvironment()) }
+    override convenience init() {
+        self.init(environment: ApplicationEnvironment(runtimeAccessibilityAccess: .shared))
+    }
 
     init(environment: ApplicationEnvironment, runtime: AppRuntime? = nil,
          displayTopologyStore: DisplayTopologyStore? = nil,
@@ -122,6 +118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setvbuf(stdout, nil, _IOLBF, 0)
 
         #if DEBUG
+        let resources = ActionResourceLog.begin("app.launch")
+        defer { resources?.finish() }
         startMainLoopStallProbeIfTracing()
         #endif
 
@@ -143,15 +141,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if ready {
                 self.finishLaunching(at: location)
             } else {
-                self.environment.terminate()
+                self.requestTermination(source: "previous-instance")
             }
         }
     }
 
     private func finishLaunching(at location: AppInstallLocation) {
         let trusted = permissionService.hasRequiredPermissions()
-        #if DEBUG
         cachedAccessibilityTrusted = trusted
+        #if DEBUG
         logPermissionLaunch(installLocation: location, isTrusted: trusted)
         #endif
 
@@ -285,38 +283,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        #if DEBUG
+        let resources = ActionResourceLog.begin("app.terminate")
+        defer { resources?.finish() }
+        #endif
+        if let event = NSAppleEventManager.shared().currentAppleEvent {
+            permissionLogger.notice("application-termination-requested apple-event-class=\(event.eventClass, privacy: .public) apple-event-id=\(event.eventID, privacy: .public)")
+        } else {
+            permissionLogger.notice("application-termination-requested")
+        }
         startupTask?.cancel()
         startupTask = nil
         permissionCoordinator?.terminationRequested()
         stopModules()
         if hasStartedApp { runtime.stop() }
 
-        guard let controller = windowLiftAvoidanceController else { return .terminateNow }
-        guard terminationTask == nil else { return .terminateLater }
-
-        let reply = environment.replyToTermination
-        terminationTask = Task { @MainActor [weak self] in
-            let result = await controller.stopAndRestore()
-            #if DEBUG
-            if case let .incomplete(remaining) = result {
-                Logger(subsystem: "io.github.sashokey.deskmote", category: "WindowRestoration")
-                    .error("termination restoration incomplete count=\(remaining, privacy: .public)")
-            }
-            #endif
-            self?.windowLiftAvoidanceController = nil
-            self?.terminationTask = nil
-            reply(sender, true)
-        }
-        return .terminateLater
+        panelCoordinator?.stopWindowGeometryObservation()
+        permissionLogger.notice("application-termination-ready")
+        return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        permissionLogger.notice("application-will-terminate")
         startupTask?.cancel()
         startupTask = nil
         permissionCoordinator?.terminationRequested()
         stopModules()
-        windowLiftAvoidanceController?.stop()
-        panelCoordinator?.overlaySpaceHost?.tearDown()
+        panelCoordinator?.stopWindowGeometryObservation()
         if hasStartedApp { runtime.stop() }
     }
 
@@ -374,16 +367,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startTaskbarRuntime() {
+        #if DEBUG
+        let resources = ActionResourceLog.begin("app.startTaskbarRuntime")
+        defer { resources?.finish() }
+        #endif
         runtime.start()
         let coordinator = environment.makePanels(runtime, stripOrderStore, displayTopologyStore)
         panelCoordinator = coordinator
+        coordinator.windowAdjustmentAllowed = { [weak self] in self?.permissionCoordinator?.phase == .running }
+        coordinator.onSpaceCompatibilityFailure = { [weak self] code, details in
+            self?.showSpaceCompatibilityNotice(code: code, details: details)
+        }
         coordinator.onRequestTaskbarMenu = { [weak self] event, view in
             self?.statusMenuController.popUpFromTaskbar(with: event, in: view)
         }
         coordinator.start()
-        let lift = environment.makeLift(coordinator)
-        windowLiftAvoidanceController = lift
-        lift.start()
+    }
+
+    private func showSpaceCompatibilityNotice(code: String, details: String) {
+        let alert = spaceCompatibilityAlert ?? NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = String(localized: "DeskMote Couldn’t Read Spaces")
+        let macOS = ProcessInfo.processInfo.operatingSystemVersionString
+        let build = Bundle.main.object(forInfoDictionaryKey: "DeskMoteSourceRevision") as? String ?? "-"
+        let guidance = String(localized: "Some taskbars or window buttons may be unavailable. In Console, search for the error code in the taskbar-spaces category.")
+        alert.informativeText = "\(guidance)\n\n\(code)\n\(details)\n\(macOS) · \(build)"
+        let button = alert.buttons.first ?? alert.addButton(withTitle: String(localized: "OK"))
+        let window = alert.window
+        window.isReleasedWhenClosed = false
+        window.styleMask.insert(.closable)
+        window.level = .floating
+        button.target = window
+        button.action = #selector(NSWindow.performClose(_:))
+        spaceCompatibilityAlert = alert
+        alert.layout()
+        window.center()
+        window.orderFrontRegardless()
     }
 
     #if DEBUG
@@ -432,73 +451,81 @@ extension AppDelegate: PermissionEffectHandler {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications", isDirectory: true))
     }
 
-    func terminateSelf() { environment.terminate() }
+    func terminateSelf() {
+        requestTermination(source: "permission-flow")
+    }
+
+    private func requestTermination(source: String) {
+        permissionLogger.notice("application-termination-trigger source=\(source, privacy: .public)")
+        environment.terminate()
+    }
 
     func startWatchdog() {
         stopWatchdog()
         let generation = permissionWatchdogGate.start()
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.schedulePermissionProbe(generation: generation)
-            }
-        }
-        timer.tolerance = 0.1
-        RunLoop.main.add(timer, forMode: .common)
+        let timer = DispatchSource.makeTimerSource(queue: permissionProbeQueue)
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(100))
+        timer.setEventHandler(handler: makePermissionProbe(generation: generation))
         permissionWatchdogTimer = timer
+        timer.activate()
     }
 
     func stopWatchdog() {
-        permissionWatchdogTimer?.invalidate()
-        permissionWatchdogTimer = nil
         permissionWatchdogGate.stop()
+        permissionWatchdogTimer?.cancel()
+        permissionWatchdogTimer = nil
     }
 
-    func schedulePermissionProbe(generation: UInt64? = nil) {
-        guard let generation = permissionWatchdogGate.beginProbe(for: generation) else { return }
+    func schedulePermissionProbe() {
+        permissionProbeQueue.async(execute: makePermissionProbe(generation: nil))
+    }
+
+    private func makePermissionProbe(generation expectedGeneration: UInt64?) -> @Sendable () -> Void {
+        let gate = permissionWatchdogGate
+        let access = environment.runtimeAccessibilityAccess
         let probe = environment.permissionProbe
-        permissionProbeQueue.async { [weak self] in
+        let logger = permissionLogger
+        return { [weak self] in
+            guard let generation = gate.beginProbe(for: expectedGeneration) else { return }
+            let trustGeneration = access.trustGeneration
             let trusted = probe()
+            var changed = false
+            let enqueue = gate.completeProbe(generation: generation, deliver: trusted) {
+                guard let didChange = access.updateTrust(trusted, for: trustGeneration) else { return false }
+                changed = didChange
+                return true
+            }
+            if changed { logger.notice("permission-probe-transition trusted=\(trusted, privacy: .public)") }
+            guard enqueue else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self,
-                      self.permissionWatchdogGate.completeProbe(generation: generation) else { return }
-                #if DEBUG
-                if self.cachedAccessibilityTrusted != trusted {
+                      let trusted = gate.takeDelivery(generation: generation) else { return }
+                let changed = self.cachedAccessibilityTrusted != trusted
+                self.cachedAccessibilityTrusted = trusted
+                if changed {
                     self.permissionLogger.notice("permission-trust-changed trusted=\(trusted, privacy: .public)")
                 }
-                self.cachedAccessibilityTrusted = trusted
-                #endif
                 self.moduleToggles.forEach {
                     $0.accessibilityChanged(trusted: trusted, canResume: self.environment.moduleSessionIsActive)
                 }
+                if changed { self.permissionLogger.notice("permission-modules-notified trusted=\(trusted, privacy: .public)") }
                 self.permissionCoordinator?.sampleTrust(trusted)
+                if changed { self.permissionLogger.notice("permission-trust-delivered trusted=\(trusted, privacy: .public)") }
             }
         }
     }
 
-    func freezeLiftSnapshots() {
-        windowLiftAvoidanceController?.beginPermissionUncertainty()
-    }
-
-    func unfreezeLiftSnapshots() {
-        windowLiftAvoidanceController?.endPermissionUncertainty()
-    }
-
     func suspendPanelsAndStores() {
+        #if DEBUG
+        let resources = ActionResourceLog.begin("permission.suspendRuntime")
+        defer { resources?.finish() }
+        #endif
+        permissionLogger.notice("permission-loss-suspension-started")
         panelCoordinator?.suspendAndRelease()
         panelCoordinator = nil
+        permissionLogger.notice("permission-loss-panels-suspended")
         runtime.stop()
-    }
-
-    func restoreLiftedWindows(episode: UInt64) async -> WindowRestorationCompletion {
-        guard let controller = windowLiftAvoidanceController else { return .complete }
-        let result = await controller.restoreAndStopForPermissionRecovery()
-        if result == .complete { windowLiftAvoidanceController = nil }
-        #if DEBUG
-        if case let .incomplete(remaining) = result {
-            permissionLogger.error("permission recovery restoration incomplete count=\(remaining, privacy: .public)")
-        }
-        #endif
-        return result
+        permissionLogger.notice("permission-loss-suspension-completed")
     }
 
     func launchNewInstance(episode: UInt64) async -> Result<Void, Error> {

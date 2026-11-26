@@ -70,18 +70,6 @@ final class AXWindowReaderResultTests: XCTestCase {
         XCTAssertTrue(eligible("Notification Center"))
     }
 
-    func testRollbackAcceptsOnlyFramesOwnedByThePartialWrite() {
-        let original = CGRect(x: 100, y: 100, width: 900, height: 700)
-        let partial = CGRect(x: 100, y: 100, width: 900, height: 668)
-        let target = CGRect(x: 100, y: 132, width: 900, height: 668)
-        XCTAssertTrue(AXWindowFrameRollbackPolicy.accepts(partial, attemptedFrames: [partial, target], tolerance: 1))
-        XCTAssertTrue(AXWindowFrameRollbackPolicy.accepts(target, attemptedFrames: [partial, target], tolerance: 1))
-        XCTAssertFalse(AXWindowFrameRollbackPolicy.accepts(original, attemptedFrames: [partial, target], tolerance: 1))
-        XCTAssertFalse(AXWindowFrameRollbackPolicy.accepts(CGRect(x: 500, y: 100, width: 900, height: 668),
-            attemptedFrames: [partial, target], tolerance: 1))
-        XCTAssertFalse(AXWindowFrameRollbackPolicy.accepts(partial, attemptedFrames: [], tolerance: 1))
-    }
-
     func testAXWindowArraysValidateEveryElementType() throws {
         let element = AXUIElementCreateApplication(-42)
         XCTAssertEqual(try XCTUnwrap(AXWindowReader.validatedElements([element] as CFArray)).count, 1)

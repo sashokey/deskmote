@@ -1,6 +1,5 @@
 import AppKit
 import Combine
-
 @MainActor
 final class TaskbarPresenter {
     private let runtime: AppRuntime
@@ -19,7 +18,6 @@ final class TaskbarPresenter {
     init(view: TaskbarView, runtime: AppRuntime, ordering: StripOrderStore,
          topology: DisplayTopologyStore, spaces: TaskbarSpaceStore, displayUUID: String?,
          backgroundMenu: @escaping (NSEvent, NSView) -> Void,
-         popupPresented: @escaping (NSPanel) -> Void,
          contextMenuVisibilityChanged: @escaping (Bool) -> Void,
          icons: AppIconResolver = .shared, system: any WindowSystemAccess = NativeWindowSystem()) {
         self.view = view
@@ -66,7 +64,6 @@ final class TaskbarPresenter {
                 self.ordering.reorderGroup(app, relativeTo: target, after: after, current: self.liveIDs)
             },
             backgroundMenu: backgroundMenu,
-            popupPresented: popupPresented,
             contextMenuVisibilityChanged: contextMenuVisibilityChanged
         )
         view.taskbarContent.iconProvider = { item in
@@ -74,11 +71,11 @@ final class TaskbarPresenter {
             return NSRunningApplication(processIdentifier: item.item.resourcePID)?.icon
         }
         runtime.$snapshot.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
-        runtime.$optimisticStatesByWindowID.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         ordering.$liveOrder.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         topology.$table.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         topology.$physicalDisplayCount.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         spaces.activeSpaceChanges.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
+        spaces.$activeLayouts.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         spaces.$snapshot.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         spaces.$confirmedSpaceRevision.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         icons.changes.sink { [weak self] in self?.scheduleRefresh(refreshIcons: true) }.store(in: &subscriptions)
@@ -153,6 +150,10 @@ final class TaskbarPresenter {
     }
 
     private func refresh() {
+        #if DEBUG
+        let resources = ActionResourceLog.begin("taskbar.presentSnapshot")
+        defer { resources?.finish() }
+        #endif
         guard !refreshing, let view else { return }
         refreshing = true
         let refreshIcons = iconsDirty
@@ -171,7 +172,7 @@ final class TaskbarPresenter {
         let liveUtility = permitsExternal ? [] : visibleItems().values.filter(isLiveUtility)
         renderedOnlyLiveUtility = !liveUtility.isEmpty
         let activeItemID = runtime.effectiveActiveWindowID.flatMap { runtime.snapshot.windows[$0]?.groupID }
-        let groups = TaskbarPresentation.groups(items: renderedOnlyLiveUtility ? liveUtility : items, order: order, filter: displayFilter,
+        let groups = TaskbarPresentation.groups(items: permitsExternal ? items : liveUtility, order: order, filter: displayFilter,
                                                 activeItemID: activeItemID,
                                                 spaces: spaces.snapshot,
                                                 utilityOnPanelDisplay: utilityOnPanelDisplay,

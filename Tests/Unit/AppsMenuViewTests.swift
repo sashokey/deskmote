@@ -5,9 +5,18 @@ import XCTest
 final class AppsMenuViewTests: XCTestCase {
     private final class PointerPanel: NSPanel {
         var pointer = CGPoint.zero
+        var simulatedBackingScale: CGFloat?
 
         override var isKeyWindow: Bool { true }
         override var mouseLocationOutsideOfEventStream: NSPoint { pointer }
+        override var backingScaleFactor: CGFloat { simulatedBackingScale ?? super.backingScaleFactor }
+    }
+
+    private final class SizeSensitiveIcon: NSImage {
+        override func draw(in rect: NSRect) {
+            (rect.width == 38 ? NSColor.green : NSColor.red).setFill()
+            rect.fill()
+        }
     }
 
     private final class RunningFixture: NSRunningApplication, @unchecked Sendable {
@@ -15,15 +24,19 @@ final class AppsMenuViewTests: XCTestCase {
         var hideRequests = 0
         var activateRequests = 0
         var hiddenState = false
-        override var processIdentifier: pid_t { 50_101 }
-        override var localizedName: String? { "Running Fixture" }
-        override var bundleIdentifier: String? { "test.running.fixture" }
+        var pid: pid_t = 50_101
+        var name = "Running Fixture"
+        var identifier = "test.running.fixture"
+        var location: URL? = URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app")
+        override var processIdentifier: pid_t { pid }
+        override var localizedName: String? { name }
+        override var bundleIdentifier: String? { identifier }
         override var activationPolicy: NSApplication.ActivationPolicy { .regular }
         override var isTerminated: Bool { false }
         override var isHidden: Bool { hiddenState }
         override var isActive: Bool { false }
         override var icon: NSImage? { suppliedIcon }
-        override var bundleURL: URL? { URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app") }
+        override var bundleURL: URL? { location }
         override func hide() -> Bool { hideRequests += 1; return true }
         override func activate(options: NSApplication.ActivationOptions) -> Bool { activateRequests += 1; return true }
     }
@@ -45,7 +58,7 @@ final class AppsMenuViewTests: XCTestCase {
         let source = try XCTUnwrap(button("One", in: view))
         let destination = try XCTUnwrap(button("Two", in: view))
         let start = source.convert(CGPoint(x: source.bounds.midX, y: source.bounds.midY), to: nil)
-        let end = destination.convert(CGPoint(x: destination.bounds.midX, y: destination.bounds.midY), to: nil)
+        let end = destination.convert(CGPoint(x: destination.bounds.maxX - 1, y: destination.bounds.midY), to: nil)
         func event(_ kind: NSEvent.EventType, _ point: CGPoint) throws -> NSEvent {
             try XCTUnwrap(NSEvent.mouseEvent(with: kind, location: point, modifierFlags: [], timestamp: 0,
                                             windowNumber: panel.windowNumber, context: nil, eventNumber: 1,
@@ -59,6 +72,55 @@ final class AppsMenuViewTests: XCTestCase {
         source.mouseUp(with: up)
         _ = NSApp.nextEvent(matching: .leftMouseUp, until: .distantPast, inMode: .default, dequeue: true)
         XCTAssertEqual(fixture.store.pins.map(\.id), [original[1], original[2], original[0]])
+    }
+
+    func testDroppingPinnedAppOnIconCreatesFolderAndDroppingOnFolderAddsApp() async throws {
+        let fixture = try makeCatalog(names: ["One", "Two", "Three", "Four"])
+        defer { fixture.cleanUp() }
+        let catalog = fixture.store.installedApplications()
+        let applications = try ["One", "Two", "Three", "Four"].map { name in
+            try XCTUnwrap(catalog.first { $0.name == name })
+        }
+        applications.forEach(fixture.store.pin)
+        let original = fixture.store.pins
+        let frame = CGRect(x: 0, y: 0, width: 642, height: 676)
+        let panel = PointerPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        defer { panel.close() }
+        let view = AppsMenuView(frame: frame, store: fixture.store, reduceMotion: { true }) {
+            XCTFail("A completed drag must not launch an app")
+        }
+        panel.contentView = view
+        try await waitForButton("One", in: view)
+
+        func drop(_ sourceID: UUID, on targetID: UUID) throws {
+            let buttons = descendants(of: view, as: NSButton.self)
+            let source = try XCTUnwrap(buttons.first { $0.identifier?.rawValue == "pin-\(sourceID)" })
+            let destination = try XCTUnwrap(buttons.first { $0.identifier?.rawValue == "pin-\(targetID)" })
+            let targetFrame = destination.frame
+            let selection = try XCTUnwrap(destination.subviews.compactMap { $0 as? NSBox }.first)
+            let start = source.convert(CGPoint(x: source.bounds.midX, y: 26), to: nil)
+            let end = destination.convert(CGPoint(x: destination.bounds.midX, y: 26), to: nil)
+            func event(_ kind: NSEvent.EventType, _ point: CGPoint) throws -> NSEvent {
+                try XCTUnwrap(NSEvent.mouseEvent(with: kind, location: point, modifierFlags: [], timestamp: 0,
+                                                windowNumber: panel.windowNumber, context: nil, eventNumber: 1,
+                                                clickCount: 1, pressure: kind == .leftMouseUp ? 0 : 1))
+            }
+            source.mouseDown(with: try event(.leftMouseDown, start))
+            source.mouseDragged(with: try event(.leftMouseDragged, end))
+            XCTAssertEqual(destination.frame, targetFrame)
+            XCTAssertGreaterThan(selection.fillColor.alphaComponent, 0)
+            source.mouseUp(with: try event(.leftMouseUp, end))
+        }
+
+        try drop(original[0].id, on: original[2].id)
+        XCTAssertEqual(fixture.store.pins.map(\.id), [original[1].id, original[2].id, original[3].id])
+        XCTAssertEqual(fixture.store.pins[1].applicationIDs, [applications[2].id, applications[0].id])
+        XCTAssertEqual(fixture.store.pins[1].name, "")
+        try drop(original[3].id, on: original[2].id)
+        XCTAssertEqual(fixture.store.pins.map(\.id), [original[1].id, original[2].id])
+        XCTAssertEqual(fixture.store.pins[1].applicationIDs, [applications[2].id, applications[0].id, applications[3].id])
+        XCTAssertEqual(AppsMenuStore(defaults: fixture.defaults).pins, fixture.store.pins)
     }
 
     func testDraggingPinnedTileSlidesItsNeighborIntoTheVacatedSlot() async throws {
@@ -76,9 +138,8 @@ final class AppsMenuViewTests: XCTestCase {
         let neighbor = try XCTUnwrap(button("Three", in: view))
         let unaffected = try XCTUnwrap(button("Two", in: view))
         let vacatedFrame = source.frame
-        let neighborFrame = neighbor.frame
         let start = source.convert(CGPoint(x: source.bounds.midX, y: source.bounds.midY), to: nil)
-        let end = neighbor.convert(CGPoint(x: neighbor.bounds.midX, y: neighbor.bounds.midY), to: nil)
+        let end = neighbor.convert(CGPoint(x: neighbor.bounds.maxX - 1, y: neighbor.bounds.midY), to: nil)
         func event(_ kind: NSEvent.EventType, _ point: CGPoint) throws -> NSEvent {
             try XCTUnwrap(NSEvent.mouseEvent(with: kind, location: point, modifierFlags: [], timestamp: 0,
                                             windowNumber: panel.windowNumber, context: nil, eventNumber: 1,
@@ -89,7 +150,7 @@ final class AppsMenuViewTests: XCTestCase {
         source.mouseDragged(with: try event(.leftMouseDragged, end))
 
         XCTAssertEqual(neighbor.frame, vacatedFrame)
-        XCTAssertEqual(source.frame, neighborFrame)
+        XCTAssertEqual(source.convert(CGPoint(x: source.bounds.midX, y: source.bounds.midY), to: nil), end)
         XCTAssertNil(source.layer?.animation(forKey: "apps-pin-shift"))
         XCTAssertNil(unaffected.layer?.animation(forKey: "apps-pin-shift"))
         let movement = try XCTUnwrap(neighbor.layer?.animation(forKey: "apps-pin-shift") as? CABasicAnimation)
@@ -131,6 +192,52 @@ final class AppsMenuViewTests: XCTestCase {
         source.mouseDragged(with: try event(.leftMouseDragged, end))
         source.mouseUp(with: try event(.leftMouseUp, end))
         XCTAssertEqual(fixture.store.pins.map(\.id), order)
+    }
+
+    func testSystemFileManagerOccupiesTheLeadingSlotOutsideTheRunningScroller() throws {
+        let suite = "DeskMote.AppsMenuViewTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let other = RunningFixture()
+        let manager = RunningFixture()
+        manager.pid = 50_102
+        manager.name = "File Manager Fixture"
+        manager.identifier = "test.file.manager"
+        let application = AppsMenuApplication(id: manager.identifier, name: manager.name,
+            url: try XCTUnwrap(manager.location), category: "utilities")
+        var runningApplications = [other, manager]
+        var opened: [URL] = []
+        let store = AppsMenuStore(defaults: defaults, applicationDirectories: [],
+                                  runningApplicationSnapshot: { runningApplications },
+                                  systemFileManager: application, openApplication: { opened.append($0) })
+        let view = AppsMenuView(frame: CGRect(x: 0, y: 0, width: 642, height: 676), store: store) {}
+        let leading = try XCTUnwrap(button(manager.name, in: view))
+        let running = try XCTUnwrap(button(other.name, in: view))
+        XCTAssertNil(leading.enclosingScrollView)
+        XCTAssertLessThan(leading.convert(leading.bounds, to: view).minX,
+                          running.convert(running.bounds, to: view).minX)
+        XCTAssertEqual(descendants(of: view, as: NSButton.self).filter { $0.title == manager.name }.count, 1)
+        runningApplications = [other]
+        let reopened = AppsMenuView(frame: view.frame, store: store) {}
+        let stoppedManager = try XCTUnwrap(button(manager.name, in: reopened))
+        XCTAssertNil(stoppedManager.enclosingScrollView)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(stoppedManager.action), to: stoppedManager.target, from: stoppedManager))
+        XCTAssertEqual(opened, [application.url])
+    }
+
+    func testRunningApplicationClickUsesOpeningInsteadOfOnlyActivation() throws {
+        let app = RunningFixture()
+        app.location = URL(fileURLWithPath: "/nonexistent/DeskMote Test Fixture.app")
+        var dismissed = false
+        var opened: [URL] = []
+        let store = AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [app] },
+                                  openApplication: { opened.append($0) })
+        let view = AppsMenuView(frame: CGRect(x: 0, y: 0, width: 642, height: 676), store: store) { dismissed = true }
+        let target = try XCTUnwrap(button(app.name, in: view))
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(target.action), to: target.target, from: target))
+        XCTAssertTrue(dismissed)
+        XCTAssertEqual(app.activateRequests, 0)
+        XCTAssertEqual(opened, [try XCTUnwrap(app.location)])
     }
 
     func testRunningAppsHoverShowsOnlyNameAndUsesTheBundleIcon() async throws {
@@ -315,6 +422,17 @@ final class AppsMenuViewTests: XCTestCase {
         XCTAssertEqual(selection.borderWidth, 0)
     }
 
+    func testAllShowsNoticeWhenSpotlightCatalogIsUnavailable() async {
+        let store = AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }, readIndex: { _ in nil })
+        let frame = CGRect(x: 0, y: 0, width: 642, height: 676)
+        let view = AppsMenuView(frame: frame, store: store, dismiss: {})
+        _ = await store.loadCatalog()
+        view.prepareForPresentation(size: frame.size)
+
+        let notice = String(localized: "macOS app catalog is unavailable.")
+        XCTAssertTrue(descendants(of: view, as: NSTextField.self).contains { $0.stringValue == notice })
+    }
+
     func testAllCatalogKeepsHorizontalOriginWhenViewportIsNarrowerThanDocument() async throws {
         let fixture = try makeCatalog(names: (1...25).map { "Test App \($0)" })
         defer { fixture.cleanUp() }
@@ -440,8 +558,37 @@ final class AppsMenuViewTests: XCTestCase {
         waiting.forEach { $0.resume() }
         waiting.removeAll()
         let deadline = ContinuousClock.now + .seconds(1)
-        while image.image !== icon, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        XCTAssertTrue(image.image === icon)
+        while image.image == nil, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertNotNil(image.image)
+    }
+
+    func testListIconUsesArtworkRenderedAtPinnedSize() async throws {
+        let source = SizeSensitiveIcon(size: CGSize(width: 64, height: 64))
+        let fixture = try makeCatalog(names: ["Test App"], readIcon: { _ in source })
+        defer { fixture.cleanUp() }
+        let frame = CGRect(x: 0, y: 0, width: 642, height: 676)
+        let panel = PointerPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        defer { panel.close() }
+        let view = AppsMenuView(frame: frame, store: fixture.store) {}
+        panel.contentView = view
+        try await waitForButton("Test App", in: view)
+        let row = try XCTUnwrap(button("Test App", in: view))
+        let icon = try XCTUnwrap(row.subviews.compactMap { $0 as? NSImageView }.first)
+        let deadline = ContinuousClock.now + .seconds(1)
+        while icon.image == nil, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(icon.frame.size, CGSize(width: 24, height: 24))
+        XCTAssertEqual(try XCTUnwrap(icon.image).size, icon.frame.size)
+        XCTAssertFalse(icon.image === source)
+        for scale in [1, 2] {
+            panel.simulatedBackingScale = CGFloat(scale)
+            icon.viewDidChangeBackingProperties()
+            let bitmap = try XCTUnwrap(icon.image?.representations.first as? NSBitmapImageRep)
+            XCTAssertEqual(bitmap.pixelsWide, 38 * scale)
+            XCTAssertEqual(bitmap.size, icon.frame.size)
+            let center = try XCTUnwrap(bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2))
+            XCTAssertGreaterThan(center.greenComponent, center.redComponent)
+        }
     }
 
     func testPinnedExpansionRelayoutsAllImmediatelyAndFadesOnlyRevealedTiles() async throws {
@@ -510,7 +657,7 @@ final class AppsMenuViewTests: XCTestCase {
         XCTAssertFalse(panel.isVisible)
     }
 
-    func testCatalogRowsRetainKeyboardFocusAfterLayoutRebuild() async throws {
+    func testCatalogRowsRemainVisibleAfterLayoutRebuild() async throws {
         let fixture = try makeCatalog()
         defer { fixture.cleanUp() }
         let frame = CGRect(x: 0, y: 0, width: 642, height: 676)
@@ -521,22 +668,27 @@ final class AppsMenuViewTests: XCTestCase {
         window.contentView = view
         try await waitForButton("Café Viewer", in: view)
         let original = try XCTUnwrap(button("Café Viewer", in: view))
-        XCTAssertTrue(window.makeFirstResponder(original))
-        let key = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
-                                                 windowNumber: window.windowNumber, context: nil, characters: "\u{f71b}",
-                                                 charactersIgnoringModifiers: "\u{f71b}", isARepeat: false, keyCode: 0))
-        original.keyDown(with: key)
-        XCTAssertEqual(original.subviews.compactMap { $0 as? NSBox }.first?.borderWidth, 1)
-
         window.setContentSize(CGSize(width: 600, height: 676))
         view.layoutSubtreeIfNeeded()
 
         let replacement = try XCTUnwrap(button("Café Viewer", in: view))
         XCTAssertFalse(original === replacement)
-        XCTAssertTrue(replacement === window.firstResponder)
-        XCTAssertEqual(replacement.subviews.compactMap { $0 as? NSBox }.first?.borderWidth, 1)
         XCTAssertGreaterThan(replacement.frame.width, 0)
         XCTAssertFalse(window.isVisible)
+    }
+
+    func testPreparedAppsMenuUsesModeChangedBeforeFirstPresentation() async throws {
+        let fixture = try makeCatalog()
+        defer { fixture.cleanUp() }
+        fixture.store.catalogMode = .list
+        let frame = CGRect(x: 0, y: 0, width: 642, height: 676)
+        let view = AppsMenuView(frame: frame, store: fixture.store) {}
+        try await waitForButton("Calculator", in: view)
+        XCTAssertNotNil(button("View: List", in: view))
+
+        fixture.store.catalogMode = .grid
+        view.prepareForPresentation(size: frame.size)
+        XCTAssertNotNil(button("View: Grid", in: view))
     }
 
     func testViewModeDefersLayoutUntilAfterTrackingAndReusesList() async throws {
@@ -677,21 +829,7 @@ final class AppsMenuViewTests: XCTestCase {
         try XCTUnwrap(button("A", in: view)).performClick(nil)
         XCTAssertNotNil(button("Back", in: view))
         XCTAssertEqual(button("B", in: view)?.isEnabled, false)
-        let a = try XCTUnwrap(button("A", in: view))
-        let z = try XCTUnwrap(button("Z", in: view))
-        XCTAssertTrue(panel.makeFirstResponder(a))
-        let initialSelection = try XCTUnwrap(a.subviews.compactMap { $0 as? NSBox }.first)
-        XCTAssertEqual(initialSelection.borderWidth, 0)
-        let arrow = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
-                                                   windowNumber: panel.windowNumber, context: nil,
-                                                   characters: "\u{f703}", charactersIgnoringModifiers: "\u{f703}",
-                                                   isARepeat: false, keyCode: 124))
-        a.keyDown(with: arrow)
-        XCTAssertTrue(panel.firstResponder === z)
-        let keyboardSelection = try XCTUnwrap(z.subviews.compactMap { $0 as? NSBox }.first)
-        XCTAssertEqual(keyboardSelection.borderWidth, 1)
-        XCTAssertNotEqual(keyboardSelection.borderColor, .keyboardFocusIndicatorColor)
-        z.performClick(nil)
+        try XCTUnwrap(button("Z", in: view)).performClick(nil)
         XCTAssertNil(button("Back", in: view))
         let last = try XCTUnwrap(button("Zebra Browser", in: view))
         let scroll = try XCTUnwrap(last.enclosingScrollView)
@@ -736,35 +874,6 @@ final class AppsMenuViewTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(gap, 7 * scale)
             XCTAssertLessThanOrEqual(gap, 14 * scale)
         }
-    }
-
-    func testEscapeClearsSearchBeforeDismissing() async throws {
-        let fixture = try makeCatalog()
-        defer { fixture.cleanUp() }
-        var dismissCount = 0
-        let view = AppsMenuView(frame: CGRect(x: 0, y: 0, width: 642, height: 676), store: fixture.store) {
-            dismissCount += 1
-        }
-        let search = try XCTUnwrap(descendants(of: view, as: NSSearchField.self).first)
-        try await waitForButton("Calculator", in: view)
-        search.stringValue = "cafe"
-        view.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: search))
-        try await waitForButton("Café Viewer", in: view)
-        XCTAssertEqual(view.searchResults.map(\.name), ["Café Viewer"])
-
-        view.cancelOperation(nil)
-
-        XCTAssertEqual(search.stringValue, "")
-        XCTAssertEqual(dismissCount, 0)
-        XCTAssertNotNil(button("Calculator", in: view))
-        XCTAssertTrue(view.searchResults.isEmpty)
-        if view.searchResults.isEmpty {
-            XCTAssertFalse(view.control(search, textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
-        }
-
-        view.cancelOperation(nil)
-
-        XCTAssertEqual(dismissCount, 1)
     }
 
     func testPinnedHeadingAndAllFollowVisiblePinRows() async throws {
@@ -898,7 +1007,7 @@ final class AppsMenuViewTests: XCTestCase {
     private func makeCatalog(names: [String] = ["Café Viewer", "Calculator"],
                              runningApplications: [NSRunningApplication] = [],
                              readIcon: (@MainActor (URL) async -> NSImage)? = nil)
-        throws -> (store: AppsMenuStore, cleanUp: () -> Void) {
+        throws -> (store: AppsMenuStore, defaults: UserDefaults, cleanUp: () -> Void) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let suite = "DeskMote.AppsMenuViewTests.\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -911,7 +1020,7 @@ final class AppsMenuViewTests: XCTestCase {
         }
         let store = AppsMenuStore(defaults: defaults, applicationDirectories: [directory],
                                   runningApplicationSnapshot: { runningApplications }, readIcon: readIcon)
-        return (store, {
+        return (store, defaults, {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         })

@@ -39,7 +39,7 @@ struct SkyLightWindowFocus: WindowFocusRequesting {
     }()
 
     private static let functions: (front: SetFront, post: PostEvent)? = {
-        guard let library = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY) else { return nil }
+        guard WindowPlatformABI.isValidated, let library = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY) else { return nil }
         guard let front = dlsym(library, "_SLPSSetFrontProcessWithOptions"),
               let post = dlsym(library, "SLPSPostEventRecordTo") else {
             dlclose(library)

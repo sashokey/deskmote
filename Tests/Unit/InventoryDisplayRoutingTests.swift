@@ -39,7 +39,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
                              parentWindowIDs: [cgWindow: 0])
             }, cgWindowSnapshotProvider: { id in
                 .init(allWindowIDs: [id], onScreenWindowIDs: [id], windowIDsByPID: [pid: [id]],
-                      alphaByWindowID: [:], boundsByWindowID: [id: reader.bounds.withLock { $0 }])
+                      alphaByWindowID: [:], boundsByWindowID: [id: reader.bounds.withLock { $0 }], parentWindowIDs: [id: 0])
             }, onScreenWindowIDsProvider: { [cgWindow] }, cgSnapshotReuseEnabled: true,
             uptimeProvider: { 100 }, frontmostPIDProvider: { pid }, displayTableProvider: { table })
         defer { tracker.stop() }
@@ -64,21 +64,23 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         receive(reader.element, kAXWindowMovedNotification)
         await waitForMovement { tracker.snapshot.windows[id]?.displayUUID == "B" }
         for task in tracker.pendingInventoryWorkForTesting { await task.value }
-        XCTAssertEqual(reader.reads.withLock { $0 }, 2)
-        XCTAssertEqual(fullCaptures.withLock { $0 }, 2)
+        XCTAssertEqual(reader.reads.withLock { $0 }, 1)
+        XCTAssertEqual(fullCaptures.withLock { $0 }, 1)
         XCTAssertEqual(tracker.snapshot.windows[id]?.cgWindowID, cgWindow)
 
         reader.bounds.withLock { $0 = frameOnA }
         receive(reader.element, kAXWindowMovedNotification)
         await waitForMovement { tracker.snapshot.windows[id]?.displayUUID == "A" }
-        XCTAssertEqual(fullCaptures.withLock { $0 }, 3)
+        XCTAssertEqual(fullCaptures.withLock { $0 }, 1)
         reader.bounds.withLock { $0 = frameOnAMoved }
         receive(reader.element, kAXWindowMovedNotification)
-        await waitForMovement { reader.reads.withLock { $0 } == 4 }
+        await waitForMovement {
+            tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.confirmedCGDisplayBounds == frameOnAMoved
+        }
         for task in tracker.pendingInventoryWorkForTesting { await task.value }
         XCTAssertEqual(publications, ["A", "B", "A"])
-        XCTAssertEqual(fullCaptures.withLock { $0 }, 3, "A confirmed move within one display can reuse recent CG evidence")
-        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnAMoved)
+        XCTAssertEqual(fullCaptures.withLock { $0 }, 1)
+        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnA)
 
         let replaced = reader.element
         let replacement = AXElementKey(e: AXUIElementCreateApplication(pid + 2))
@@ -96,8 +98,160 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         receive(replacement, kAXWindowMovedNotification)
         await waitForMovement { tracker.snapshot.windows[id]?.displayUUID == "B" }
         for task in tracker.pendingInventoryWorkForTesting { await task.value }
-        XCTAssertEqual(reader.reads.withLock { $0 }, readsBeforeMove + 1)
-        XCTAssertEqual(fullCaptures.withLock { $0 }, capturesBeforeMove + 1)
+        XCTAssertEqual(reader.reads.withLock { $0 }, readsBeforeMove)
+        XCTAssertEqual(fullCaptures.withLock { $0 }, capturesBeforeMove)
+    }
+
+    func testNativeResizeInvalidatesOnlyTheExactTrackedWindowEvenWithoutASnapshotChange() async throws {
+        let fixture = try await makeMovementFixture()
+        defer { fixture.tracker.stop() }
+        var invalidations: [CGWindowID] = []
+        let subscription = fixture.tracker.windowSpaceInvalidations.sink { invalidations.append($0) }
+        defer { subscription.cancel() }
+        let previous = fixture.tracker.snapshot
+
+        fixture.receive(AXElementKey(e: AXUIElementCreateApplication(pid + 1)), kAXWindowResizedNotification)
+        fixture.receive(fixture.reader.element, kAXWindowResizedNotification)
+        await waitForMovement { invalidations == [cgWindow] }
+        await drainMovementWork(fixture.tracker)
+
+        XCTAssertEqual(invalidations, [cgWindow])
+        XCTAssertEqual(fixture.tracker.snapshot, previous)
+    }
+
+    func testMoveBurstRoutesTheLatestFrameWithoutFullInventoryOrCapture() async throws {
+        let gate = DisplayCaptureGate()
+        let fixture = try await makeMovementFixture(firstExactGate: gate)
+        defer { gate.open(); fixture.tracker.stop() }
+        let initialReads = fixture.reader.reads.withLock { $0 }
+        let initialFullCaptures = fixture.cg.fullCaptures.withLock { $0 }
+        let move = fixture.observer.onWindowMoved
+        var accepted = 0
+        fixture.observer.onWindowMoved = { pid, id, element in
+            move?(pid, id, element)
+            accepted += 1
+        }
+        fixture.reader.bounds.withLock { $0 = frameOnAMoved }
+        fixture.cg.bounds.withLock { $0 = frameOnAMoved }
+        gate.arm()
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { gate.isBlocked }
+
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        for _ in 1..<100 {
+            fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        }
+        await waitForMovement { accepted == 100 }
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "A")
+        gate.open()
+        await drainMovementWork(fixture.tracker)
+
+        XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, Array(repeating: cgWindow, count: 3))
+        XCTAssertEqual(fixture.reader.reads.withLock { $0 }, initialReads)
+        XCTAssertEqual(fixture.cg.fullCaptures.withLock { $0 }, initialFullCaptures)
+        XCTAssertFalse(gate.timedOut)
+    }
+
+    func testTabSwitchImmediatelyAfterTargetedMoveRetainsItsSeat() async throws {
+        let fixture = try await makeMovementFixture()
+        defer { fixture.tracker.stop() }
+        let handle = try XCTUnwrap(fixture.observer.subscribedElement(cgWindowID: cgWindow))
+        let token = try XCTUnwrap(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.token)
+        fixture.cg.bounds.withLock { $0 = frameOnAMoved }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement {
+            fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.confirmedCGDisplayBounds == frameOnAMoved
+        }
+        XCTAssertEqual(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnA)
+
+        let replacement = cgWindow + 1
+        let snapshot = AppTrackerCGWindowSnapshot.timedCapture {
+            .init(allWindowIDs: [cgWindow, replacement], onScreenWindowIDs: [replacement],
+                  windowIDsByPID: [pid: [cgWindow, replacement]], alphaByWindowID: [:],
+                  boundsByWindowID: [cgWindow: frameOnAMoved, replacement: frameOnAMoved],
+                  parentWindowIDs: [cgWindow: 0, replacement: 0])
+        }
+        let candidate = AXWindowSnapshot(pid: pid, cgWindowID: replacement, titleRead: .value("Next tab"),
+            bounds: frameOnAMoved, role: kAXWindowRole, subrole: kAXStandardWindowSubrole,
+            isMinimized: false, isFocusedWindow: false, element: AXUIElementCreateApplication(pid + 1), isMinimizedRead: false)
+        let evidence = AbsentSeatProbeEvidence(request: .init(cgWindowID: cgWindow, seatToken: token,
+            element: AXElementKey(e: handle.element), instanceID: handle.instanceID, probeCount: 0),
+            element: .alive(minimized: false), windowSpaceIDs: [], currentSpaceIDs: [1])
+        fixture.tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: snapshot, now: Date(),
+            eligible: [candidate], readOutcome: .success(count: 1), rawAXCgIDs: [replacement], absenceEvidence: [cgWindow: evidence])
+
+        let app = try XCTUnwrap(fixture.tracker.fixtureAppForTesting(pid: pid))
+        XCTAssertEqual(app.windowOrder, [replacement])
+        XCTAssertEqual(app.windowsByID[replacement]?.token, token)
+        XCTAssertEqual(app.windowsByID[replacement]?.priorTabWindowNumbers, [cgWindow])
+    }
+
+    func testOlderFullCGCaptureCannotOverrideCompletedTargetedTransfer() async throws {
+        let fixture = try await makeMovementFixture()
+        defer { fixture.tracker.stop() }
+        let stale = AppTrackerCGWindowSnapshot.timedCapture { cgSnapshot(bounds: [cgWindow: frameOnA]) }
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { fixture.tracker.snapshot.windows[fixture.id]?.displayUUID == "B" }
+
+        XCTAssertFalse(fixture.tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: stale))
+        XCTAssertFalse(fixture.tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: stale))
+        let seat = fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]
+        XCTAssertEqual(seat?.displayUUID, "B")
+        XCTAssertEqual(seat?.confirmedCGDisplayBounds, frameOnB)
+    }
+
+    func testTargetedMoveFallsBackWhenTheWindowBecomesANativeChild() async throws {
+        let fixture = try await makeMovementFixture()
+        defer { fixture.tracker.stop() }
+        let fullCaptures = fixture.cg.fullCaptures.withLock { $0 }
+        var displays: [String?] = []
+        let subscription = fixture.tracker.snapshots.sink { displays.append($0.windows[fixture.id]?.displayUUID) }
+        defer { subscription.cancel() }
+        fixture.cg.parent.withLock { $0 = cgWindow + 1 }
+        fixture.cg.bounds.withLock { $0 = frameOnB }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement { fixture.tracker.snapshot.windows[fixture.id] == nil }
+        await drainMovementWork(fixture.tracker)
+
+        XCTAssertFalse(displays.contains("B"))
+        XCTAssertEqual(fixture.cg.fullCaptures.withLock { $0 }, fullCaptures + 1)
+    }
+
+    func testOlderNativeChildSnapshotCannotRetireRootAfterTargetedMove() async throws {
+        let fixture = try await makeMovementFixture()
+        defer { fixture.tracker.stop() }
+        let stale = AppTrackerCGWindowSnapshot.timedCapture {
+            .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
+                  alphaByWindowID: [:], boundsByWindowID: [cgWindow: frameOnA], parentWindowIDs: [cgWindow: cgWindow + 1])
+        }
+        fixture.cg.bounds.withLock { $0 = frameOnAMoved }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement {
+            fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.confirmedCGDisplayBounds == frameOnAMoved
+        }
+
+        _ = fixture.tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: stale, now: Date(), eligible: [],
+            readOutcome: .unread(errorCode: AXError.cannotComplete.rawValue))
+        XCTAssertEqual(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowOrder, [cgWindow])
+    }
+
+    func testOlderEmptyInventoryCannotRetireRootAfterTargetedMove() async throws {
+        let fixture = try await makeMovementFixture()
+        defer { fixture.tracker.stop() }
+        let stale = AppTrackerCGWindowSnapshot.timedCapture {
+            .init(allWindowIDs: [], onScreenWindowIDs: [], windowIDsByPID: [:], alphaByWindowID: [:])
+        }
+        fixture.cg.bounds.withLock { $0 = frameOnAMoved }
+        fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
+        await waitForMovement {
+            fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.confirmedCGDisplayBounds == frameOnAMoved
+        }
+
+        _ = fixture.tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: stale, now: Date(), eligible: [],
+            readOutcome: .success(count: 0), rawAXCgIDs: [])
+        XCTAssertEqual(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowOrder, [cgWindow])
     }
 
     func testNewerNativeMovementSuppressesAnOlderDisplayReadBeforeItPublishes() async throws {
@@ -182,7 +336,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
                 if attempt.isMultiple(of: 2), allowSamples.indices.contains(attempt / 2 - 1),
                    allowSamples[attempt / 2 - 1].wait(timeout: .now() + 8) == .timedOut { timeouts.withLock { $0 += 1 } }
                 return .init(allWindowIDs: [id], onScreenWindowIDs: [id], windowIDsByPID: [pid: [id]],
-                             alphaByWindowID: [:], boundsByWindowID: [id: cgBounds.withLock { $0 }])
+                             alphaByWindowID: [:], boundsByWindowID: [id: cgBounds.withLock { $0 }], parentWindowIDs: [id: 0])
             }, onScreenWindowIDsProvider: { [cgWindow] }, cgSnapshotReuseEnabled: true,
             uptimeProvider: { 100 }, frontmostPIDProvider: { pid }, displayTableProvider: { table })
         defer { for gate in allowSamples { gate.signal() }; tracker.stop() }
@@ -204,7 +358,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         allowSamples[0].signal()
         for task in tracker.pendingInventoryWorkForTesting { await task.value }
         XCTAssertEqual(tracker.snapshot.windows[id]?.displayUUID, "B")
-        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnAMoved)
+        XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnA)
 
         reader.bounds.withLock { $0 = frameOnB }
         cgBounds.withLock { $0 = frameOnA }
@@ -227,7 +381,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         XCTAssertEqual(timeouts.withLock { $0 }, 0)
     }
 
-    func testNativeMoveQueuedBehindATitleReadPreservesBothExactSamples() async throws {
+    func testNativeMoveCompletesWhileATitleReadIsBlocked() async throws {
         let gate = DisplayCaptureGate()
         let fixture = try await makeMovementFixture(bulkGate: gate)
         defer { gate.open(); fixture.tracker.stop() }
@@ -249,7 +403,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let b = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
         let presenters = [("A", a), ("B", b)].map { display, view in
             TaskbarPresenter(view: view, runtime: runtime, ordering: ordering, topology: topology, spaces: spaces,
-                             displayUUID: display, backgroundMenu: { _, _ in }, popupPresented: { _ in },
+                             displayUUID: display, backgroundMenu: { _, _ in },
                              contextMenuVisibilityChanged: { _ in })
         }
         func ids(_ view: TaskbarView) -> [String] { view.taskbarContent.groups.flatMap(\.windows).map(\.item.actionWindowID) }
@@ -287,6 +441,8 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         fixture.reader.title.withLock { $0 = "Latest title" }
         fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
         await waitForMovement { titleEvents == 2 }
+        await waitForMovement { fixture.tracker.snapshot.windows[fixture.id]?.displayUUID == "B" }
+        await waitForMovement { ids(a).isEmpty && ids(b) == [fixture.id.rawValue] }
 
         gate.open()
         await drainMovementWork(fixture.tracker)
@@ -330,16 +486,17 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         fixture.cg.bounds.withLock { $0 = frameOnAMoved }
         fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
         await waitForMovement { moveEvents == 2 }
+        fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
 
         gate.open()
         await drainMovementWork(fixture.tracker)
-        XCTAssertEqual(displays, ["A", "A"])
+        XCTAssertFalse(displays.contains("B"))
         XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.title, "Title after returning")
         XCTAssertEqual(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnAMoved)
         XCTAssertFalse(gate.timedOut)
     }
 
-    func testNativeMoveReceivesBothExactSamplesAfterInventoryBackoff() async throws {
+    func testNativeMoveReceivesBothExactSamplesDuringInventoryBackoff() async throws {
         let uptime = UptimeBox()
         let fixture = try await makeMovementFixture(uptime: { uptime.now })
         defer { fixture.tracker.stop() }
@@ -361,16 +518,15 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 2)
         XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "A")
 
-        uptime.now += 0.5
-        fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
         await drainMovementWork(fixture.tracker)
+        XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 2)
         XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow])
         XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
     }
 
     func testUnreadNativeMoveRetriesFromTheFrontmostTickAndMovesItsButton() async throws {
         let uptime = UptimeBox()
-        let fixture = try await makeMovementFixture(uptime: { uptime.now })
+        let fixture = try await makeMovementFixture(exactFailures: 1, uptime: { uptime.now })
         defer { fixture.tracker.stop() }
         let runtime = AppRuntime(tracker: DisplayMovementInventory(tracker: fixture.tracker),
                                  actionExecutor: DisplayMovementActions())
@@ -390,7 +546,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let b = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
         let presenters = [("A", a), ("B", b)].map { display, view in
             TaskbarPresenter(view: view, runtime: runtime, ordering: ordering, topology: topology, spaces: spaces,
-                             displayUUID: display, backgroundMenu: { _, _ in }, popupPresented: { _ in },
+                             displayUUID: display, backgroundMenu: { _, _ in },
                              contextMenuVisibilityChanged: { _ in })
         }
         func ids(_ view: TaskbarView) -> [String] { view.taskbarContent.groups.flatMap(\.windows).map(\.item.actionWindowID) }
@@ -409,7 +565,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
         await waitForMovement { fixture.reader.reads.withLock { $0 == 2 } }
         await drainMovementWork(fixture.tracker)
-        XCTAssertTrue(fixture.cg.exactIDs.withLock { $0.isEmpty })
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow])
         XCTAssertEqual(ids(a), [fixture.id.rawValue])
         XCTAssertTrue(ids(b).isEmpty)
 
@@ -424,14 +580,14 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         await drainMovementWork(fixture.tracker)
         XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 3)
         XCTAssertEqual(fixture.reader.bounds.withLock { $0 }, frameOnA)
-        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow])
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow, cgWindow])
         XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
         await waitForMovement { ids(a).isEmpty && ids(b) == [fixture.id.rawValue] }
     }
 
     func testUnreadNativeMoveKeepsItsExactSamplesForThePeriodicTail() async throws {
         let uptime = UptimeBox()
-        let fixture = try await makeMovementFixture(uptime: { uptime.now })
+        let fixture = try await makeMovementFixture(exactFailures: 1, uptime: { uptime.now })
         defer { fixture.tracker.stop() }
         fixture.reader.unread.withLock { $0 = true }
         fixture.cg.bounds.withLock { $0 = frameOnB }
@@ -456,13 +612,13 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         fixture.tracker.scheduleFrontmostPollForTesting(pid: pid + 1)
         await drainMovementWork(fixture.tracker)
         XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 5)
-        XCTAssertTrue(fixture.cg.exactIDs.withLock { $0.isEmpty })
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow])
         XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "A")
 
         fixture.tracker.runPeriodicBatchForTesting(cgSnapshot: cgSnapshot(bounds: [cgWindow: frameOnB]))
         await drainMovementWork(fixture.tracker)
         XCTAssertEqual(fixture.reader.reads.withLock { $0 }, 6)
-        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow])
+        XCTAssertEqual(fixture.cg.exactIDs.withLock { $0 }, [cgWindow, cgWindow, cgWindow])
         XCTAssertEqual(fixture.tracker.snapshot.windows[fixture.id]?.displayUUID, "B")
     }
 
@@ -477,6 +633,9 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
             receivedTitle = true
         }
         fixture.reader.title.withLock { $0 = "First update" }
+        fixture.receive(fixture.reader.element, kAXTitleChangedNotification)
+        await waitForMovement { fixture.tracker.snapshot.windows[fixture.id]?.title == "First update" }
+        receivedTitle = false
         fixture.cg.bounds.withLock { $0 = frameOnB }
         gate.arm()
         fixture.receive(fixture.reader.element, kAXWindowMovedNotification)
@@ -509,6 +668,8 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
     private final class CGState: Sendable {
         let bounds: Mutex<CGRect>
         let exactIDs = Mutex<[CGWindowID]>([])
+        let fullCaptures = Mutex(0)
+        let parent = Mutex<CGWindowID>(0)
 
         init(bounds: CGRect) { self.bounds = Mutex(bounds) }
     }
@@ -518,7 +679,8 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
     }
 
     private func makeMovementFixture(
-        bulkGate: DisplayCaptureGate? = nil, secondExactGate: DisplayCaptureGate? = nil,
+        bulkGate: DisplayCaptureGate? = nil, firstExactGate: DisplayCaptureGate? = nil,
+        secondExactGate: DisplayCaptureGate? = nil, exactFailures: Int = 0,
         uptime: @escaping () -> TimeInterval = { 100 }
     ) async throws -> MovementFixture {
         let (pid, cgWindow, table) = (pid, cgWindow, tableAB)
@@ -532,15 +694,21 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         })
         let tracker = AppTracker(reader: reader, processProvider: DisplayAttributionFixedProcessProvider(),
             cgSnapshotProvider: {
+                cg.fullCaptures.withLock { $0 += 1 }
                 let bounds = cg.bounds.withLock { $0 }
                 bulkGate?.waitIfArmed()
                 return .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
-                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: bounds], parentWindowIDs: [cgWindow: 0])
+                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: bounds],
+                             parentWindowIDs: [cgWindow: cg.parent.withLock { $0 }])
             }, cgWindowSnapshotProvider: { id in
                 let attempt = cg.exactIDs.withLock { $0.append(id); return $0.count }
+                if attempt <= exactFailures { return .failed }
+                let bounds = cg.bounds.withLock { $0 }
+                if attempt == 1 { firstExactGate?.waitIfArmed() }
                 if attempt == 2 { secondExactGate?.waitIfArmed() }
                 return .init(allWindowIDs: [cgWindow], onScreenWindowIDs: [cgWindow], windowIDsByPID: [pid: [cgWindow]],
-                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: cg.bounds.withLock { $0 }])
+                             alphaByWindowID: [:], boundsByWindowID: [cgWindow: bounds],
+                             parentWindowIDs: [cgWindow: cg.parent.withLock { $0 }])
             }, onScreenWindowIDsProvider: { [cgWindow] }, cgSnapshotReuseEnabled: false,
             uptimeProvider: uptime, frontmostPIDProvider: { pid }, displayTableProvider: { table })
         let id = WindowID(rawValue: "cgw-\(cgWindow)")
@@ -922,11 +1090,11 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let orchestrator = TaskbarScreenOrchestrator(runtime: AppRuntime(tracker: tracker),
             stripOrderStore: StripOrderStore(), displayTopologyStore: store,
             spaceStore: TaskbarSpaceStore(read: { _ in nil }, pollInterval: 0),
-            overlaySpaceHost: nil, topologySnapshotProvider: { snapshot }, startCoordinator: { _ in true },
+            topologySnapshotProvider: { snapshot }, startCoordinator: { _ in true },
             topologyRetryScheduler: { _, action in
                 retryCallbacks.append(action)
                 return DispatchWorkItem(block: action)
-            })
+            }, makeGeometryObserver: { nil })
         defer { orchestrator.suspendAndRelease() }
         orchestrator.start()
         XCTAssertNil(tracker.snapshot.windows[windowID]?.displayUUID)
@@ -1063,7 +1231,7 @@ private final class DisplayMovementActions: WindowActionExecuting {
     let ids = Mutex<[WindowID]>([])
 
     func execute(_ request: PlatformActionRequest, snapshot: DockSnapshot, forcedMinimizedPrior: Bool,
-                 cancellation: OperationCancellation, onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?) -> Bool {
+                 cancellation: OperationCancellation, onHandoffTarget: (@Sendable (WindowID) -> Void)?) -> Bool {
         if let id = request.windowID { ids.withLock { $0.append(id) } }
         return false
     }

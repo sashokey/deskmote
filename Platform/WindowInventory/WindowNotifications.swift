@@ -76,6 +76,7 @@ final class AppWindowObserver {
     private static let applicationNotifications = [
         kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification
     ]
+    private static let geometryNotifications = [kAXWindowMovedNotification, kAXWindowResizedNotification]
     #if DEBUG
     private static let dropsDestroyNotifications = DebugSwitch.simulateNoDestroy.isEnabled()
     #endif
@@ -96,7 +97,7 @@ final class AppWindowObserver {
 
     private var pendingApplicationNotifications: [String] {
         var names = Self.applicationNotifications
-        if movementAttempts < 3 { names.append(kAXWindowMovedNotification) }
+        if movementAttempts < 3 { names.append(contentsOf: Self.geometryNotifications) }
         return names.filter { applicationItems[$0] != .done && applicationItems[$0] != .unsupported }
     }
 
@@ -109,8 +110,8 @@ final class AppWindowObserver {
         guard !isStarting, clock() >= applicationRetryAt else { return }
         let notifications = pendingApplicationNotifications
         guard session == nil || !notifications.isEmpty else { return }
-        let required = notifications.filter { $0 != kAXWindowMovedNotification }
-        let registerMovement = notifications.contains(kAXWindowMovedNotification)
+        let geometry = notifications.filter { Self.geometryNotifications.contains($0) }
+        let required = notifications.filter { !Self.geometryNotifications.contains($0) }
         isStarting = true
         let currentSession = session
         let makeSession = makeSession
@@ -149,27 +150,34 @@ final class AppWindowObserver {
                     for (id, key) in windows { _ = self.registerWindow(key.e, cgWindowID: id) }
                 }
                 if !wasReady, self.canReceiveWindowCreated { self.onWindowCreationReady?(pid) }
-                return registerMovement ? self.inFlight.values.compactMap(\.task) : []
+                return geometry.isEmpty ? [] : self.inFlight.values.compactMap(\.task)
             }
-            let movementResult: AXError?
-            if registerMovement, let session = created?.session {
+            let geometryResults: [String: AXError]
+            if !geometry.isEmpty, let session = created?.session {
                 for task in pendingRegistrations {
                     if Task.isCancelled { return }
                     await task.value
                 }
                 guard !Task.isCancelled else { return }
-                movementResult = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
-                    session.add(kAXWindowMovedNotification, element: nil)
-                }
+                geometryResults = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
+                    var results: [String: AXError] = [:]
+                    for notification in geometry {
+                        guard !cancellation.isCancelled else { break }
+                        results[notification] = session.add(notification, element: nil)
+                    }
+                    return results
+                } ?? [:]
             } else {
-                movementResult = nil
+                geometryResults = [:]
             }
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation) else { return }
                 self.isStarting = false
-                if let movementResult {
+                if !geometryResults.isEmpty {
                     self.movementAttempts += 1
-                    self.recordApplicationRegistration(kAXWindowMovedNotification, result: movementResult)
+                    for (notification, result) in geometryResults {
+                        self.recordApplicationRegistration(notification, result: result)
+                    }
                 }
                 let needsRetry = self.session == nil || !self.pendingApplicationNotifications.isEmpty
                 if needsRetry {
@@ -426,7 +434,7 @@ final class AppWindowObserver {
             if let cgID = subscriptions.cgWindowID(forElement: AXElementKey(e: element)) {
                 onTitleChanged?(pid, cgID)
             }
-        } else if notifStr == kAXWindowMovedNotification {
+        } else if Self.geometryNotifications.contains(notifStr) {
             let key = AXElementKey(e: element)
             if let cgID = subscriptions.cgWindowID(forElement: key) {
                 onWindowMoved?(pid, cgID, key)

@@ -3,6 +3,11 @@ import ApplicationServices
 import CoreGraphics
 import Darwin
 import Foundation
+#if DEBUG
+import os
+
+private let heightFrameLog = Logger(subsystem: "io.github.sashokey.deskmote", category: "window-height")
+#endif
 
 struct AXElementKey: Hashable, @unchecked Sendable {
     let e: AXUIElement
@@ -95,76 +100,6 @@ struct AXWindowHandle {
     let title: String?
     let bounds: CGRect?
     let element: AXUIElement
-}
-
-enum AXWindowFrameAttribute: Equatable {
-    case position
-    case size
-}
-
-enum AXWindowAttributeSettableStatus: Equatable {
-    case settable
-    case notSettable
-    case unread(AXError)
-
-    var isSettable: Bool {
-        if case .settable = self { return true }
-        return false
-    }
-}
-
-struct AXWindowFrameSettableStatus: Equatable {
-    let position: AXWindowAttributeSettableStatus
-    let size: AXWindowAttributeSettableStatus
-}
-
-enum AXWindowFrameWriteFailure: Error, Equatable {
-    case invalidGeometry
-    case initialFrameUnavailable
-    case initialFrameMismatch(expected: CGRect, actual: CGRect)
-    case windowIdentityUnavailable
-    case windowIdentityChanged
-    case capabilityQueryFailed(attribute: AXWindowFrameAttribute, error: AXError)
-    case attributeNotSettable(AXWindowFrameAttribute)
-    case valueCreationFailed(AXWindowFrameAttribute)
-    case operationBudgetExhausted
-    case writeFailed(attribute: AXWindowFrameAttribute, error: AXError)
-    case verificationUnavailable
-    case verificationMismatch(expected: CGRect, actual: CGRect)
-
-    var mayHaveMutatedWindow: Bool {
-        switch self {
-        case .writeFailed, .verificationUnavailable, .verificationMismatch:
-            return true
-        case .invalidGeometry,
-             .initialFrameUnavailable,
-             .initialFrameMismatch,
-             .windowIdentityUnavailable,
-             .windowIdentityChanged,
-             .capabilityQueryFailed,
-             .attributeNotSettable,
-             .valueCreationFailed,
-             .operationBudgetExhausted:
-            return false
-        }
-    }
-}
-
-enum AXWindowFrameRollbackPolicy {
-    static func accepts(_ actual: CGRect, attemptedFrames: [CGRect], tolerance: CGFloat) -> Bool {
-        attemptedFrames.contains { WindowFrameMatchPolicy.areClose(actual, $0, tolerance: tolerance) }
-    }
-}
-
-enum AXWindowFrameRollbackResult: Equatable {
-    case notRequested
-    case restored(actualFrame: CGRect)
-    case failed(reason: AXWindowFrameWriteFailure, actualFrame: CGRect?)
-}
-
-enum AXWindowFrameWriteResult: Equatable {
-    case success(actualFrame: CGRect)
-    case failure(reason: AXWindowFrameWriteFailure, rollback: AXWindowFrameRollbackResult)
 }
 
 enum AXWindowReadResult {
@@ -270,33 +205,45 @@ extension AccessibilityOperations {
 }
 
 struct NativeAccessibilityOperations: AccessibilityOperations {
-    func isTrusted() -> Bool { AXIsProcessTrusted() }
+    private let access = RuntimeAccessibilityAccess.shared
+
+    func isTrusted() -> Bool { access.checkTrust(AXIsProcessTrusted) }
     func application(_ pid: pid_t) -> AXUIElement { AXUIElementCreateApplication(pid) }
-    func systemWide() -> AXUIElement? { AXUIElementCreateSystemWide() }
+    func systemWide() -> AXUIElement? { access.allowsCalls ? AXUIElementCreateSystemWide() : nil }
     func copy(_ element: AXUIElement, _ attribute: CFString) -> (AXError, CFTypeRef?) {
-        var value: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
-        return (error, value)
+        access.call(denied: (.apiDisabled, nil), status: { $0.0 }) {
+            var value: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+            return (error, value)
+        }
     }
     func copyAttributes(_ element: AXUIElement, _ attributes: [String]) -> (AXError, [CFTypeRef]?) {
-        var values: CFArray?
-        let error = AXUIElementCopyMultipleAttributeValues(element, attributes as CFArray, [], &values)
-        return (error, values as? [CFTypeRef])
+        access.call(denied: (.apiDisabled, nil), status: { $0.0 }) {
+            var values: CFArray?
+            let error = AXUIElementCopyMultipleAttributeValues(element, attributes as CFArray, [], &values)
+            return (error, values as? [CFTypeRef])
+        }
     }
     func set(_ element: AXUIElement, _ attribute: CFString, _ value: CFTypeRef) -> AXError {
-        AXUIElementSetAttributeValue(element, attribute, value)
+        access.call { AXUIElementSetAttributeValue(element, attribute, value) }
     }
-    func perform(_ element: AXUIElement, _ action: CFString) -> AXError { AXUIElementPerformAction(element, action) }
+    func perform(_ element: AXUIElement, _ action: CFString) -> AXError {
+        access.call { AXUIElementPerformAction(element, action) }
+    }
     func pid(_ element: AXUIElement) -> pid_t? {
         var value: pid_t = 0
-        return AXUIElementGetPid(element, &value) == .success ? value : nil
+        return access.call { AXUIElementGetPid(element, &value) } == .success ? value : nil
     }
-    func windowID(_ element: AXUIElement) -> CGWindowID? { AXWindowIDBridge.cgWindowID(for: element) }
-    func setTimeout(_ element: AXUIElement, _ timeout: Float) -> AXError { AXUIElementSetMessagingTimeout(element, timeout) }
+    func windowID(_ element: AXUIElement) -> CGWindowID? { AXWindowIDBridge.cgWindowID(for: element, access: access) }
+    func setTimeout(_ element: AXUIElement, _ timeout: Float) -> AXError {
+        access.call { AXUIElementSetMessagingTimeout(element, timeout) }
+    }
     func isSettable(_ element: AXUIElement, _ attribute: CFString) -> (AXError, Bool) {
-        var value = DarwinBoolean(false)
-        let error = AXUIElementIsAttributeSettable(element, attribute, &value)
-        return (error, value.boolValue)
+        access.call(denied: (.apiDisabled, false), status: { $0.0 }) {
+            var value = DarwinBoolean(false)
+            let error = AXUIElementIsAttributeSettable(element, attribute, &value)
+            return (error, value.boolValue)
+        }
     }
 }
 
@@ -308,18 +255,6 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         case unread(AXError)
     }
 
-    private enum GeometryWrite {
-        case size(CGSize)
-        case frame(CGRect)
-    }
-
-    private struct GeometryWriteSample {
-        let frame: CGRect
-        var windowIDs: [CGWindowID?] = []
-    }
-
-    private static let geometryWriteAttributes = [kAXPositionAttribute, kAXSizeAttribute].map { $0 as String }
-        + AXWindowIDBridge.fallbackAttributeNames
     private static let inventoryGeometryAttributes = [kAXPositionAttribute, kAXSizeAttribute].map { $0 as String }
     private static let inventoryWindowAttributes = inventoryGeometryAttributes + [kAXRoleAttribute, kAXSubroleAttribute].map { $0 as String }
     private static let inventoryAttributes = [kAXMinimizedAttribute, kAXTitleAttribute].map { $0 as String } + inventoryWindowAttributes
@@ -628,7 +563,13 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
             return [kAXMinimizedAttribute as String: (.cannotComplete, nil)]
         }
         applyMessagingTimeout(min(readMessagingTimeout, budget?.remaining ?? readMessagingTimeout), to: element)
+        #if DEBUG
+        let resources = ActionResourceLog.begin("native.ax.inventoryAttributes")
+        #endif
         let (error, values) = accessibility.copyAttributes(element, attributes)
+        #if DEBUG
+        resources?.finish()
+        #endif
         switch error {
         case .notImplemented, .attributeUnsupported, .illegalArgument, .failure:
             return [:]
@@ -881,121 +822,62 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         return WindowFrameMatchPolicy.isValid(frame) ? frame : nil
     }
 
-    func frame(of element: AXUIElement, messagingTimeout: TimeInterval) -> CGRect? {
-        applyMessagingTimeout(messagingTimeout, to: element)
-        return frame(of: element, maxAttempts: 1)
+    func heightAdjustmentFrame(of element: AXUIElement) -> CGRect? {
+        guard accessibility.isTrusted() else {
+            #if DEBUG
+            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=permission-unavailable")
+            #endif
+            return nil
+        }
+        applyMessagingTimeout(0.1, to: element)
+        #if DEBUG
+        let resources = ActionResourceLog.begin("native.ax.heightFrame")
+        #endif
+        let (error, values) = accessibility.copyAttributes(element, Self.inventoryGeometryAttributes + [
+            kAXMinimizedAttribute as String, "AXFullScreen",
+        ])
+        #if DEBUG
+        resources?.finish()
+        #endif
+        guard error == .success, let values, values.count == 4 else {
+            #if DEBUG
+            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=batch-unread axError=\(error.rawValue) count=\(values?.count ?? 0)")
+            #endif
+            return nil
+        }
+        guard isInactiveWindowFlag(values[2]), isInactiveWindowFlag(values[3]) else {
+            #if DEBUG
+            let minimized = (values[2] as? NSNumber)?.stringValue ?? "unread"
+            let fullscreen = (values[3] as? NSNumber)?.stringValue ?? "unread"
+            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=ineligible minimized=\(minimized, privacy: .public) fullscreen=\(fullscreen, privacy: .public)")
+            #endif
+            return nil
+        }
+        let measured = frame(position: values[0], size: values[1])
+        #if DEBUG
+        if measured == nil {
+            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=invalid-position-or-size")
+        }
+        #endif
+        return measured
     }
 
-    func frameSettableStatus(
-        of element: AXUIElement,
-        messagingTimeout: TimeInterval = 0.1
-    ) -> AXWindowFrameSettableStatus {
-        applyMessagingTimeout(messagingTimeout, to: element)
-        return AXWindowFrameSettableStatus(
-            position: settableStatus(kAXPositionAttribute as CFString, on: element),
-            size: settableStatus(kAXSizeAttribute as CFString, on: element)
-        )
+    private func isInactiveWindowFlag(_ value: CFTypeRef) -> Bool {
+        if CFGetTypeID(value) == CFNullGetTypeID() { return true }
+        if let flag = value as? NSNumber { return !flag.boolValue }
+        guard let axValue = axValue(from: value) else { return false }
+        var error = AXError.failure
+        return AXValueGetValue(axValue, .axError, &error) && (error == .attributeUnsupported || error == .noValue)
     }
 
-    func setSize(
-        _ size: CGSize,
-        for element: AXUIElement,
-        messagingTimeout: TimeInterval = 0.1,
-        frameVerificationTolerance: CGFloat = 1,
-        onlyIfCurrentMatches expectedCurrentFrame: CGRect? = nil,
-        restoreOnFailureTo restoreFrame: CGRect? = nil,
-        expectedWindowID: CGWindowID? = nil,
-        onAttempt: (CGRect) -> Void = { _ in },
-        checkWriteAdmission: () -> AXWindowFrameWriteFailure? = { nil }
-    ) -> AXWindowFrameWriteResult {
-        performGeometryWrite(
-            .size(size), for: element, messagingTimeout: messagingTimeout,
-            frameVerificationTolerance: frameVerificationTolerance,
-            onlyIfCurrentMatches: expectedCurrentFrame,
-            restoreOnFailureTo: restoreFrame,
-            expectedWindowID: expectedWindowID,
-            onAttempt: onAttempt,
-            checkWriteAdmission: checkWriteAdmission
-        )
-    }
-
-    func setFrame(
-        _ frame: CGRect,
-        for element: AXUIElement,
-        messagingTimeout: TimeInterval = 0.1,
-        frameVerificationTolerance: CGFloat = 1,
-        onlyIfCurrentMatches expectedCurrentFrame: CGRect? = nil,
-        restoreOnFailureTo restoreFrame: CGRect? = nil,
-        expectedWindowID: CGWindowID? = nil,
-        onAttempt: (CGRect) -> Void = { _ in },
-        checkWriteAdmission: () -> AXWindowFrameWriteFailure? = { nil }
-    ) -> AXWindowFrameWriteResult {
-        performGeometryWrite(
-            .frame(frame), for: element, messagingTimeout: messagingTimeout,
-            frameVerificationTolerance: frameVerificationTolerance,
-            onlyIfCurrentMatches: expectedCurrentFrame,
-            restoreOnFailureTo: restoreFrame,
-            expectedWindowID: expectedWindowID,
-            onAttempt: onAttempt,
-            checkWriteAdmission: checkWriteAdmission
-        )
-    }
-
-    private func performGeometryWrite(
-        _ geometry: GeometryWrite,
-        for element: AXUIElement,
-        messagingTimeout: TimeInterval,
-        frameVerificationTolerance: CGFloat,
-        onlyIfCurrentMatches expectedCurrentFrame: CGRect?,
-        restoreOnFailureTo restoreFrame: CGRect?,
-        expectedWindowID: CGWindowID?,
-        onAttempt: (CGRect) -> Void,
-        checkWriteAdmission: () -> AXWindowFrameWriteFailure?
-    ) -> AXWindowFrameWriteResult {
-        applyMessagingTimeout(messagingTimeout, to: element)
-        guard isValid(geometry), isValid(tolerance: frameVerificationTolerance),
-              expectedCurrentFrame.map(isValid(frame:)) ?? true,
-              restoreFrame.map(isValid(frame:)) ?? true else {
-            return .failure(reason: .invalidGeometry, rollback: .notRequested)
-        }
-
-        var attemptedFrames: [CGRect] = []
-        func recordAttempt(_ frame: CGRect) {
-            attemptedFrames.append(frame)
-            onAttempt(frame)
-        }
-        let result: Result<CGRect, AXWindowFrameWriteFailure>
-        switch geometry {
-        case let .size(size):
-            result = writeSize(
-                size, to: element, frameVerificationTolerance: frameVerificationTolerance,
-                onlyIfCurrentMatches: expectedCurrentFrame, expectedWindowID: expectedWindowID,
-                checkWriteAdmission: checkWriteAdmission, recordAttempt: recordAttempt
-            )
-        case let .frame(frame):
-            result = writeFrame(
-                frame, to: element, frameVerificationTolerance: frameVerificationTolerance,
-                onlyIfCurrentMatches: expectedCurrentFrame, expectedWindowID: expectedWindowID,
-                checkWriteAdmission: checkWriteAdmission, recordAttempt: recordAttempt
-            )
-        }
-        switch result {
-        case let .success(actualFrame):
-            return .success(actualFrame: actualFrame)
-        case let .failure(reason):
-            return .failure(
-                reason: reason,
-                rollback: rollbackResult(
-                    after: reason,
-                    to: restoreFrame,
-                    for: element,
-                    attemptedFrames: attemptedFrames,
-                    frameVerificationTolerance: frameVerificationTolerance,
-                    expectedWindowID: expectedWindowID,
-                    checkWriteAdmission: checkWriteAdmission
-                )
-            )
-        }
+    func writeWindowSize(_ size: CGSize, to element: AXUIElement) -> AXError {
+        var size = size
+        guard let value = AXValueCreate(.cgSize, &size) else { return .illegalArgument }
+        #if DEBUG
+        let resources = ActionResourceLog.begin("native.ax.writeSize")
+        defer { resources?.finish() }
+        #endif
+        return accessibility.set(element, kAXSizeAttribute as CFString, value)
     }
 
     func setMinimized(_ minimized: Bool, for handle: AXWindowHandle) -> Bool {
@@ -1033,7 +915,14 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
                 applyMessagingTimeout(min(readMessagingTimeout, budget.remaining), to: element)
             }
             let result: AXError
+            #if DEBUG
+            let resources = (attribute as String) == (kAXWindowsAttribute as String)
+                ? ActionResourceLog.begin("native.ax.inventoryWindowList") : nil
+            #endif
             (result, value) = accessibility.copy(element, attribute)
+            #if DEBUG
+            resources?.finish()
+            #endif
             if result == .success {
                 return result
             }
@@ -1065,351 +954,6 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
         return unsafeDowncast(value, to: AXValue.self)
     }
 
-    private func settableStatus(
-        _ attribute: CFString,
-        on element: AXUIElement
-    ) -> AXWindowAttributeSettableStatus {
-        guard budget?.canContinue ?? true else { return .unread(.cannotComplete) }
-        if let budget { applyMessagingTimeout(min(readMessagingTimeout, budget.remaining), to: element) }
-        let (result, isSettable) = accessibility.isSettable(element, attribute)
-        guard result == .success else { return .unread(result) }
-        return isSettable ? .settable : .notSettable
-    }
-
-    private func windowIdentityFailure(_ expectedWindowID: CGWindowID?, for element: AXUIElement) -> AXWindowFrameWriteFailure? {
-        guard let expectedWindowID else { return nil }
-        guard budget?.canContinue != false else { return .operationBudgetExhausted }
-        guard let actualWindowID = cgWindowID(for: element, maxAttempts: 1) else {
-            return budget?.canContinue == false ? .operationBudgetExhausted : .initialFrameUnavailable
-        }
-        return actualWindowID == expectedWindowID ? nil : .windowIdentityChanged
-    }
-
-    private func geometryWriteSample(
-        for element: AXUIElement, expectedWindowID: CGWindowID?, maxAttempts: Int
-    ) -> GeometryWriteSample? {
-        if expectedWindowID != nil {
-            guard budget?.canContinue != false else { return nil }
-            if let budget { applyMessagingTimeout(min(readMessagingTimeout, budget.remaining), to: element) }
-            let attributes = Self.geometryWriteAttributes
-            let (error, values) = accessibility.copyAttributes(element, attributes)
-            switch error {
-            case .success:
-                if let values, values.count == attributes.count,
-                   let frame = frame(position: values[0], size: values[1]) {
-                    return GeometryWriteSample(frame: frame, windowIDs: values.dropFirst(2).map(AXWindowIDBridge.cgWindowID))
-                }
-            case .notImplemented, .attributeUnsupported, .illegalArgument, .failure:
-                break
-            default:
-                return nil
-            }
-        }
-        return frame(of: element, maxAttempts: maxAttempts).map { GeometryWriteSample(frame: $0) }
-    }
-
-    private func writeGeometryAttribute(
-        _ attribute: AXWindowFrameAttribute, to element: AXUIElement, value: CFTypeRef,
-        expectedWindowID: CGWindowID?, sample: GeometryWriteSample,
-        onlyIfCurrentMatches expectedFrame: CGRect?, frameVerificationTolerance: CGFloat,
-        checkWriteAdmission: () -> AXWindowFrameWriteFailure?, onAttempt: (CGRect) -> Void
-    ) -> AXWindowFrameWriteFailure? {
-        guard budget?.canContinue != false else { return .operationBudgetExhausted }
-        if let budget { applyMessagingTimeout(min(readMessagingTimeout, budget.remaining), to: element) }
-        if let failure = windowIdentityFailure(expectedWindowID, for: element) { return failure }
-        var admittedFrame = sample.frame
-        if let expectedWindowID, let expectedFrame {
-            guard let current = geometryWriteSample(for: element, expectedWindowID: expectedWindowID, maxAttempts: 1) else {
-                if budget?.canContinue == false { return .operationBudgetExhausted }
-                return attribute == .position ? .verificationUnavailable : .initialFrameUnavailable
-            }
-            for (index, id) in current.windowIDs.enumerated() {
-                guard let id, id != expectedWindowID else { continue }
-                if !sample.windowIDs.indices.contains(index) || sample.windowIDs[index] != id {
-                    return .windowIdentityChanged
-                }
-            }
-            for (index, id) in sample.windowIDs.enumerated() where id == expectedWindowID {
-                guard current.windowIDs.indices.contains(index), current.windowIDs[index] != nil else {
-                    return .windowIdentityUnavailable
-                }
-            }
-            guard measuredFramesAgree(current.frame, expectedFrame, tolerance: frameVerificationTolerance) else {
-                return attribute == .position
-                    ? .verificationUnavailable
-                    : .initialFrameMismatch(expected: expectedFrame, actual: current.frame)
-            }
-            admittedFrame = current.frame
-        }
-        if let failure = checkWriteAdmission() { return failure }
-        guard budget?.canContinue != false else { return .operationBudgetExhausted }
-        onAttempt(admittedFrame)
-        let name = attribute == .size ? kAXSizeAttribute : kAXPositionAttribute
-        let result = accessibility.set(element, name as CFString, value)
-        return result == .success ? nil : .writeFailed(attribute: attribute, error: result)
-    }
-
-    private func writeSize(
-        _ size: CGSize,
-        to element: AXUIElement,
-        frameVerificationTolerance: CGFloat,
-        onlyIfCurrentMatches expectedCurrentFrame: CGRect? = nil,
-        expectedWindowID: CGWindowID?,
-        checkWriteAdmission: () -> AXWindowFrameWriteFailure?,
-        recordAttempt: (CGRect) -> Void = { _ in }
-    ) -> Result<CGRect, AXWindowFrameWriteFailure> {
-        guard let initialFrame = frame(of: element, maxAttempts: 1) else {
-            return .failure(budget?.canContinue == false ? .operationBudgetExhausted : .initialFrameUnavailable)
-        }
-        if let expectedCurrentFrame,
-           !measuredFramesAgree(initialFrame, expectedCurrentFrame, tolerance: frameVerificationTolerance) {
-            return .failure(.initialFrameMismatch(expected: expectedCurrentFrame, actual: initialFrame))
-        }
-
-        if sizesMatch(initialFrame.size, size, tolerance: frameVerificationTolerance) {
-            return .success(initialFrame)
-        }
-
-        switch settableStatus(kAXSizeAttribute as CFString, on: element) {
-        case .settable:
-            break
-        case .notSettable:
-            return .failure(.attributeNotSettable(.size))
-        case let .unread(error):
-            return .failure(.capabilityQueryFailed(attribute: .size, error: error))
-        }
-
-        var mutableSize = size
-        guard let sizeValue = AXValueCreate(.cgSize, &mutableSize) else {
-            return .failure(.valueCreationFailed(.size))
-        }
-        if let failure = windowIdentityFailure(expectedWindowID, for: element) {
-            return .failure(failure)
-        }
-        var sample = GeometryWriteSample(frame: initialFrame)
-        if let expectedCurrentFrame {
-            guard let current = geometryWriteSample(for: element, expectedWindowID: expectedWindowID, maxAttempts: 1) else {
-                return .failure(budget?.canContinue == false ? .operationBudgetExhausted : .initialFrameUnavailable)
-            }
-            guard measuredFramesAgree(current.frame, expectedCurrentFrame, tolerance: frameVerificationTolerance) else {
-                return .failure(.initialFrameMismatch(expected: expectedCurrentFrame, actual: current.frame))
-            }
-            sample = current
-        }
-
-        var expectedFrame = CGRect(origin: sample.frame.origin, size: size)
-        if let failure = writeGeometryAttribute(
-            .size, to: element, value: sizeValue, expectedWindowID: expectedWindowID, sample: sample,
-            onlyIfCurrentMatches: expectedCurrentFrame, frameVerificationTolerance: frameVerificationTolerance,
-            checkWriteAdmission: checkWriteAdmission,
-            onAttempt: { admitted in
-                expectedFrame.origin = admitted.origin
-                recordAttempt(expectedFrame)
-            }
-        ) {
-            return .failure(failure)
-        }
-
-        guard let actualFrame = frame(of: element, maxAttempts: 2) else {
-            return .failure(.verificationUnavailable)
-        }
-        guard measuredFramesAgree(actualFrame, expectedFrame, tolerance: frameVerificationTolerance) else {
-            return .failure(.verificationMismatch(expected: expectedFrame, actual: actualFrame))
-        }
-        return .success(actualFrame)
-    }
-
-    private func writeFrame(
-        _ intendedWindowFrame: CGRect,
-        to element: AXUIElement,
-        frameVerificationTolerance: CGFloat,
-        onlyIfCurrentMatches expectedCurrentFrame: CGRect? = nil,
-        expectedWindowID: CGWindowID?,
-        checkWriteAdmission: () -> AXWindowFrameWriteFailure?,
-        recordAttempt: (CGRect) -> Void = { _ in }
-    ) -> Result<CGRect, AXWindowFrameWriteFailure> {
-        guard let initialFrame = frame(of: element, maxAttempts: 1) else {
-            return .failure(.initialFrameUnavailable)
-        }
-        if let expectedCurrentFrame,
-           !measuredFramesAgree(initialFrame, expectedCurrentFrame, tolerance: frameVerificationTolerance) {
-            return .failure(.initialFrameMismatch(expected: expectedCurrentFrame, actual: initialFrame))
-        }
-        if measuredFramesAgree(initialFrame, intendedWindowFrame, tolerance: frameVerificationTolerance) {
-            return .success(initialFrame)
-        }
-
-        let needsSize = !sizesMatch(
-            initialFrame.size,
-            intendedWindowFrame.size,
-            tolerance: frameVerificationTolerance
-        )
-        let needsPosition = !pointsMatch(
-            initialFrame.origin,
-            intendedWindowFrame.origin,
-            tolerance: frameVerificationTolerance
-        )
-
-        if needsSize {
-            switch settableStatus(kAXSizeAttribute as CFString, on: element) {
-            case .settable:
-                break
-            case .notSettable:
-                return .failure(.attributeNotSettable(.size))
-            case let .unread(error):
-                return .failure(.capabilityQueryFailed(attribute: .size, error: error))
-            }
-        }
-        if needsPosition {
-            switch settableStatus(kAXPositionAttribute as CFString, on: element) {
-            case .settable:
-                break
-            case .notSettable:
-                return .failure(.attributeNotSettable(.position))
-            case let .unread(error):
-                return .failure(.capabilityQueryFailed(attribute: .position, error: error))
-            }
-        }
-
-        var mutableSize = intendedWindowFrame.size
-        let sizeValue = needsSize ? AXValueCreate(.cgSize, &mutableSize) : nil
-        if needsSize, sizeValue == nil {
-            return .failure(.valueCreationFailed(.size))
-        }
-
-        var mutablePosition = intendedWindowFrame.origin
-        let positionValue = needsPosition ? AXValueCreate(.cgPoint, &mutablePosition) : nil
-        if needsPosition, positionValue == nil {
-            return .failure(.valueCreationFailed(.position))
-        }
-        if let failure = windowIdentityFailure(expectedWindowID, for: element) {
-            return .failure(failure)
-        }
-        var sample = GeometryWriteSample(frame: initialFrame)
-        if let expectedCurrentFrame {
-            guard let current = geometryWriteSample(for: element, expectedWindowID: expectedWindowID, maxAttempts: 1) else {
-                return .failure(.initialFrameUnavailable)
-            }
-            guard measuredFramesAgree(current.frame, expectedCurrentFrame, tolerance: frameVerificationTolerance) else {
-                return .failure(.initialFrameMismatch(expected: expectedCurrentFrame, actual: current.frame))
-            }
-            sample = current
-        }
-
-        var admittedFrame = sample.frame
-        if let sizeValue {
-            if let failure = writeGeometryAttribute(
-                .size, to: element, value: sizeValue, expectedWindowID: expectedWindowID, sample: sample,
-                onlyIfCurrentMatches: expectedCurrentFrame, frameVerificationTolerance: frameVerificationTolerance,
-                checkWriteAdmission: checkWriteAdmission,
-                onAttempt: { admitted in
-                    admittedFrame = admitted
-                    recordAttempt(CGRect(origin: admitted.origin, size: intendedWindowFrame.size))
-                }
-            ) {
-                return .failure(failure)
-            }
-        }
-
-        if let positionValue {
-            if needsSize, let failure = windowIdentityFailure(expectedWindowID, for: element) {
-                return .failure(failure)
-            }
-            let expectedPartial = CGRect(origin: admittedFrame.origin, size: needsSize ? intendedWindowFrame.size : admittedFrame.size)
-            guard let current = geometryWriteSample(for: element, expectedWindowID: expectedWindowID, maxAttempts: 2),
-                  measuredFramesAgree(current.frame, expectedPartial, tolerance: frameVerificationTolerance) else {
-                return .failure(.verificationUnavailable)
-            }
-            if let failure = writeGeometryAttribute(
-                .position, to: element, value: positionValue, expectedWindowID: expectedWindowID, sample: current,
-                onlyIfCurrentMatches: expectedPartial, frameVerificationTolerance: frameVerificationTolerance,
-                checkWriteAdmission: checkWriteAdmission,
-                onAttempt: { _ in recordAttempt(intendedWindowFrame) }
-            ) {
-                return .failure(needsSize && failure == .operationBudgetExhausted ? .verificationUnavailable : failure)
-            }
-        }
-
-        guard let actualFrame = frame(of: element, maxAttempts: 2) else {
-            return .failure(.verificationUnavailable)
-        }
-        guard measuredFramesAgree(actualFrame, intendedWindowFrame, tolerance: frameVerificationTolerance) else {
-            return .failure(.verificationMismatch(expected: intendedWindowFrame, actual: actualFrame))
-        }
-        return .success(actualFrame)
-    }
-
-    private func rollbackResult(
-        after failure: AXWindowFrameWriteFailure,
-        to restoreFrame: CGRect?,
-        for element: AXUIElement,
-        attemptedFrames: [CGRect],
-        frameVerificationTolerance: CGFloat,
-        expectedWindowID: CGWindowID?,
-        checkWriteAdmission: () -> AXWindowFrameWriteFailure?
-    ) -> AXWindowFrameRollbackResult {
-        guard failure.mayHaveMutatedWindow, let restoreFrame else {
-            return .notRequested
-        }
-
-        guard let current = frame(of: element, maxAttempts: 1) else {
-            return .failed(reason: .verificationUnavailable, actualFrame: nil)
-        }
-        guard AXWindowFrameRollbackPolicy.accepts(current, attemptedFrames: attemptedFrames, tolerance: frameVerificationTolerance) else {
-            return .failed(reason: .initialFrameMismatch(expected: attemptedFrames.last ?? restoreFrame, actual: current), actualFrame: current)
-        }
-        switch writeFrame(
-            restoreFrame,
-            to: element,
-            frameVerificationTolerance: frameVerificationTolerance,
-            onlyIfCurrentMatches: current,
-            expectedWindowID: expectedWindowID,
-            checkWriteAdmission: checkWriteAdmission
-        ) {
-        case let .success(actualFrame):
-            return .restored(actualFrame: actualFrame)
-        case let .failure(reason):
-            return .failed(
-                reason: reason,
-                actualFrame: frame(of: element, maxAttempts: 1)
-            )
-        }
-    }
-
-    private func isValid(size: CGSize) -> Bool {
-        size.width.isFinite && size.height.isFinite && size.width > 0 && size.height > 0
-    }
-
-    private func isValid(_ geometry: GeometryWrite) -> Bool {
-        switch geometry {
-        case let .size(size): isValid(size: size)
-        case let .frame(frame): isValid(frame: frame)
-        }
-    }
-
-    private func isValid(frame: CGRect) -> Bool {
-        frame.origin.x.isFinite
-            && frame.origin.y.isFinite
-            && isValid(size: frame.size)
-    }
-
-    private func isValid(tolerance: CGFloat) -> Bool {
-        tolerance.isFinite && tolerance >= 0
-    }
-
-    private func measuredFramesAgree(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat) -> Bool {
-        pointsMatch(lhs.origin, rhs.origin, tolerance: tolerance)
-            && sizesMatch(lhs.size, rhs.size, tolerance: tolerance)
-    }
-
-    private func pointsMatch(_ lhs: CGPoint, _ rhs: CGPoint, tolerance: CGFloat) -> Bool {
-        abs(lhs.x - rhs.x) <= tolerance && abs(lhs.y - rhs.y) <= tolerance
-    }
-
-    private func sizesMatch(_ lhs: CGSize, _ rhs: CGSize, tolerance: CGFloat) -> Bool {
-        abs(lhs.width - rhs.width) <= tolerance && abs(lhs.height - rhs.height) <= tolerance
-    }
-
     private func applyMessagingTimeout(_ timeout: TimeInterval?, to element: AXUIElement) {
         guard let timeout else { return }
         let boundedTimeout = min(timeout, budget?.remaining ?? timeout)
@@ -1438,12 +982,18 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
 
 }
 
+enum WindowPlatformABI {
+    static let validatedMajorVersion = 27
+    static let isValidated = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == validatedMajorVersion
+}
+
 enum AXWindowIDBridge {
     typealias GetWindowFunction = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
 
     static let fallbackAttributeNames = ["AXWindowID", "AXWindowNumber"]
 
     private static let getWindowFunction: GetWindowFunction? = {
+        guard WindowPlatformABI.isValidated else { return nil }
         let frameworkPaths = [
             "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
             "/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices"
@@ -1466,11 +1016,11 @@ enum AXWindowIDBridge {
         return nil
     }()
 
-    static func cgWindowID(for element: AXUIElement) -> UInt32? {
+    static func cgWindowID(for element: AXUIElement, access: RuntimeAccessibilityAccess) -> UInt32? {
         guard let getWindowFunction else { return nil }
 
         var windowID = CGWindowID(0)
-        guard getWindowFunction(element, &windowID) == .success else {
+        guard access.call({ getWindowFunction(element, &windowID) }) == .success else {
             return nil
         }
         return windowID == 0 ? nil : UInt32(windowID)
@@ -1491,42 +1041,3 @@ enum AXWindowIDBridge {
         return nil
     }
 }
-
-#if DEBUG
-extension AXWindowFrameAttribute {
-    var diagnosticDescription: String {
-        switch self { case .position: return "position"; case .size: return "size" }
-    }
-}
-
-extension AXWindowFrameWriteFailure {
-    var diagnosticDescription: String {
-        switch self {
-        case .invalidGeometry: return "invalidGeometry"
-        case .initialFrameUnavailable: return "initialFrameUnavailable"
-        case let .initialFrameMismatch(expected, actual):
-            return "initialFrameMismatch(expected:\(WindowFrameMatchPolicy.signature(for: expected)),actual:\(WindowFrameMatchPolicy.signature(for: actual)))"
-        case .windowIdentityUnavailable: return "windowIdentityUnavailable"
-        case .windowIdentityChanged: return "windowIdentityChanged"
-        case let .capabilityQueryFailed(attribute, error): return "capabilityQueryFailed(\(attribute.diagnosticDescription),\(error.rawValue))"
-        case let .attributeNotSettable(attribute): return "attributeNotSettable(\(attribute.diagnosticDescription))"
-        case let .valueCreationFailed(attribute): return "valueCreationFailed(\(attribute.diagnosticDescription))"
-        case .operationBudgetExhausted: return "operationBudgetExhausted"
-        case let .writeFailed(attribute, error): return "writeFailed(\(attribute.diagnosticDescription),\(error.rawValue))"
-        case .verificationUnavailable: return "verificationUnavailable"
-        case let .verificationMismatch(expected, actual):
-            return "verificationMismatch(expected:\(WindowFrameMatchPolicy.signature(for: expected)),actual:\(WindowFrameMatchPolicy.signature(for: actual)))"
-        }
-    }
-}
-
-extension AXWindowFrameRollbackResult {
-    var diagnosticDescription: String {
-        switch self {
-        case .notRequested: return "notRequested"
-        case let .restored(actual): return "restored(\(WindowFrameMatchPolicy.signature(for: actual)))"
-        case let .failed(reason, actual): return "failed(\(reason.diagnosticDescription),\(WindowFrameMatchPolicy.signature(for: actual)))"
-        }
-    }
-}
-#endif

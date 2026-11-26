@@ -26,9 +26,9 @@ final class IntentPipeline {
     func plan(
         intent: UserIntent,
         snapshot: DockSnapshot,
-        optimisticStates: [String: OptimisticWindowState] = [:]
+        pendingMinimize: Bool = false
     ) -> PlatformActionRequest {
-        actionPlanning.plan(intent: intent, snapshot: snapshot, optimisticStates: optimisticStates)
+        actionPlanning.plan(intent: intent, snapshot: snapshot, pendingMinimize: pendingMinimize)
     }
 
     func canBegin(intent: UserIntent) -> Bool {
@@ -78,17 +78,6 @@ final class IntentPipeline {
         case .closeWindow:
             return .close
         }
-    }
-}
-
-enum FeedbackTickPolicy {
-    static func shouldTick(
-        isRunning: Bool,
-        hasFeedbackEntries: Bool,
-        hasOptimisticStates: Bool
-    ) -> Bool {
-        guard isRunning else { return false }
-        return hasFeedbackEntries || hasOptimisticStates
     }
 }
 

@@ -312,9 +312,7 @@ jobs:
                   process.env.RELEASE_NOTES,
                   'Apple Silicon app for macOS 27 or later. Ad-hoc signed.',
                   'The installable app ZIP is attached.',
-                  "Source is available through GitHub's standard Source code archives for this release tag.",
-                  'Mac acceptance checklist: https://github.com/' + context.repo.owner + '/' + context.repo.repo
-                    + '/blob/' + sourceSHA + '/AGENTS.md'
+                  "Source is available through GitHub's standard Source code archives for this release tag."
                 ].filter(Boolean).join('\n\n')
               }));
               await requireExpectedTag();

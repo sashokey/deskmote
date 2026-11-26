@@ -51,7 +51,6 @@ final class TaskbarRendererTests: XCTestCase {
     private final class Popup: TaskbarPopupPresenting {
         var panel: NSPanel? { nil }
         var isPresented: Bool { content != nil }
-        var onPresent: ((NSPanel) -> Void)?
         var onDismiss: (() -> Void)?
         var content: NSView?
         var presentations = 0
@@ -87,7 +86,7 @@ final class TaskbarRendererTests: XCTestCase {
         let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
             .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
         let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        XCTAssertEqual(selection.frame, CGRect(x: 0, y: 0, width: 29, height: 28))
+        XCTAssertEqual(button.convert(selection.frame, to: content), AppsMenuGeometry.buttonFrame)
         XCTAssertEqual(selection.cornerRadius, TaskbarMetrics.buttonCornerRadius)
         XCTAssertEqual(selection.alphaValue, 0)
         let reference = TaskbarButtonView(frame: button.frame)
@@ -197,6 +196,39 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertFalse(panel.isVisible)
     }
 
+    func testAppsButtonOpensAtTheBottomLeftCorner() throws {
+        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
+        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        defer { panel.close() }
+        let popup = Popup()
+        let content = TaskbarContentView(frame: frame, popup: popup)
+        panel.contentView = content
+        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
+        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
+            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
+        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
+        content.layoutSubtreeIfNeeded()
+
+        let points = [CGPoint(x: 0, y: frame.maxY - 1),
+                      CGPoint(x: 0.5, y: frame.maxY - 0.5),
+                      CGPoint(x: 0.25, y: frame.maxY - 0.25)]
+        for point in points {
+            panel.pointer = content.convert(point, to: nil)
+            button.updateTrackingAreas()
+            XCTAssertGreaterThan(selection.alphaValue, 0)
+            let target = try XCTUnwrap(content.hitTest(panel.pointer) as? NSButton, "Corner \(point)")
+            XCTAssertTrue(target === button)
+            target.performClick(nil)
+            XCTAssertTrue(popup.content is AppsMenuView)
+            content.dismissAppsMenu()
+            XCTAssertFalse(popup.isPresented)
+            XCTAssertEqual(button.convert(selection.frame, to: content), CGRect(x: 10, y: 2, width: 29, height: 28))
+        }
+        let neighboringGap = content.convert(CGPoint(x: 40, y: frame.maxY - 0.5), to: nil)
+        XCTAssertFalse(content.hitTest(neighboringGap) === button)
+    }
+
     func testAppsButtonHoverFollowsTheCurrentPointerWhenTrackingEventsArriveLate() throws {
         let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
         let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -297,7 +329,7 @@ final class TaskbarRendererTests: XCTestCase {
         let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
         XCTAssertEqual(button.convert(selection.frame, to: content), AppsMenuGeometry.buttonFrame)
         button.performClick(nil)
-        XCTAssertTrue(popup.content is AppsMenuView)
+        let firstMenu = try XCTUnwrap(popup.content as? AppsMenuView)
         XCTAssertEqual(admissions, [true])
         XCTAssertTrue(content.hasExplicitPopup)
         XCTAssertEqual(button.state, .on)
@@ -319,6 +351,7 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertEqual(selection.alphaValue, 0)
 
         button.performClick(nil)
+        XCTAssertTrue(popup.content === firstMenu)
         XCTAssertTrue(content.hasExplicitPopup)
         content.prepareForHiding()
         XCTAssertFalse(content.hasExplicitPopup)
@@ -495,7 +528,7 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertNil(view.taskbarContent.buttonViews["group:test.editor"])
     }
 
-    func testTaskbarButtonRespondsToPointerClicksWithoutKeyboardOrAccessibilityActions() throws {
+    func testTaskbarButtonRespondsToPointerClicksWithoutAccessibilityActions() throws {
         let context = ContextMenu()
         let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 800, height: 32), contextMenu: context)
         var toggled: [String] = []
@@ -510,12 +543,7 @@ final class TaskbarRendererTests: XCTestCase {
         button.mouseUp(with: mouseEvent(.leftMouseUp, point: point, in: button))
         XCTAssertNil(context.menu)
         toggled.removeAll()
-        for code: UInt16 in [36, 49] {
-            let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-                timestamp: 0, windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
-                isARepeat: false, keyCode: code))
-            button.keyDown(with: event)
-        }
+
         XCTAssertFalse(button.acceptsFirstResponder)
         XCTAssertFalse(button.accessibilityPerformPress())
         XCTAssertFalse(button.accessibilityPerformShowMenu())
@@ -739,7 +767,7 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertEqual(popup.keyRequests, 1)
     }
 
-    func testPopupListIgnoresKeyboardAndAccessibilityActions() throws {
+    func testPopupListIgnoresAccessibilityActions() throws {
         _ = NSApplication.shared
         let panel = RecordingPopupPanel(contentRect: CGRect(x: 0, y: 0, width: 216, height: 120),
                                          styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -759,12 +787,6 @@ final class TaskbarRendererTests: XCTestCase {
         let row = try XCTUnwrap(list.nativeRow(at: 0))
         XCTAssertFalse(row.accessibilityPerformPress())
         XCTAssertTrue(row.accessibilityCustomActions()?.isEmpty ?? true)
-        for code: UInt16 in [125, 125, 36, 53] {
-            let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
-                windowNumber: panel.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "",
-                isARepeat: false, keyCode: code))
-            panel.sendEvent(event)
-        }
         XCTAssertTrue(activated.isEmpty)
         XCTAssertEqual(list.tableView.selectedRow, -1)
         XCTAssertTrue(controller.isPresented)
@@ -838,36 +860,44 @@ final class TaskbarRendererTests: XCTestCase {
         let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
         let animatedFrame = CGRect(x: 12, y: 32, width: 642, height: 688)
         let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        let controller = TaskbarPopupController(makePanel: { _ in panel }, reduceMotion: { false })
+        var tick: (@MainActor (TimeInterval) -> Void)?
+        let controller = TaskbarPopupController(makePanel: { _ in panel }, reduceMotion: { false },
+                                                appsFrameSource: { _, update in
+            tick = update
+            return { tick = nil }
+        })
         defer { controller.dismissImmediately() }
-        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] })) {}
+        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [],
+            runningApplicationSnapshot: { [] }), deferCatalog: true) {}
         controller.present(content: menu, frame: frame, anchorWindow: nil)
         XCTAssertFalse(panel.hasShadow)
         XCTAssertEqual(panel.frameAtFront, animatedFrame)
         let viewport = try XCTUnwrap(panel.contentView)
         XCTAssertTrue(viewport.clipsToBounds)
-        XCTAssertEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)), frame)
-        XCTAssertTrue(viewport.bounds.contains(menu.frame.offsetBy(dx: 0, dy: -6)))
-        let catalog = try XCTUnwrap(menu.contentView?.subviews.compactMap { $0 as? NSScrollView }.first)
-        XCTAssertNil(catalog.contentView.layer?.animation(forKey: "apps-popup-slide"))
-        let opening = try XCTUnwrap(menu.layer?.animation(forKey: "apps-popup-slide") as? CAKeyframeAnimation)
-        XCTAssertEqual(opening.duration, 0.19, accuracy: 0.001)
-        XCTAssertEqual((opening.values?.first as? NSNumber)?.doubleValue, -animatedFrame.height)
-        XCTAssertEqual((opening.values?.last as? NSNumber)?.doubleValue, 0)
-        XCTAssertTrue(controller.isPresented)
-        XCTAssertNil(panel.contentView?.hitTest(CGPoint(x: 100, y: 100)))
+        XCTAssertEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)),
+                       frame.offsetBy(dx: 0, dy: -animatedFrame.height))
+        XCTAssertNil(viewport.hitTest(CGPoint(x: 100, y: 100)))
+        XCTAssertTrue(menu.catalogDeferredUntilFrame)
+
+        let search = try XCTUnwrap(menu.contentView?.subviews.compactMap { $0 as? NSSearchField }.first)
+        tick?(0.19 * 0.84)
+        XCTAssertTrue(menu.catalogDeferredUntilFrame)
+        let searchPoint = search.convert(CGPoint(x: search.bounds.midX, y: search.bounds.midY), to: viewport.superview)
+        let hit = try XCTUnwrap(viewport.hitTest(searchPoint))
+        XCTAssertTrue(hit === search || hit.isDescendant(of: search))
+
         let movedFrame = frame.offsetBy(dx: 24, dy: 40)
         let movedAnimatedFrame = animatedFrame.offsetBy(dx: 24, dy: 40)
         controller.updateFrame(movedFrame)
         XCTAssertEqual(panel.frame, movedAnimatedFrame)
-        XCTAssertEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)), movedFrame)
-        let search = try XCTUnwrap(menu.contentView?.subviews.compactMap { $0 as? NSSearchField }.first)
+        tick?(0.18)
+        XCTAssertFalse(menu.catalogDeferredUntilFrame)
+        XCTAssertNotEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)), movedFrame)
         XCTAssertTrue(panel.makeFirstResponder(search))
         XCTAssertNotNil(search.currentEditor())
-        let openingDeadline = ContinuousClock.now + .seconds(1)
-        while panel.frame != movedFrame, ContinuousClock.now < openingDeadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
+
+        tick?(0.19)
+        XCTAssertNil(tick)
         XCTAssertEqual(panel.frame, movedFrame)
         XCTAssertEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)), movedFrame)
 
@@ -876,8 +906,6 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertTrue(panel.ignoresMouseEvents)
         XCTAssertNil(search.currentEditor())
         XCTAssertEqual(panel.frame, movedAnimatedFrame)
-        XCTAssertEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)), movedFrame)
-        XCTAssertTrue(viewport.bounds.contains(menu.frame.offsetBy(dx: 0, dy: -6)))
         let closing = try XCTUnwrap(menu.layer?.animation(forKey: "apps-popup-slide") as? CAKeyframeAnimation)
         XCTAssertEqual(closing.duration, 0.19, accuracy: 0.001)
         XCTAssertEqual((closing.values?.first as? NSNumber)?.doubleValue, 0)
@@ -888,6 +916,41 @@ final class TaskbarRendererTests: XCTestCase {
         }
         XCTAssertNil(panel.contentView)
         XCTAssertFalse(panel.isVisible)
+    }
+
+    func testClosingAppsDuringOpeningStartsFromItsVisiblePositionAndCanReopenImmediately() throws {
+        let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
+        var panels: [RecordingPopupPanel] = []
+        var tick: (@MainActor (TimeInterval) -> Void)?
+        let controller = TaskbarPopupController(makePanel: { frame in
+            let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+            panels.append(panel)
+            return panel
+        }, reduceMotion: { false }, appsFrameSource: { _, update in
+            tick = update
+            return { tick = nil }
+        })
+        defer { controller.dismissImmediately() }
+        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [],
+            runningApplicationSnapshot: { [] })) {}
+        controller.present(content: menu, frame: frame, anchorWindow: nil)
+        let panel = try XCTUnwrap(panels.last)
+        tick?(0.095)
+        let offset = panel.convertToScreen(menu.convert(menu.bounds, to: nil)).minY - frame.minY
+
+        controller.dismiss()
+        XCTAssertNil(tick)
+        let closing = try XCTUnwrap(menu.layer?.animation(forKey: "apps-popup-slide") as? CAKeyframeAnimation)
+        let start = try XCTUnwrap(closing.values?.first as? NSNumber)
+        XCTAssertEqual(start.doubleValue, offset, accuracy: 0.001)
+
+        menu.prepareForPresentation(size: frame.size)
+        controller.present(content: menu, frame: frame, anchorWindow: nil)
+        XCTAssertNil(panel.contentView)
+        XCTAssertNotNil(tick)
+        tick?(0.19)
+        XCTAssertEqual(panels.last?.frame, frame)
+        XCTAssertTrue(controller.isPresented)
     }
 
     func testAppsPopupClipsItsMaterialToRoundedCornersInHiddenPanel() throws {

@@ -188,6 +188,50 @@ final class WindowSpaceVisibilityTests: XCTestCase {
         }
     }
 
+    func testBatchReadsOnlyRequestedDisplayAndUsesScalarForNonDesktopWindows() {
+        let additional = identity("additional", pid: 43, windowID: 102)
+        let requests = [
+            WindowSpaceRequest(identity: window, isParked: false, isOnDesktop: true, displayUUID: "left"),
+            WindowSpaceRequest(identity: other, isParked: false, isOnDesktop: true, displayUUID: "left"),
+            WindowSpaceRequest(identity: additional, isParked: false, isOnDesktop: false, displayUUID: "left")
+        ]
+        var batches: [Int] = []
+        var scalars: [Int] = []
+        let snapshot = WindowSpaceObservation.capture(
+            requests, cancellation: OperationCancellation(),
+            layouts: { ["left": layout(1, spaces: [1], fullscreen: []),
+                        "right": layout(10, spaces: [10, 11], fullscreen: [])] },
+            membership: { number in
+                scalars.append(number)
+                return [1]
+            },
+            mode: .batch, windowsInSpace: { space in
+                batches.append(space)
+                return [100, 101, 102]
+            }
+        )
+        XCTAssertEqual(batches, [1])
+        XCTAssertEqual(scalars, [102])
+        XCTAssertEqual(snapshot?.memberships, [window: [1], other: [1], additional: [1]])
+    }
+
+    func testMembershipDiagnosticsRetainSuccessfulScalarFallback() throws {
+        let batchFailure = SpaceReadFailure(api: WindowSpaceMembershipReader.batchAPI, reason: .symbolUnavailable)
+        let scalarFailure = SpaceReadFailure(api: WindowSpaceMembershipReader.membershipAPI, reason: .invalidType,
+                                            field: "response")
+        let requests = [window, other].map {
+            WindowSpaceRequest(identity: $0, isParked: false, isOnDesktop: true, displayUUID: "left")
+        }
+        let result = try WindowSpaceObservation.readMemberships(
+            requests, layouts: ["left": layout(1, spaces: [1], fullscreen: [])],
+            cancellation: OperationCancellation(),
+            membership: { $0 == 100 ? .success([1]) : .failure(scalarFailure) },
+            windowsInSpace: { _ in .failure(batchFailure) }
+        ).get()
+        XCTAssertEqual(result.memberships, [window: [1]])
+        XCTAssertEqual(result.failures, [batchFailure, scalarFailure])
+    }
+
     func testVerificationDiscardsTheSnapshotIfSpacesChangeDuringComparison() {
         let third = identity("third", pid: 43, windowID: 102)
         let requests = [window, other, third].map {
@@ -383,5 +427,30 @@ final class WindowSpaceVisibilityTests: XCTestCase {
         XCTAssertNil(ManagedSpaceLayoutReader.parse([["Display Identifier": "left",
             "Current Space": ["ManagedSpaceID": 3], "Spaces": [["ManagedSpaceID": 1, "type": 0]]]]))
         XCTAssertNil(ManagedSpaceLayoutReader.parse([["Display Identifier": "left", "Spaces": []]]))
+    }
+
+    func testUnknownSpaceTypeAndDuplicateDisplayDoNotProduceUsableLayouts() {
+        XCTAssertNil(ManagedSpaceLayoutReader.parse([
+            ["Display Identifier": "left", "Current Space": ["ManagedSpaceID": 1],
+             "Spaces": [["ManagedSpaceID": 1, "type": 8]]]
+        ]))
+        let known: [String: Any] = [
+            "Display Identifier": "left", "Current Space": ["ManagedSpaceID": 1],
+            "Spaces": [["ManagedSpaceID": 1, "type": 0]]
+        ]
+        XCTAssertNil(ManagedSpaceLayoutReader.parse([known, known]))
+    }
+
+    func testLayoutFailureIdentifiesSchemaFieldAndUnexpectedType() {
+        let changed: [[String: Any]] = [
+            ["Display Identifier": "left", "Current Space": ["ManagedSpaceID": 1],
+             "Spaces": [["ManagedSpaceID": 1, "type": 8]]]
+        ]
+        XCTAssertEqual(ManagedSpaceLayoutReader.parseChecked(changed), .failure(SpaceReadFailure(
+            api: "SLSCopyManagedDisplaySpaces", reason: .unknownSpaceType, field: "Space type", value: 8
+        )))
+        XCTAssertEqual(ManagedSpaceLayoutReader.parseChecked(["Spaces": []]), .failure(SpaceReadFailure(
+            api: "SLSCopyManagedDisplaySpaces", reason: .invalidType, field: "displays"
+        )))
     }
 }

@@ -17,35 +17,33 @@ private final class RuntimeInventory: WindowInventoryTracking {
 
 private final class RuntimeExecutor: WindowActionExecuting {
     let calls = Mutex(0)
-    let predictionReported = Mutex(false)
+    let commands = Mutex<[PlatformActionRequest.ActionKind]>([])
     let gates = (0..<4).map { _ in DispatchSemaphore(value: 0) }
     let results: [Bool]
-    let predictedWindow: WindowID?
-    let predictionGate: DispatchSemaphore?
+    private let nativeFocus: (@Sendable (WindowRecord) -> Bool)?
     private let gateDeadline: @Sendable () -> DispatchTime
 
-    init(results: [Bool], predictedWindow: WindowID? = nil, pauseAfterPrediction: Bool = false,
+    init(results: [Bool], nativeFocus: (@Sendable (WindowRecord) -> Bool)? = nil,
          gateDeadline: @escaping @Sendable () -> DispatchTime = { .now() + 3 }) {
         self.results = results
+        self.nativeFocus = nativeFocus
         self.gateDeadline = gateDeadline
-        self.predictedWindow = predictedWindow
-        predictionGate = pauseAfterPrediction ? DispatchSemaphore(value: 0) : nil
+    }
+
+    func hasNativeFocus(_ record: WindowRecord, cancellation: OperationCancellation) -> Bool {
+        !cancellation.isCancelled && (nativeFocus?(record) ?? (record.status == .active))
     }
 
     func execute(_ request: PlatformActionRequest, snapshot: DockSnapshot,
                  forcedMinimizedPrior: Bool, cancellation: OperationCancellation,
-                 onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?) -> Bool {
+                 onHandoffTarget: (@Sendable (WindowID) -> Void)?) -> Bool {
+        commands.withLock { $0.append(request.kind) }
         let index = calls.withLock { value in
             defer { value += 1 }
             return value
         }
         guard gates.indices.contains(index), results.indices.contains(index) else { return false }
         guard gates[index].wait(timeout: gateDeadline()) == .success else { return false }
-        if let predictedWindow, let onHandoffActivePrediction, index == 0 {
-            onHandoffActivePrediction(predictedWindow)
-            predictionReported.withLock { $0 = true }
-            if let predictionGate, predictionGate.wait(timeout: gateDeadline()) != .success { return false }
-        }
         return results[index]
     }
 }
@@ -150,7 +148,7 @@ final class AppRuntimeTests: XCTestCase {
             let runtime = runtime
             presenters = zip(views, displays).map { view, display in
                 TaskbarPresenter(view: view, runtime: runtime, ordering: ordering, topology: topology, spaces: spaces,
-                                 displayUUID: display, backgroundMenu: { _, _ in }, popupPresented: { _ in },
+                                 displayUUID: display, backgroundMenu: { _, _ in },
                                  contextMenuVisibilityChanged: { _ in }, system: system)
             }
             runtime.start()
@@ -197,7 +195,7 @@ final class AppRuntimeTests: XCTestCase {
         }
     }
 
-    func testNewNativeFocusReplacesCrossApplicationActivationPrediction() async {
+    func testNativeFocusIsPublishedWithoutPredictingAnEarlierActivation() async {
         let executor = RuntimeExecutor(results: [true, true])
         let panels = FocusPanels(executor: executor, actual: nil)
         defer { panels.stop() }
@@ -205,7 +203,7 @@ final class AppRuntimeTests: XCTestCase {
         panels.runtime.activate(windowID: "steam")
         await waitUntil { executor.calls.withLock { $0 } == 1 }
         await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
+        XCTAssertTrue(panels.highlights.isEmpty)
 
         panels.focus("chrome")
         await drainFocusPanels()
@@ -217,7 +215,7 @@ final class AppRuntimeTests: XCTestCase {
         for task in panels.runtime.pendingActionsForTesting { await task.value }
     }
 
-    func testPendingActivationExclusivelyHighlightsChromeAndFailureRestoresNativeSteam() async {
+    func testPendingAndFailedActivationPreserveTheConfirmedWindowHighlight() async {
         let executor = RuntimeExecutor(results: [false])
         let panels = FocusPanels(executor: executor, actual: "steam")
         defer { panels.stop() }
@@ -228,7 +226,7 @@ final class AppRuntimeTests: XCTestCase {
         await waitUntil { executor.calls.withLock { $0 } == 1 }
         panels.focus("steam")
         await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
+        XCTAssertEqual(panels.highlights, ["steam"])
 
         executor.gates[0].signal()
         for task in panels.runtime.pendingActionsForTesting { await task.value }
@@ -236,7 +234,36 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(panels.highlights, ["steam"])
     }
 
-    func testLateOlderActivationSuccessCannotOverrideChromeOrReappearAfterItsFailure() async {
+    func testRapidToggleCannotMinimizeAnUnconfirmedActivation() async {
+        let executor = RuntimeExecutor(results: [true, true])
+        let (runtime, _) = await start(executor, activeWindowID: "window-1")
+        defer { runtime.stop() }
+
+        runtime.toggle(windowID: "window-2")
+        await waitUntil { executor.calls.withLock { $0 } == 1 }
+        runtime.toggle(windowID: "window-2")
+
+        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-2"]?.action, .activate)
+        executor.gates[0].signal()
+        executor.gates[1].signal()
+        for task in runtime.pendingActionsForTesting { await task.value }
+    }
+
+    func testToggleActivatesTheExactWindowWhenNativeFocusHasMoved() async {
+        let executor = RuntimeExecutor(results: [true], nativeFocus: { _ in false })
+        let (runtime, _) = await start(executor, activeWindowID: "window-1")
+        defer { executor.gates[0].signal(); runtime.stop() }
+        runtime.toggle(windowID: "window-1")
+        await waitUntil { executor.calls.withLock { $0 } == 1 }
+        executor.gates[0].signal()
+        for task in runtime.pendingActionsForTesting { await task.value }
+
+        XCTAssertEqual(executor.commands.withLock { $0 }, [.activateWindow])
+        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-1"]?.action, .activate)
+        XCTAssertNil(runtime.pendingMinimizations["window-1"])
+    }
+
+    func testOverlappingResultsDoNotCreateAHighlightWithoutFocus() async {
         let executor = RuntimeExecutor(results: [true, false])
         let panels = FocusPanels(executor: executor, actual: nil)
         defer { panels.stop() }
@@ -245,12 +272,12 @@ final class AppRuntimeTests: XCTestCase {
         await waitUntil { executor.calls.withLock { $0 } == 1 }
         panels.runtime.activate(windowID: "chrome")
         await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
+        XCTAssertTrue(panels.highlights.isEmpty)
 
         executor.gates[0].signal()
         await waitUntil { executor.calls.withLock { $0 } == 2 }
         await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
+        XCTAssertTrue(panels.highlights.isEmpty)
 
         executor.gates[1].signal()
         for task in panels.runtime.pendingActionsForTesting { await task.value }
@@ -258,7 +285,7 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(panels.highlights, [])
     }
 
-    func testNativeConfirmationOfAnOlderActivationWaitsBehindNewerPendingChrome() async {
+    func testNativeConfirmationIsRenderedWhileANewerActivationIsPending() async {
         let executor = RuntimeExecutor(results: [true, false])
         let panels = FocusPanels(executor: executor, actual: nil)
         defer { panels.stop() }
@@ -270,7 +297,7 @@ final class AppRuntimeTests: XCTestCase {
         executor.gates[0].signal()
         await waitUntil { executor.calls.withLock { $0 } == 2 }
         await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
+        XCTAssertEqual(panels.highlights, ["steam"])
 
         executor.gates[1].signal()
         for task in panels.runtime.pendingActionsForTesting { await task.value }
@@ -278,349 +305,21 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(panels.highlights, ["steam"])
     }
 
-    func testReturnToTheInitialNativeFocusSupersedesTheNewestPendingActivation() async {
-        let executor = RuntimeExecutor(results: [true, true, true])
-        let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true)
-        defer { executor.gates.forEach { $0.signal() }; panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.activate(windowID: "chrome")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        panels.runtime.activate(windowID: "safari")
-
-        panels.focus("chrome")
-        executor.gates[0].signal()
-        await waitUntil { executor.calls.withLock { $0 } == 2 }
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["safari"])
-        panels.focus("chrome", title: "New Chrome title")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["safari"])
-
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
-        panels.runtime.toggle(windowID: "safari")
-        XCTAssertEqual(panels.runtime.debugState.feedbackEntriesByWindowID["safari"]?.action, .activate)
-        executor.gates[1].signal()
-        executor.gates[2].signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testDirectFocusAfterAnOlderActivationFailureSupersedesTheNewerPrediction() async {
-        let executor = RuntimeExecutor(results: [false, true])
-        let panels = FocusPanels(executor: executor, actual: nil)
-        defer { executor.gates.forEach { $0.signal() }; panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.activate(windowID: "steam")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        panels.runtime.activate(windowID: "chrome")
-        executor.gates[0].signal()
-        await waitUntil { executor.calls.withLock { $0 } == 2 }
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
-        executor.gates[1].signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testOlderActivationFailureReconsidersNativeFocusSeenBeforeTheResult() async {
-        let executor = RuntimeExecutor(results: [false, true])
-        let panels = FocusPanels(executor: executor, actual: nil)
-        defer { executor.gates.forEach { $0.signal() }; panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.activate(windowID: "steam")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        panels.runtime.activate(windowID: "chrome")
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        executor.gates[0].signal()
-        await waitUntil { executor.calls.withLock { $0 } == 2 }
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
-        executor.gates[1].signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testOlderWindowRemovalReconsidersTheIncomingNativeSnapshot() async {
-        let executor = RuntimeExecutor(results: [false, true])
-        let panels = FocusPanels(executor: executor, actual: nil)
-        defer { executor.gates.forEach { $0.signal() }; panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.activate(windowID: "steam")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        panels.runtime.activate(windowID: "chrome")
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        var snapshot = panels.runtime.snapshot
-        let removed = WindowID(rawValue: "steam")
-        snapshot.windows.removeValue(forKey: removed)
-        snapshot.orderedWindowIDs.removeAll { $0 == removed }
-        panels.inventory.values.send(snapshot)
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-        executor.gates[0].signal()
-        executor.gates[1].signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testCloseRemovesTheSupersededActivationBeforeAnotherWindowIsToggled() async {
-        let executor = RuntimeExecutor(results: [false, true, true])
-        let panels = FocusPanels(executor: executor, actual: "steam")
-        defer { executor.gates.forEach { $0.signal() }; panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.activate(windowID: "chrome")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        panels.runtime.close(windowID: "chrome")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
-        executor.gates[0].signal()
-        await waitUntil { executor.calls.withLock { $0 } == 2 }
-        panels.runtime.toggle(windowID: "steam")
-        XCTAssertEqual(panels.runtime.debugState.feedbackEntriesByWindowID["steam"]?.action, .minimize)
-        executor.gates[1].signal()
-        executor.gates[2].signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testDirectFocusToAStillQueuedEarlierTargetSupersedesTheNewerPrediction() async {
-        let executor = RuntimeExecutor(results: [true, true, true])
-        let panels = FocusPanels(executor: executor, actual: nil, includesSafari: true)
-        defer { executor.gates.forEach { $0.signal() }; panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.close(windowID: "safari")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        panels.runtime.activate(windowID: "steam")
-        panels.runtime.activate(windowID: "chrome")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
-        XCTAssertEqual(executor.calls.withLock { $0 }, 1)
-        executor.gates.forEach { $0.signal() }
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testCloseHandoffSurvivesAnUpdateFromItsStillFocusedSourceUntilNewNativeFocus() async {
-        let executor = RuntimeExecutor(results: [true], predictedWindow: WindowID(rawValue: "chrome"),
-                                       pauseAfterPrediction: true)
-        let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true)
-        defer { executor.gates[0].signal(); executor.predictionGate?.signal(); panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.close(windowID: "steam")
-        executor.gates[0].signal()
-        await waitUntil { panels.highlights == ["chrome"] }
-
-        panels.focus("steam", title: "Closing Steam window")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        panels.focus("safari")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["safari"])
-        executor.predictionGate?.signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testCloseHandoffAcceptsNewlyConfirmedExactSourceAndRejectsUnrelatedFocus() async {
-        for (actual, expected) in [("steam", "chrome"), ("safari", "safari")] {
-            let executor = RuntimeExecutor(results: [true], predictedWindow: WindowID(rawValue: "chrome"),
-                                           pauseAfterPrediction: true)
-            let panels = FocusPanels(executor: executor, actual: nil, includesSafari: true)
-            defer { executor.gates[0].signal(); executor.predictionGate?.signal(); panels.stop() }
-            await waitUntil { panels.ready }
-            panels.runtime.close(windowID: "steam")
-            await waitUntil { executor.calls.withLock { $0 } == 1 }
-            panels.focus(actual)
-            await drainFocusPanels()
-            XCTAssertEqual(panels.highlights, [actual])
-
-            executor.gates[0].signal()
-            executor.predictionGate?.signal()
-            for task in panels.runtime.pendingActionsForTesting { await task.value }
-            await drainFocusPanels()
-            XCTAssertEqual(panels.highlights, [expected])
-        }
-    }
-
-    func testCancelledQueuedActivationDoesNotBlockAnEarlierValidCloseHandoff() async throws {
-        let now = ContinuousClock.now
-        let executor = RuntimeExecutor(results: [true], predictedWindow: WindowID(rawValue: "safari"),
-                                       pauseAfterPrediction: true, gateDeadline: { .distantFuture })
-        let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true, monotonicNow: { now })
-        defer { executor.gates[0].signal(); executor.predictionGate?.signal(); panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.close(windowID: "steam")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        let id = WindowID(rawValue: "chrome")
-        let target = try XCTUnwrap(panels.runtime.snapshot.windows[id]?.actionIdentity)
-        let invalidations = PassthroughSubject<Void, Never>()
-        panels.runtime.trigger(.activate(id), expected: target, projectionInvalidations: invalidations.eraseToAnyPublisher(),
-                               isProjectionCurrent: { true })
-        await waitUntil { panels.highlights == ["chrome"] }
-        invalidations.send(())
-        await waitUntil { panels.highlights == ["steam"] }
-        XCTAssertEqual(executor.calls.withLock { $0 }, 1)
-
-        executor.gates[0].signal()
-        await waitUntil { panels.runtime.optimisticStatesByWindowID["safari"]?.systemPredicted == true }
-        executor.predictionGate?.signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-        XCTAssertEqual(panels.runtime.effectiveActiveWindowID, WindowID(rawValue: "safari"))
-        await waitUntil { panels.highlights == ["safari"] }
-        XCTAssertEqual(executor.calls.withLock { $0 }, 1)
-    }
-
-    private func queueChromeActivation(in panels: FocusPanels) throws -> PassthroughSubject<Void, Never> {
-        let id = WindowID(rawValue: "chrome")
-        let target = try XCTUnwrap(panels.runtime.snapshot.windows[id]?.actionIdentity)
-        let invalidations = PassthroughSubject<Void, Never>()
-        panels.runtime.trigger(.activate(id), expected: target, projectionInvalidations: invalidations.eraseToAnyPublisher(),
-                               isProjectionCurrent: { true })
-        return invalidations
-    }
-
-    func testReportedCloseHandoffReturnsWhenTheQueuedActivationIsCancelled() async throws {
-        let cases: [(Duration, String, WindowStatus?)] = [
-            (.seconds(4), "safari", .active),
-            (.seconds(4) + .nanoseconds(1), "steam", nil),
-        ]
-        for (elapsed, highlight, prediction) in cases {
-            let start = ContinuousClock.now
-            var now = start
-            let executor = RuntimeExecutor(results: [true], predictedWindow: WindowID(rawValue: "safari"),
-                                           pauseAfterPrediction: true)
-            let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true, monotonicNow: { now })
-            defer { executor.gates[0].signal(); executor.predictionGate?.signal(); panels.stop() }
-            await waitUntil { panels.ready }
-            panels.runtime.close(windowID: "steam")
-            await waitUntil { executor.calls.withLock { $0 } == 1 }
-            let invalidations = try queueChromeActivation(in: panels)
-            executor.gates[0].signal()
-            await waitUntil { executor.predictionReported.withLock { $0 } }
-            await drainFocusPanels()
-            XCTAssertEqual(panels.highlights, ["chrome"])
-
-            now = start + elapsed
-            invalidations.send(())
-            XCTAssertEqual(panels.runtime.optimisticStatesByWindowID["safari"]?.status, prediction)
-            await drainFocusPanels()
-            XCTAssertEqual(panels.highlights, [highlight])
-            XCTAssertEqual(executor.calls.withLock { $0 }, 1)
-            executor.predictionGate?.signal()
-            for task in panels.runtime.pendingActionsForTesting { await task.value }
-        }
-    }
-
-    func testReportedCloseHandoffSurvivesTheFirstConfirmationOfItsExactSource() async {
-        let executor = RuntimeExecutor(results: [true], predictedWindow: WindowID(rawValue: "chrome"),
-                                       pauseAfterPrediction: true)
-        let panels = FocusPanels(executor: executor, actual: nil, includesSafari: true)
-        defer { executor.gates[0].signal(); executor.predictionGate?.signal(); panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.close(windowID: "steam")
-        executor.gates[0].signal()
-        await waitUntil { panels.highlights == ["chrome"] }
-
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        panels.focus("safari")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["safari"])
-        executor.predictionGate?.signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testFocusOnAnUnadmittedActivationDoesNotRetireAnEarlierCloseHandoff() async throws {
-        let executor = RuntimeExecutor(results: [true], predictedWindow: WindowID(rawValue: "safari"),
-                                       pauseAfterPrediction: true)
-        let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true)
-        defer { executor.gates[0].signal(); executor.predictionGate?.signal(); panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.close(windowID: "steam")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        let invalidations = try queueChromeActivation(in: panels)
-        panels.focus("chrome")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        invalidations.send(())
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
-        XCTAssertEqual(executor.calls.withLock { $0 }, 1)
-
-        executor.gates[0].signal()
-        executor.predictionGate?.signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["safari"])
-        XCTAssertEqual(executor.calls.withLock { $0 }, 1)
-    }
-
-    func testSuccessfulNewerActivationRetiresAnEarlierCloseHandoff() async {
-        let executor = RuntimeExecutor(results: [true, true], predictedWindow: WindowID(rawValue: "safari"),
-                                       pauseAfterPrediction: true)
-        let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true)
-        defer { executor.gates.forEach { $0.signal() }; executor.predictionGate?.signal(); panels.stop() }
-        await waitUntil { panels.ready }
-        panels.runtime.close(windowID: "steam")
-        await waitUntil { executor.calls.withLock { $0 } == 1 }
-        panels.runtime.activate(windowID: "chrome")
-        executor.gates[0].signal()
-        await waitUntil { executor.predictionReported.withLock { $0 } }
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["chrome"])
-
-        executor.predictionGate?.signal()
-        await waitUntil { executor.calls.withLock { $0 } == 2 }
-        executor.gates[1].signal()
-        for task in panels.runtime.pendingActionsForTesting { await task.value }
-        panels.focus("chrome")
-        await drainFocusPanels()
-        panels.focus("steam")
-        await drainFocusPanels()
-        XCTAssertEqual(panels.highlights, ["steam"])
-    }
-
-    func testNativeHandoffFromAnOlderCommandDoesNotSupersedeTheNewerActivation() async {
-        for close in [true, false] {
-            let executor = RuntimeExecutor(results: [true, false], predictedWindow: WindowID(rawValue: "safari"),
-                                           pauseAfterPrediction: true)
-            let panels = FocusPanels(executor: executor, actual: "steam", includesSafari: true)
-            defer {
-                executor.gates.forEach { $0.signal() }
-                executor.predictionGate?.signal()
-                panels.stop()
-            }
+    func testMinimizeAndCloseOnlyHighlightTheNextConfirmedWindow() async {
+        for close in [false, true] {
+            let executor = RuntimeExecutor(results: [true])
+            let panels = FocusPanels(executor: executor, actual: "steam")
+            defer { executor.gates[0].signal(); panels.stop() }
             await waitUntil { panels.ready }
             if close { panels.runtime.close(windowID: "steam") }
             else { panels.runtime.toggle(windowID: "steam") }
             await waitUntil { executor.calls.withLock { $0 } == 1 }
-            panels.runtime.activate(windowID: "chrome")
-            executor.gates[0].signal()
-            executor.predictionGate?.signal()
-            await waitUntil { executor.calls.withLock { $0 } == 2 }
-            panels.focus("safari")
+            await drainFocusPanels()
+            XCTAssertEqual(panels.highlights, ["steam"])
+
+            panels.focus("chrome")
             await drainFocusPanels()
             XCTAssertEqual(panels.highlights, ["chrome"])
-            executor.gates[1].signal()
-            for task in panels.runtime.pendingActionsForTesting { await task.value }
-            await drainFocusPanels()
-            XCTAssertEqual(panels.highlights, ["safari"])
         }
     }
 
@@ -690,7 +389,7 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(executor.calls.withLock { $0 }, 0)
     }
 
-    func testFailedActionPublishesFailureAfterClearingItsOptimisticState() async {
+    func testFailedActivationPublishesFailureWithoutChangingFocus() async {
         let executor = RuntimeExecutor(results: [false])
         let (runtime, _) = await start(executor)
         defer { runtime.stop() }
@@ -698,16 +397,16 @@ final class AppRuntimeTests: XCTestCase {
         let subscription = runtime.debugState.$feedbackEntriesByWindowID.sink { entries in
             guard entries["window-1"]?.phase == .failure else { return }
             publishedFailure = true
-            XCTAssertNil(runtime.optimisticStatesByWindowID["window-1"])
+            XCTAssertNil(runtime.effectiveActiveWindowID)
         }
         defer { subscription.cancel() }
         runtime.activate(windowID: "window-1")
-        XCTAssertEqual(runtime.optimisticStatesByWindowID["window-1"]?.status, .active)
+        XCTAssertNil(runtime.effectiveActiveWindowID)
         let pending = runtime.pendingActionsForTesting
         XCTAssertFalse(pending.isEmpty)
         executor.gates[0].signal()
         for task in pending { await task.value }
-        XCTAssertNil(runtime.optimisticStatesByWindowID["window-1"])
+        XCTAssertNil(runtime.effectiveActiveWindowID)
         XCTAssertTrue(publishedFailure)
     }
 
@@ -725,121 +424,47 @@ final class AppRuntimeTests: XCTestCase {
         await waitUntil { runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase == .success }
         executor.gates[0].signal()
         for task in older { await task.value }
-        XCTAssertEqual(runtime.optimisticStatesByWindowID["window-1"]?.status, .active)
+        XCTAssertNil(runtime.effectiveActiveWindowID)
         XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase, .success)
     }
 
-    private func startPredictedHandoff(
-        close: Bool = false, results: [Bool]
-    ) async -> (AppRuntime, RuntimeInventory, RuntimeExecutor) {
-        let executor = RuntimeExecutor(results: results, predictedWindow: WindowID(rawValue: "window-2"),
-                                       pauseAfterPrediction: true)
-        let (runtime, inventory) = await start(executor, activeWindowID: "window-1")
-        if close { runtime.close(windowID: "window-1") }
-        else { runtime.toggle(windowID: "window-1") }
-        executor.gates[0].signal()
-        await waitUntil { runtime.optimisticStatesByWindowID["window-2"]?.systemPredicted == true }
-        return (runtime, inventory, executor)
-    }
-
-    func testFailedHandoffDoesNotTurnTheNextSiblingClickIntoMinimize() async {
-        for close in [false, true] {
-            let (runtime, _, executor) = await startPredictedHandoff(close: close, results: [false, true])
-            defer { runtime.stop() }
-            executor.predictionGate?.signal()
-            for task in runtime.pendingActionsForTesting { await task.value }
-            XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase, .failure)
-            XCTAssertNil(runtime.optimisticStatesByWindowID["window-2"])
-
-            runtime.toggle(windowID: "window-2")
-            XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-2"]?.action, .activate)
-            executor.gates[1].signal()
-            for task in runtime.pendingActionsForTesting { await task.value }
-        }
-    }
-
-    func testSupersededHandoffClearsItsPredictionImmediately() async {
-        let (runtime, _, executor) = await startPredictedHandoff(results: [false, true])
-        defer { runtime.stop() }
+    func testAnotherCloseCanRunWhenThePreviousCloseWasNeverConfirmed() async {
+        let executor = RuntimeExecutor(results: [true, false])
+        let inventory = RuntimeInventory(snapshot(activeWindowID: "window-1"))
+        var now = ContinuousClock.now
+        let runtime = AppRuntime(tracker: inventory, actionExecutor: executor, monotonicNow: { now })
+        runtime.start()
+        defer { executor.gates.forEach { $0.signal() }; runtime.stop() }
+        await waitUntil { runtime.snapshot.windows.count == 2 }
 
         runtime.close(windowID: "window-1")
-        XCTAssertNil(runtime.optimisticStatesByWindowID["window-2"])
-        executor.predictionGate?.signal()
-        executor.gates[1].signal()
+        await waitUntil { executor.calls.withLock { $0 } == 1 }
+        executor.gates[0].signal()
         for task in runtime.pendingActionsForTesting { await task.value }
+        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase, .pending)
+
+        now += .seconds(5)
+        runtime.close(windowID: "window-1")
+        await waitUntil { executor.calls.withLock { $0 } == 2 }
     }
 
-    func testReplacingHandoffSourceClearsItsPredictionImmediately() async {
-        let (runtime, inventory, executor) = await startPredictedHandoff(results: [false])
-        defer { runtime.stop() }
-        let sourceID = WindowID(rawValue: "window-1")
-        var replacement = runtime.snapshot
-        replacement.windows[sourceID]?.cgWindowID = 3
-        inventory.values.send(replacement)
-        await waitUntil { runtime.snapshot.windows[sourceID]?.cgWindowID == 3 }
-
-        XCTAssertNil(runtime.optimisticStatesByWindowID["window-2"])
-        executor.predictionGate?.signal()
-        for task in runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testFailedHandoffKeepsAnIndependentTargetAction() async {
-        let (runtime, _, executor) = await startPredictedHandoff(results: [false, true])
-        defer { runtime.stop() }
-        runtime.activate(windowID: "window-2")
-        executor.predictionGate?.signal()
-        await waitUntil { runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase == .failure }
-
-        XCTAssertEqual(runtime.optimisticStatesByWindowID["window-2"]?.status, .active)
-        XCTAssertEqual(runtime.optimisticStatesByWindowID["window-2"]?.systemPredicted, false)
-        executor.gates[1].signal()
-        for task in runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testSuccessfulHandoffKeepsThePredictionForTheNextSiblingClick() async {
-        let (runtime, _, executor) = await startPredictedHandoff(results: [true, true])
-        defer { runtime.stop() }
-        executor.predictionGate?.signal()
-        for task in runtime.pendingActionsForTesting { await task.value }
-
-        runtime.toggle(windowID: "window-2")
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-2"]?.action, .minimize)
-        executor.gates[1].signal()
-        for task in runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testInventoryConfirmedCloseKeepsTheSiblingHandoffPrediction() async {
-        let (runtime, inventory, executor) = await startPredictedHandoff(close: true, results: [true])
-        defer { runtime.stop() }
-        let sourceID = WindowID(rawValue: "window-1")
-        var closed = runtime.snapshot
-        closed.windows.removeValue(forKey: sourceID)
-        closed.orderedWindowIDs.removeAll { $0 == sourceID }
-        inventory.values.send(closed)
-        await waitUntil { runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase == .success }
-
-        XCTAssertEqual(runtime.optimisticStatesByWindowID["window-2"]?.status, .active)
-        executor.predictionGate?.signal()
-        for task in runtime.pendingActionsForTesting { await task.value }
-    }
-
-    func testStopAndRestartRejectLateExecutionAndHandoffPrediction() async {
-        let executor = RuntimeExecutor(results: [false], predictedWindow: WindowID(rawValue: "window-2"))
+    func testStopAndRestartRejectLateExecution() async {
+        let executor = RuntimeExecutor(results: [false])
         let (runtime, inventory) = await start(executor, activeWindowID: "window-1")
         runtime.toggle(windowID: "window-1")
-        XCTAssertEqual(runtime.optimisticStatesByWindowID["window-1"]?.status, .minimized)
+        XCTAssertNotNil(runtime.pendingMinimizations["window-1"])
         await waitUntil { executor.calls.withLock { $0 } == 1 }
         let pending = runtime.pendingActionsForTesting
         runtime.stop()
         XCTAssertTrue(runtime.snapshot.windows.isEmpty)
-        XCTAssertTrue(runtime.optimisticStatesByWindowID.isEmpty)
+        XCTAssertTrue(runtime.pendingMinimizations.isEmpty)
         XCTAssertTrue(runtime.debugState.feedbackEntriesByWindowID.isEmpty)
         runtime.start()
         defer { runtime.stop() }
         await waitUntil { runtime.snapshot.windows.count == 2 }
         executor.gates[0].signal()
         for task in pending { await task.value }
-        XCTAssertTrue(runtime.optimisticStatesByWindowID.isEmpty)
+        XCTAssertTrue(runtime.pendingMinimizations.isEmpty)
         XCTAssertTrue(runtime.debugState.feedbackEntriesByWindowID.isEmpty)
         XCTAssertEqual(inventory.starts, 2)
         XCTAssertEqual(inventory.stops, 1)
@@ -853,7 +478,7 @@ final class AppRuntimeTests: XCTestCase {
         inventory.values.send(snapshot())
         XCTAssertTrue(runtime.pendingActionsForTesting.isEmpty)
         XCTAssertEqual(executor.calls.withLock { $0 }, 0)
-        XCTAssertTrue(runtime.optimisticStatesByWindowID.isEmpty)
+        XCTAssertTrue(runtime.pendingMinimizations.isEmpty)
         XCTAssertTrue(runtime.snapshot.windows.isEmpty)
     }
 

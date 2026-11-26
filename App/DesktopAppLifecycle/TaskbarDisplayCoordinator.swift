@@ -6,14 +6,13 @@ import os
 #endif
 
 @MainActor
-final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
+final class TaskbarScreenOrchestrator: NSObject {
     struct Unit {
         let key: String?
         let coordinator: PanelCoordinator
     }
 
     private(set) var units: [Unit] = []
-    let overlaySpaceHost: OverlaySpaceHost?
 
     private let runtime: AppRuntime
     private let stripOrderStore: StripOrderStore
@@ -22,12 +21,12 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
     private let topologySnapshotProvider: @MainActor () -> ScreenTopologySnapshot
     private let startCoordinator: (PanelCoordinator) -> Bool
     private let topologyRetryScheduler: DisplayTopologyRefreshController.ScheduleAfter
-    private let captureFullscreenCGWindows: @MainActor () -> [[String: Any]]?
     private let workspaceNotifications: NotificationCenter
     private let frontmostApplicationPID: () -> pid_t?
-    private let fullscreenUptime: @Sendable () -> TimeInterval
+    private let makeGeometryObserver: () -> FrontmostWindowGeometryObserver?
     #if DEBUG
     private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "taskbar-screens")
+    private static let heightLog = Logger(subsystem: "io.github.sashokey.deskmote", category: "window-height")
     #endif
 
     var onRequestTaskbarMenu: ((NSEvent, NSView) -> Void)? {
@@ -37,15 +36,25 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
     private var started = false
     private var isSuspended = false
     private var topologyRefreshController: DisplayTopologyRefreshController?
-    private var fullscreenTimer: Timer?
-    private var fullscreenObservers: [NSObjectProtocol] = []
+    var windowAdjustmentAllowed: () -> Bool = { true }
+    private let windowHeightAdjustment: WindowHeightAdjustment?
+    private let windowAdjustmentDisplays: (() -> [WindowAdjustmentDisplay])?
+    private var geometryObserver: FrontmostWindowGeometryObserver?
+    private var launchFocusSubscription: AnyCancellable?
+    private var desktopReturns: AnyCancellable?
+    private var geometryObservers: [NSObjectProtocol] = []
+    private var panelGeometryObserver: NSObjectProtocol?
+    private var spaceSubscriptions = Set<AnyCancellable>()
+
+    var onSpaceCompatibilityFailure: ((String, String) -> Void)? {
+        didSet { spaceStore.onCompatibilityFailure = onSpaceCompatibilityFailure }
+    }
 
     init(
         runtime: AppRuntime,
         stripOrderStore: StripOrderStore,
         displayTopologyStore: DisplayTopologyStore,
         spaceStore: TaskbarSpaceStore = TaskbarSpaceStore(),
-        overlaySpaceHost: OverlaySpaceHost? = OverlaySpaceHost.make(),
         topologySnapshotProvider: @escaping @MainActor () -> ScreenTopologySnapshot = {
             DisplayIdentity.topologySnapshot()
         },
@@ -55,12 +64,13 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
             return item
         },
-        captureFullscreenCGWindows: @escaping @MainActor () -> [[String: Any]]? = PanelCoordinator.captureFullscreenCGWindows,
         workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
         frontmostApplicationPID: @escaping () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier },
-        fullscreenUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        makeGeometryObserver: @escaping () -> FrontmostWindowGeometryObserver? = { FrontmostWindowGeometryObserver() },
+        windowAdjustmentAccessibility: any AccessibilityOperations = NativeAccessibilityOperations(),
+        windowAdjustmentDisplays: (() -> [WindowAdjustmentDisplay])? = nil,
+        windowAdjustmentEnabled: Bool = DebugSwitch.windowLift.isEnabled()
     ) {
-        self.overlaySpaceHost = overlaySpaceHost
         self.runtime = runtime
         self.stripOrderStore = stripOrderStore
         self.displayTopologyStore = displayTopologyStore
@@ -68,15 +78,18 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         self.topologySnapshotProvider = topologySnapshotProvider
         self.topologyRetryScheduler = topologyRetryScheduler
         self.startCoordinator = startCoordinator
-        self.captureFullscreenCGWindows = captureFullscreenCGWindows
         self.workspaceNotifications = workspaceNotifications
         self.frontmostApplicationPID = frontmostApplicationPID
-        self.fullscreenUptime = fullscreenUptime
+        self.makeGeometryObserver = makeGeometryObserver
+        windowHeightAdjustment = windowAdjustmentEnabled
+            ? WindowHeightAdjustment(accessibility: windowAdjustmentAccessibility) : nil
+        self.windowAdjustmentDisplays = windowAdjustmentDisplays
         super.init()
     }
 
     isolated deinit {
-        stopFullscreenMonitoring()
+        stopWindowGeometryObservation()
+        stopSpaceObservation()
         spaceStore.stop()
         topologyRefreshController?.cancel()
         NotificationCenter.default.removeObserver(self)
@@ -88,11 +101,12 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         let seedController = makeTopologyRefreshController()
         topologyRefreshController = seedController
         let snapshot = seedController.prepareForTopologyChange()
+        startSpaceObservation()
         spaceStore.start(snapshots: runtime.$snapshot.eraseToAnyPublisher(), utilityOnActiveSpace: { [weak runtime] id in
             runtime?.utilityWindowOnActiveSpace(id)
-        })
+        }, windowInvalidations: runtime.windowSpaceInvalidations)
         rebuildUnits(reason: "start", snapshot: snapshot)
-        startFullscreenMonitoring()
+        startWindowGeometryObservation()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screenParametersChanged),
@@ -104,13 +118,13 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
     func suspendAndRelease() {
         guard !isSuspended else { return }
         isSuspended = true
-        stopFullscreenMonitoring()
+        stopWindowGeometryObservation()
+        stopSpaceObservation()
         spaceStore.stop()
         for unit in units {
             unit.coordinator.tearDown(source: "runtime-suspended")
         }
         units = []
-        overlaySpaceHost?.tearDown()
         topologyRefreshController?.cancel()
         topologyRefreshController = nil
         NotificationCenter.default.removeObserver(self)
@@ -124,6 +138,10 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         )
         let current = units.map(\.key)
         guard desired != current else { return }
+        #if DEBUG
+        let span = ActionResourceLog.begin("taskbar.displays.rebuild")
+        defer { span?.finish() }
+        #endif
         let desiredSet = Set(desired.map { $0 ?? "" })
         var survivors: [String?: Unit] = [:]
         for unit in units {
@@ -133,15 +151,12 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
                 unit.coordinator.tearDown(source: "topology-\(reason)")
             }
         }
-        let initialRead = makeFullscreenReadBatch()
-        lazy var initialPID = frontmostApplicationPID()
         units = desired.compactMap { key in
             if let survivor = survivors[key] { return survivor }
             guard let unit = makeUnit(key: key) else { return nil }
-            unit.coordinator.lastActiveApplicationPID = initialPID
-            unit.coordinator.triggerAsyncFullscreenCheck(source: "initial-ax", sharedRead: initialRead)
             return unit
         }
+        applySpaceLayouts(spaceStore.activeLayouts)
         #if DEBUG
         logger.info("units rebuilt reason=\(reason, privacy: .public) count=\(self.units.count, privacy: .public)")
         #endif
@@ -151,7 +166,6 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         let placement: TaskbarUnitPlacement = key.map { .fixed(displayUUID: $0) } ?? .primary
         let coordinator = PanelCoordinator(
             placement: placement,
-            overlaySpaceHost: overlaySpaceHost,
             runtime: runtime,
             stripOrderStore: stripOrderStore,
             displayTopologyStore: displayTopologyStore,
@@ -174,7 +188,7 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
             applyTopologySnapshot(snapshot)
         }
         rebuildUnits(reason: "screens", snapshot: snapshot)
-        updateFullscreenPanels { $0.screenParametersChanged(sharedRead: $1) }
+        units.forEach { $0.coordinator.screenParametersChanged() }
     }
 
     private func makeTopologyRefreshController() -> DisplayTopologyRefreshController {
@@ -188,13 +202,18 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
                     reason: "topology-retry",
                     snapshot: snapshot
                 )
-                self?.updateFullscreenPanels { $0.screenParametersChanged(sharedRead: $1) }
+                self?.units.forEach { $0.coordinator.screenParametersChanged() }
             },
             scheduleAfter: topologyRetryScheduler
         )
     }
 
     private func applyTopologySnapshot(_ snapshot: ScreenTopologySnapshot) {
+        #if DEBUG
+        let span = ActionResourceLog.begin("taskbar.displays.update")
+        defer { span?.finish() }
+        #endif
+        windowHeightAdjustment?.invalidateLayout()
         spaceStore.updateTopology(snapshot)
         displayTopologyStore.apply(snapshot)
         runtime.updateDisplayTopology(snapshot.attributionTable)
@@ -215,63 +234,141 @@ final class TaskbarScreenOrchestrator: NSObject, WindowLiftAvoidanceHost {
         return true
     }
 
-    func windowLiftAvoidanceContexts() -> [WindowLiftAvoidanceContext] {
-        units.compactMap { $0.coordinator.windowLiftAvoidanceContext() }
-    }
-
-    func windowGeometryChanged() {
-        updateFullscreenPanels { $0.windowGeometryChanged(sharedRead: $1) }
-    }
-
-    private func startFullscreenMonitoring() {
-        fullscreenObservers.append(workspaceNotifications.addObserver(
-            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.handleSpaceChange() }
-        })
-        fullscreenObservers.append(workspaceNotifications.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+    private func startWindowGeometryObservation() {
+        guard windowHeightAdjustment != nil, let observer = makeGeometryObserver() else { return }
+        observer.onEvent = { [weak self] event in
+            self?.handleWindowGeometryEvent(event)
+        }
+        observer.isLaunchFocusCurrent = { [weak self] focus in
+            guard let self else { return false }
+            return self.windowAdjustmentAllowed() && self.frontmostApplicationPID() == focus.pid
+                && self.runtime.isLaunchWindowFocusCurrent(focus)
+        }
+        geometryObserver = observer
+        launchFocusSubscription = runtime.launchWindowFocus.sink { [weak observer] focus in
+            observer?.acceptLaunchFocus(focus)
+        }
+        panelGeometryObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main
         ) { [weak self] note in
-            let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+            guard let panel = note.object as? NSWindow else { return }
+            let identity = ObjectIdentifier(panel)
             MainActor.assumeIsolated {
-                self?.updateFullscreenPanels { $0.handleAppActivated(pid: pid, sharedRead: $1) }
-            }
-        })
-        fullscreenTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.reconcileFullscreenState()
+                guard let self, self.units.contains(where: { $0.coordinator.dockPanel.map(ObjectIdentifier.init) == identity }) else { return }
+                self.windowHeightAdjustment?.invalidateLayout()
             }
         }
-        fullscreenTimer?.tolerance = 0.5
+        geometryObservers = [
+            NSWorkspace.didActivateApplicationNotification,
+            NSWorkspace.didLaunchApplicationNotification,
+            NSWorkspace.didTerminateApplicationNotification,
+        ].map { name in
+            workspaceNotifications.addObserver(forName: name, object: nil, queue: .main) { [weak observer] note in
+                let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+                MainActor.assumeIsolated {
+                    #if DEBUG
+                    Self.heightLog.notice("workspace-event name=\(name.rawValue, privacy: .public) pid=\(pid ?? 0)")
+                    #endif
+                    switch name {
+                    case NSWorkspace.didActivateApplicationNotification:
+                        observer?.activate(pid: pid)
+                    case NSWorkspace.didLaunchApplicationNotification:
+                        if let pid { observer?.applicationLaunched(pid: pid) }
+                    case NSWorkspace.didTerminateApplicationNotification:
+                        if let pid { observer?.applicationTerminated(pid: pid) }
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+        observer.start(pid: frontmostApplicationPID())
     }
 
-    private func handleSpaceChange() {
-        guard started, !isSuspended, !units.isEmpty else { return }
-        overlaySpaceHost?.reconcileVisibility()
-        updateFullscreenPanels { $0.handleSpaceChange(sharedRead: $1) }
-    }
-
-    func reconcileFullscreenState() {
-        updateFullscreenPanels { $0.reconcileFullscreenState(sharedRead: $1) }
-    }
-
-    private func stopFullscreenMonitoring() {
-        fullscreenTimer?.invalidate()
-        fullscreenTimer = nil
-        fullscreenObservers.forEach { workspaceNotifications.removeObserver($0) }
-        fullscreenObservers.removeAll()
-    }
-
-    private func updateFullscreenPanels(_ update: (PanelCoordinator, FullscreenReadBatch) -> Void) {
-        guard started, !isSuspended, !units.isEmpty else { return }
-        let batch = makeFullscreenReadBatch()
-        units.forEach { update($0.coordinator, batch) }
-    }
-
-    private func makeFullscreenReadBatch() -> FullscreenReadBatch {
-        FullscreenReadBatch(uptime: fullscreenUptime, readCG: captureFullscreenCGWindows) {
-            PanelCoordinator.readFullscreenAXObservation(pid: $0)
+    private func handleWindowGeometryEvent(_ event: FrontmostWindowGeometryObserver.Event) {
+        guard let windowHeightAdjustment else { return }
+        switch event {
+        case let .windowBindingChanged(window, ownerPID):
+            windowHeightAdjustment.bind(window, ownerPID: ownerPID)
+        case let .newFocusedWindow(window, evidence):
+            guard windowAdjustmentAllowed() else {
+                #if DEBUG
+                Self.heightLog.notice("height-skip reason=adjustment-not-allowed source=\(evidence.rawValue, privacy: .public) window=\(window.hashValue)")
+                #endif
+                return
+            }
+            windowHeightAdjustment.newWindowConfirmed(window,
+                displays: currentAdjustmentDisplays(), evidence: evidence.rawValue)
+        case let .geometryChanged(window, notification, receivedAt):
+            guard windowAdjustmentAllowed() else { return }
+            windowHeightAdjustment.geometryChanged(window, displays: currentAdjustmentDisplays(),
+                                                   notification: notification, receivedAt: receivedAt)
+        default:
+            break
         }
     }
 
+    private func currentAdjustmentDisplays() -> [WindowAdjustmentDisplay] {
+        if let windowAdjustmentDisplays { return windowAdjustmentDisplays() }
+        let screens = NSScreen.screens
+        guard let primaryHeight = screens.first?.frame.maxY else { return [] }
+        let panelFrames = units.compactMap { $0.coordinator.visibleTaskbarFrame }
+        return screens.map { screen in
+            let panel = panelFrames.first { screen.frame.contains(CGPoint(x: $0.midX, y: $0.midY)) }
+            return WindowAdjustmentDisplay(
+                frame: DisplayIdentity.windowServerFrame(fromAppKit: screen.frame, primaryDisplayHeight: primaryHeight),
+                visibleFrame: DisplayIdentity.windowServerFrame(fromAppKit: screen.visibleFrame, primaryDisplayHeight: primaryHeight),
+                panelFrame: panel.map { DisplayIdentity.windowServerFrame(fromAppKit: $0, primaryDisplayHeight: primaryHeight) }
+            )
+        }
+    }
+
+    func stopWindowGeometryObservation() {
+        launchFocusSubscription?.cancel()
+        launchFocusSubscription = nil
+        geometryObservers.forEach { workspaceNotifications.removeObserver($0) }
+        geometryObservers.removeAll()
+        if let panelGeometryObserver { NotificationCenter.default.removeObserver(panelGeometryObserver) }
+        panelGeometryObserver = nil
+        windowHeightAdjustment?.stop()
+        geometryObserver?.stop()
+        geometryObserver = nil
+    }
+
+    private func startSpaceObservation() {
+        spaceStore.$activeLayouts.sink { [weak self] layouts in
+            self?.applySpaceLayouts(layouts)
+        }.store(in: &spaceSubscriptions)
+        spaceStore.activeSpaceChanges.sink { [weak self] _ in
+            guard let self else { return }
+            self.windowHeightAdjustment?.invalidateLayout()
+            self.units.forEach { $0.coordinator.spaceWillChange() }
+            self.geometryObserver?.retryUnavailableObservation()
+        }.store(in: &spaceSubscriptions)
+        spaceStore.desktopReturns.sink { [weak self] _ in
+            self?.runtime.refreshFrontmostWindow()
+        }.store(in: &spaceSubscriptions)
+    }
+
+    private func applySpaceLayouts(_ layouts: TaskbarSpaceStore.Layouts) {
+        guard started, !isSuspended else { return }
+        windowHeightAdjustment?.invalidateLayout()
+        let primary = displayTopologyStore.table.primaryUUID
+        for unit in units {
+            let key = unit.key ?? primary
+            let local = key.flatMap { layouts[$0] }
+            let shared = layouts.count == 1 ? layouts["Main"] : nil
+            let primaryFallback = key == nil && units.count == 1 && layouts.count == 1 ? layouts.values.first : nil
+            guard let layout = local ?? shared ?? primaryFallback else {
+                unit.coordinator.applySpaceUnavailable(source: "space-layout")
+                continue
+            }
+            let fullscreen = layout.fullscreenSpaceIDs.contains(layout.currentSpaceID)
+            unit.coordinator.applySpaceFullscreen(fullscreen, source: "space-layout")
+        }
+    }
+
+    private func stopSpaceObservation() {
+        spaceSubscriptions.removeAll()
+    }
 }

@@ -15,23 +15,22 @@ extension PanelCoordinator {
         guard let panel = dockPanel else { return }
         let primary = fixedUnitDisplayUUID == nil ? screenProvider().first : nil
         guard let screen = resolvedPinnedScreen() ?? primary ?? panelCurrentScreen(panel: panel) else {
+            panelsAreVisible = false
+            taskbarPresenter?.setPanelVisible(false)
             orderDockSurfaceOut(source: "screen-unavailable")
             return
         }
         let frame = TaskbarMetrics.panelFrame(on: screen.frame)
-        if panel.frame != frame {
-            taskbarView?.taskbarContent.prepareForHiding()
-            panel.setFrame(frame, display: true)
-        }
+        guard panel.frame != frame else { return }
+        taskbarView?.taskbarContent.prepareForHiding()
+        panel.setFrame(frame, display: panel.isVisible)
         dockContentHost?.layoutContent()
     }
 
-    func screenParametersChanged(sharedRead: FullscreenReadBatch? = nil) {
+    func screenParametersChanged() {
         guard !isSuspendedForPermissionLoss else { return }
-        fullscreenProbeGeneration &+= 1
         taskbarView?.taskbarContent.prepareForHiding()
         relayout()
-        reconcilePanelVisibility(source: "screen-parameters-changed")
-        triggerAsyncFullscreenCheck(source: "screen-ax", sharedRead: sharedRead)
+        applyPanelVisibility(source: "screen-parameters-changed")
     }
 }

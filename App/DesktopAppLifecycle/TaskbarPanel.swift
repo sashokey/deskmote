@@ -26,15 +26,6 @@ final class ManualPanelHost {
 enum PanelCollectionBehavior {
     static let standard: NSWindow.CollectionBehavior =
         [.canJoinAllSpaces, .transient, .ignoresCycle, .fullScreenAuxiliary]
-
-    @MainActor
-    static func restoreMembership(of panels: [NSPanel], completion: @escaping @MainActor () -> Void) {
-        for panel in panels { panel.collectionBehavior = [] }
-        DispatchQueue.main.async {
-            for panel in panels { panel.collectionBehavior = standard }
-            completion()
-        }
-    }
 }
 
 class NonConstrainingPanel: NSPanel {

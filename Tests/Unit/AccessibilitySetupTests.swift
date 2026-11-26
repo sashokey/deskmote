@@ -3,7 +3,7 @@ import XCTest
 @MainActor
 final class PermissionOnboardingTests: XCTestCase {
     func testPermissionWatchdogGateRejectsOverlapAndStoppedGeneration() {
-        var gate = PermissionWatchdogGate()
+        let gate = PermissionWatchdogGate()
         XCTAssertNil(gate.beginProbe())
         gate.start()
         guard let oldGeneration = gate.beginProbe() else {
@@ -21,6 +21,68 @@ final class PermissionOnboardingTests: XCTestCase {
         }
         XCTAssertFalse(gate.completeProbe(generation: oldGeneration))
         XCTAssertTrue(gate.completeProbe(generation: currentGeneration))
+    }
+
+    func testBusyMainThreadCoalescesSamplesWithoutLosingTheDenial() throws {
+        let gate = PermissionWatchdogGate()
+        let generation = gate.start()
+        XCTAssertEqual(try XCTUnwrap(gate.beginProbe()), generation)
+        XCTAssertTrue(gate.completeProbe(generation: generation, deliver: false))
+        XCTAssertEqual(try XCTUnwrap(gate.beginProbe()), generation)
+        XCTAssertFalse(gate.completeProbe(generation: generation, deliver: true))
+        XCTAssertEqual(gate.takeDelivery(generation: generation), false)
+        XCTAssertNil(gate.takeDelivery(generation: generation))
+    }
+
+    func testNativeDenialBlocksLaterCallsEvenWithAStalePositiveProbe() {
+        let access = RuntimeAccessibilityAccess()
+        XCTAssertEqual(access.call { .cannotComplete }, .cannotComplete)
+        XCTAssertEqual(access.call { .success }, .success)
+        XCTAssertEqual(access.call { .apiDisabled }, .apiDisabled)
+        access.updateTrust(true)
+
+        XCTAssertEqual(access.call {
+            XCTFail("A native denial must block AX work for this runtime")
+            return .success
+        }, .apiDisabled)
+
+        access.updateTrust(false)
+        access.updateTrust(true)
+        XCTAssertEqual(access.call { .success }, .success)
+    }
+
+    func testLateNativeDenialDoesNotOverrideRestoredTrust() {
+        let access = RuntimeAccessibilityAccess()
+        XCTAssertEqual(access.call {
+            access.updateTrust(false)
+            access.updateTrust(true)
+            return .apiDisabled
+        }, .apiDisabled)
+
+        XCTAssertEqual(access.call { .success }, .success)
+    }
+
+    func testTrustRecoveryReopensCallsAfterATransientNegativeProbe() {
+        let access = RuntimeAccessibilityAccess()
+        access.updateTrust(false)
+        XCTAssertEqual(access.call {
+            XCTFail("The runtime must pause AX work after a negative probe")
+            return .success
+        }, .apiDisabled)
+
+        access.updateTrust(true)
+        XCTAssertEqual(access.call { .success }, .success)
+    }
+
+    func testNativeNegativeTrustRejectsAnOverlappingPositiveProbe() {
+        let access = RuntimeAccessibilityAccess()
+        let generation = access.trustGeneration
+        XCTAssertFalse(access.checkTrust { false })
+        XCTAssertNil(access.updateTrust(true, for: generation))
+        XCTAssertFalse(access.allowsCalls)
+
+        XCTAssertEqual(access.updateTrust(true, for: access.trustGeneration), true)
+        XCTAssertTrue(access.allowsCalls)
     }
 
     func testClassifiesStableLocations() {
@@ -322,25 +384,14 @@ final class PermissionOnboardingTests: XCTestCase {
         XCTAssertEqual(machine.phase, .running)
         XCTAssertTrue(effects.contains(.startApp))
         XCTAssertFalse(effects.contains(.launchNewInstance(episode: episode)))
-        XCTAssertFalse(effects.contains(.restoreLiftedWindows(episode: episode)))
     }
 
-    func testFirstFalseFreezesLiftAndRecoveredTrustUnfreezes() {
+    func testFirstFalseIsUncertainUntilTrustReturns() {
         var machine = runningMachine()
-        XCTAssertEqual(machine.handle(.trustVerdict(.uncertain)), [.freezeLift])
+        XCTAssertEqual(machine.handle(.trustVerdict(.uncertain)), [])
         XCTAssertEqual(machine.phase, .uncertain)
-        XCTAssertEqual(machine.handle(.trustVerdict(.stable)), [.unfreezeLift])
-        XCTAssertEqual(machine.phase, .running)
-    }
-
-    func testStableWatchdogSamplesRecoverAControllerOnlyFreezeWhileRunning() {
-        var machine = runningMachine()
-        for _ in 0..<3 {
-            XCTAssertEqual(machine.handle(.trustVerdict(.stable)), [.unfreezeLift])
-            XCTAssertEqual(machine.phase, .running)
-        }
-        _ = machine.handle(.terminationRequested)
         XCTAssertEqual(machine.handle(.trustVerdict(.stable)), [])
+        XCTAssertEqual(machine.phase, .running)
     }
 
     func testLostTrustSuspendsAndReRegistersWithTheSystem() {
@@ -351,7 +402,6 @@ final class PermissionOnboardingTests: XCTestCase {
         guard case let .suspended(episode) = machine.phase else { return XCTFail("expected suspended") }
         XCTAssertEqual(effects, [
             .stopWatchdog,
-            .freezeLift,
             .suspendPanelsAndStores,
             .setActivationPolicy(.regular),
             .showGuide,
@@ -360,18 +410,13 @@ final class PermissionOnboardingTests: XCTestCase {
         ])
     }
 
-    func testRecoveryRestoresWindowsBeforeReleasingHotKeyAndRelaunching() {
+    func testRecoveryGrantRelaunchesAndSuccessfulRelaunchTerminates() {
         var machine = suspendedMachine()
         guard case let .suspended(episode) = machine.phase else { return XCTFail("expected suspended") }
 
         let granted = machine.handle(.grantObserved(episode: episode))
-        XCTAssertEqual(machine.phase, .restoringWindows(episode: episode))
-        XCTAssertTrue(granted.contains(.restoreLiftedWindows(episode: episode)))
-
-        let restored = machine.handle(.restorationFinished(episode: episode, result: .complete))
         XCTAssertEqual(machine.phase, .relaunching(episode: episode))
-        XCTAssertEqual(restored, [.updateGuide, .launchNewInstance(episode: episode)])
-
+        XCTAssertEqual(granted, [.stopPermissionEpisode, .updateGuide, .launchNewInstance(episode: episode)])
         XCTAssertEqual(machine.handle(.relaunchSucceeded(episode: episode)), [.terminateSelf])
     }
 
@@ -380,7 +425,6 @@ final class PermissionOnboardingTests: XCTestCase {
         guard case let .relaunching(episode) = machine.phase else { return XCTFail("expected relaunching") }
 
         XCTAssertEqual(machine.handle(.grantObserved(episode: episode)), [])
-        XCTAssertEqual(machine.handle(.restorationFinished(episode: episode, result: .complete)), [])
         XCTAssertEqual(machine.handle(.trustVerdict(.lost)), [])
         XCTAssertEqual(machine.phase, .relaunching(episode: episode))
     }
@@ -422,7 +466,6 @@ final class PermissionOnboardingTests: XCTestCase {
         XCTAssertEqual(machine.phase, .terminating)
         XCTAssertEqual(effects, [.stopWatchdog, .cancelRecoveryTask, .stopPermissionEpisode])
 
-        XCTAssertEqual(machine.handle(.restorationFinished(episode: episode, result: .complete)), [])
         XCTAssertEqual(machine.handle(.relaunchSucceeded(episode: episode)), [])
         XCTAssertEqual(machine.handle(.retryRequested), [])
     }
@@ -538,7 +581,7 @@ final class PermissionOnboardingTests: XCTestCase {
         spy.trusted = false
         clock = 10
         coordinator.sampleTrust(false)
-        XCTAssertEqual(handler.calls.last, "freezeLift")
+        XCTAssertEqual(coordinator.phase, .uncertain)
         XCTAssertNil(coordinator.presentation)
 
         clock = 20
@@ -595,7 +638,6 @@ final class PermissionOnboardingTests: XCTestCase {
         var machine = suspendedMachine()
         guard case let .suspended(episode) = machine.phase else { return machine }
         _ = machine.handle(.grantObserved(episode: episode))
-        _ = machine.handle(.restorationFinished(episode: episode, result: .complete))
         return machine
     }
 }
@@ -615,12 +657,6 @@ private final class EffectSpy: PermissionEffectHandler {
     func openApplicationsFolder() { calls.append("openApplications") }
     func startWatchdog() { calls.append("startWatchdog") }
     func stopWatchdog() { calls.append("stopWatchdog") }
-    func freezeLiftSnapshots() { calls.append("freezeLift") }
-    func unfreezeLiftSnapshots() { calls.append("unfreezeLift") }
-    func restoreLiftedWindows(episode: UInt64) async -> WindowRestorationCompletion {
-        calls.append("restoreLiftedWindows")
-        return .complete
-    }
     func suspendPanelsAndStores() { calls.append("suspendPanelsAndStores") }
 
     func launchNewInstance(episode: UInt64) async -> Result<Void, Error> {

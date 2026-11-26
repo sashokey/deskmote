@@ -24,32 +24,6 @@ final class DockSnapshotEqualityTests: XCTestCase {
     }
 }
 
-final class FeedbackTickPolicyTests: XCTestCase {
-    func testTickRequiresARunningRuntimeWithPendingWork() {
-        let cases: [(running: Bool, feedback: Bool, optimistic: Bool, ticks: Bool)] = [
-            (true, false, false, false),
-            (true, true, false, true),
-            (true, false, true, true),
-            (true, true, true, true),
-            (false, false, false, false),
-            (false, true, false, false),
-            (false, false, true, false),
-            (false, true, true, false),
-        ]
-        for (running, feedback, optimistic, ticks) in cases {
-            XCTAssertEqual(
-                FeedbackTickPolicy.shouldTick(
-                    isRunning: running,
-                    hasFeedbackEntries: feedback,
-                    hasOptimisticStates: optimistic
-                ),
-                ticks,
-                "Running: \(running), feedback: \(feedback), optimistic: \(optimistic)"
-            )
-        }
-    }
-}
-
 final class IntentFeedbackStateRetentionTests: XCTestCase {
 
     private let windowID = "cgw-1"
@@ -189,21 +163,21 @@ final class RuntimeFeedbackClockTests: XCTestCase {
 
         runtime.toggle(windowID: id.rawValue)
         for task in runtime.pendingActionsForTesting { await task.value }
-        XCTAssertEqual(runtime.optimisticStatesByWindowID[id.rawValue]?.status, .minimized)
+        XCTAssertNotNil(runtime.pendingMinimizations[id.rawValue])
         XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID[id.rawValue]?.phase, .pending)
 
         now = start + .seconds(4)
         observation.windows[id]?.title = "At the deadline"
         desktop.values.send(observation)
         await flushSnapshots()
-        XCTAssertEqual(runtime.optimisticStatesByWindowID[id.rawValue]?.status, .minimized)
+        XCTAssertNotNil(runtime.pendingMinimizations[id.rawValue])
         XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID[id.rawValue]?.phase, .pending)
 
         now = now + .nanoseconds(1)
         observation.windows[id]?.title = "Past the deadline"
         desktop.values.send(observation)
         await flushSnapshots()
-        XCTAssertNil(runtime.optimisticStatesByWindowID[id.rawValue])
+        XCTAssertNil(runtime.pendingMinimizations[id.rawValue])
         XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID[id.rawValue]?.phase, .failure)
     }
 
@@ -216,7 +190,7 @@ final class RuntimeFeedbackClockTests: XCTestCase {
 
 private struct FeedbackSucceededMinimize: WindowActionExecuting {
     func execute(_ request: PlatformActionRequest, snapshot: DockSnapshot, forcedMinimizedPrior: Bool,
-                 cancellation: OperationCancellation, onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?) -> Bool {
+                 cancellation: OperationCancellation, onHandoffTarget: (@Sendable (WindowID) -> Void)?) -> Bool {
         request.kind == .minimizeWindow && !cancellation.isCancelled
     }
 }

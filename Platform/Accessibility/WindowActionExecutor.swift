@@ -2,7 +2,42 @@ import AppKit
 import ApplicationServices
 import Foundation
 #if DEBUG
+import Synchronization
+#endif
+#if DEBUG
 import OSLog
+#endif
+
+#if DEBUG
+final class WindowRestoreTrace: Sendable {
+    @TaskLocal static var current: WindowRestoreTrace?
+    private static let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "window-restore")
+    private let remaining = Mutex(32)
+    private let started = ContinuousClock.now
+    let token: UUID
+    let identity: WindowActionIdentity
+
+    init(token: UUID, identity: WindowActionIdentity) {
+        self.token = token
+        self.identity = identity
+    }
+
+    var isRecent: Bool { started.duration(to: .now) < .seconds(8) }
+
+    static func markCurrent(_ event: String, detail: @autoclosure () -> String = "") {
+        current?.mark(event, detail: detail())
+    }
+
+    func mark(_ event: String, detail: String = "") {
+        guard remaining.withLock({ count in
+            guard count > 0 else { return false }
+            count -= 1
+            return true
+        }) else { return }
+        let elapsed = Int(started.duration(to: .now) / .milliseconds(1))
+        Self.logger.notice("restore token=\(self.token.uuidString, privacy: .public) pid=\(self.identity.pid, privacy: .public) window=\(self.identity.cgWindowID ?? 0, privacy: .public) elapsed-ms=\(elapsed) event=\(event, privacy: .public) \(detail, privacy: .public)")
+    }
+}
 #endif
 
 struct WindowApplicationState: Sendable {
@@ -162,7 +197,14 @@ struct AccessibilityWindowActionExecutor: Sendable {
     @discardableResult
     func activateApplication(pid: pid_t, windowID: CGWindowID? = nil, element: AXUIElement? = nil) -> Bool {
         guard canAct(pid: pid, windowID: windowID, element: element) else { return false }
-        return system.activate(pid)
+        #if DEBUG
+        WindowRestoreTrace.markCurrent("native-application-activate")
+        #endif
+        let accepted = system.activate(pid)
+        #if DEBUG
+        WindowRestoreTrace.markCurrent("native-application-activate-result", detail: "accepted=\(accepted)")
+        #endif
+        return accepted
     }
 
     struct ActionExecution {
@@ -260,7 +302,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
         let visibleWindows = liveWindows.filter { !$0.isMinimized }
 
         if let window = visibleWindows.first, canAct(pid: pid, windowID: window.cgWindowID, element: window.element) {
-            _ = reader.accessibility.perform(visibleWindows[0].element, kAXRaiseAction as CFString)
+            raiseForActivation(visibleWindows[0].element, windowID: window.cgWindowID)
             return activateApplication(pid: pid)
         }
 
@@ -378,13 +420,15 @@ struct AccessibilityWindowActionExecutor: Sendable {
         preActivateForRestore: Bool = false,
         awaitOnScreenBeforeFocus: Bool = false,
         owningApplication: ApplicationIdentity? = nil,
-        rebindAfterRestore: Bool = false
+        rebindAfterRestore: Bool = false,
+        onRestoredFocus: ((WindowFocusConfirmation) -> Void)? = nil
     ) -> Bool {
         var handle = handle
         var canRebind = false
         var restoredNumber = knownCGWindowID
         var rebindDeadline: TimeInterval = 0
         var visibleRetryDeadline: TimeInterval?
+        var focusedReboundWindow: CGWindowID?
 
         func revalidateHandle() -> Bool {
             if canAct(on: handle) { return true }
@@ -398,7 +442,9 @@ struct AccessibilityWindowActionExecutor: Sendable {
             guard canAct(on: rebound) else { return false }
             handle = rebound
             restoredNumber = number
-            postSkyLightWindowFocus(pid: handle.pid, windowID: number, element: handle.element)
+            if postSkyLightWindowFocus(pid: handle.pid, windowID: number, element: handle.element) {
+                focusedReboundWindow = number
+            }
             return true
         }
 
@@ -430,6 +476,9 @@ struct AccessibilityWindowActionExecutor: Sendable {
                 postSkyLightFrontSwitchOnly(pid: handle.pid, windowID: wid, element: handle.element)
             }
             let restored = setMinimized(false, for: handle)
+            #if DEBUG
+            WindowRestoreTrace.markCurrent("native-deminiaturize", detail: "accepted=\(restored)")
+            #endif
             if rebindAfterRestore, !cancellation.isCancelled {
                 let readBudget = OperationReadBudget(maximumDuration: 0.05, cancellation: cancellation)
                 canRebind = restored || reader.withOperationBudget(readBudget)
@@ -437,29 +486,55 @@ struct AccessibilityWindowActionExecutor: Sendable {
                 rebindDeadline = ProcessInfo.processInfo.systemUptime + min(0.9, max(0, confirmationTimeout))
             }
             if (awaitOnScreenBeforeFocus && !preActivateForRestore) || (canRebind && !revalidateHandle()) {
-                waitForWindowOnScreen { revalidateHandle() ? restoredNumber : nil }
+                let onScreen = waitForWindowOnScreen { revalidateHandle() ? restoredNumber : nil }
+                #if DEBUG
+                WindowRestoreTrace.markCurrent("native-await-onscreen-result", detail: "on-screen=\(onScreen)")
+                #else
+                _ = onScreen
+                #endif
             }
-            if revalidateHandle(), let wid = restoredNumber {
-                postSkyLightWindowFocus(pid: handle.pid, windowID: wid, element: handle.element)
+            if revalidateHandle() {
+                let result = reader.accessibility.set(handle.element, kAXMainAttribute as CFString, kCFBooleanTrue)
+                #if DEBUG
+                WindowRestoreTrace.markCurrent("native-main-result", detail: "window=\(handle.cgWindowID ?? 0) ax-error=\(result.rawValue)")
+                #else
+                _ = result
+                #endif
             }
-            if revalidateHandle() { _ = reader.accessibility.set(handle.element, kAXMainAttribute as CFString, kCFBooleanTrue) }
         }
 
         return WindowActivationAttempt.run(
-            requestPrivateFocus: { requestWindowFocusViaSkyLight(handle) },
-            raise: { if canAct(on: handle) { _ = reader.accessibility.perform(handle.element, kAXRaiseAction as CFString) } },
+            requestPrivateFocus: {
+                if let focusedReboundWindow, focusedReboundWindow == handle.cgWindowID { return true }
+                return requestWindowFocusViaSkyLight(handle)
+            },
+            raise: { if canAct(on: handle) { raiseForActivation(handle.element, windowID: handle.cgWindowID) } },
             activateApplication: {
                 _ = activateApplication(pid: handle.pid, windowID: handle.cgWindowID, element: handle.element)
             },
             confirm: { timeout in
-                confirmFocused(pid: handle.pid, windowID: handle.cgWindowID, element: handle.element,
+                let confirmed = confirmFocused(pid: handle.pid, windowID: handle.cgWindowID, element: handle.element,
                                timeout: timeout, pollIntervalMicroseconds: pollIntervalMicroseconds,
                                requiresRestored: wasMinimized, owningApplication: owningApplication,
-                               restoredWindowNumber: canRebind ? { revalidateHandle() ? handle.cgWindowID : nil } : nil)
+                               restoredWindowNumber: canRebind ? { revalidateHandle() ? handle.cgWindowID : nil } : nil,
+                               onRestoredFocus: wasMinimized ? onRestoredFocus : nil)
+                #if DEBUG
+                WindowRestoreTrace.markCurrent("native-focus-confirmation", detail: "confirmed=\(confirmed) timeout-ms=\(Int(timeout * 1_000))")
+                #endif
+                return confirmed
             },
             timeout: confirmationTimeout,
             isCancelled: { !waitsForCurrentHandle() }
         )
+    }
+
+    private func raiseForActivation(_ element: AXUIElement, windowID: CGWindowID?) {
+        let result = reader.accessibility.perform(element, kAXRaiseAction as CFString)
+        #if DEBUG
+        WindowRestoreTrace.markCurrent("native-raise-result", detail: "window=\(windowID ?? 0) ax-error=\(result.rawValue)")
+        #else
+        _ = result
+        #endif
     }
 
     @discardableResult
@@ -516,7 +591,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
         return false
     }
 
-    private func isCurrentActiveOwner(_ owner: ApplicationIdentity?) -> Bool {
+    fileprivate func isCurrentActiveOwner(_ owner: ApplicationIdentity?) -> Bool {
         guard let owner, system.generation(owner.pid) == owner.generation,
               let application = system.app(owner.pid), !application.isTerminated, !application.isHidden,
               application.origin == owner.origin else { return false }
@@ -527,13 +602,15 @@ struct AccessibilityWindowActionExecutor: Sendable {
         pid: pid_t, windowID: CGWindowID?, element: AXUIElement? = nil,
         timeout: TimeInterval, pollIntervalMicroseconds: useconds_t = 10_000, requiresRestored: Bool = false,
         owningApplication: ApplicationIdentity? = nil,
-        restoredWindowNumber: (() -> CGWindowID?)? = nil
+        restoredWindowNumber: (() -> CGWindowID?)? = nil,
+        onRestoredFocus: ((WindowFocusConfirmation) -> Void)? = nil
     ) -> Bool {
         let deadline = ProcessInfo.processInfo.systemUptime + max(0, timeout)
         repeat {
             guard !cancellation.isCancelled else { return false }
             let windowID = restoredWindowNumber.map { $0() } ?? windowID
             let remaining = max(0.001, deadline - ProcessInfo.processInfo.systemUptime)
+            let observedAt = onRestoredFocus.map { _ in ProcessInfo.processInfo.systemUptime }
             let focused: AXUIElement?
             if restoredWindowNumber != nil, windowID == nil {
                 focused = nil
@@ -561,7 +638,14 @@ struct AccessibilityWindowActionExecutor: Sendable {
                         restored = reader.boolAttribute(kAXMinimizedAttribute as CFString, from: focused, maxAttempts: 1) == false
                     }
                     if restored, canAct(pid: pid, windowID: windowID, element: focused),
-                       system.app(pid)?.isActive == true || isCurrentActiveOwner(owningApplication) { return true }
+                       system.app(pid)?.isActive == true || isCurrentActiveOwner(owningApplication) {
+                        if let onRestoredFocus, let observedAt, let windowID, windowID != 0,
+                           let element, CFEqual(focused, element), !cancellation.isCancelled {
+                            onRestoredFocus(WindowFocusConfirmation(pid: pid, windowID: windowID, element: AXElementKey(e: focused),
+                                                                    observedAt: observedAt))
+                        }
+                        return true
+                    }
                 }
             }
             let wait = min(Double(pollIntervalMicroseconds) / 1_000_000,
@@ -731,8 +815,16 @@ struct AccessibilityWindowActionExecutor: Sendable {
 
     @discardableResult
     fileprivate func postSkyLightWindowFocus(pid: pid_t, windowID: CGWindowID, element: AXUIElement) -> Bool {
-        guard postSkyLightFrontSwitchOnly(pid: pid, windowID: windowID, element: element) else { return false }
-        return postSkyLightMakeKeyDown(pid: pid, windowID: windowID, element: element)
+        let switched = postSkyLightFrontSwitchOnly(pid: pid, windowID: windowID, element: element)
+        #if DEBUG
+        WindowRestoreTrace.markCurrent("native-front-switch-result", detail: "window=\(windowID) accepted=\(switched)")
+        #endif
+        guard switched else { return false }
+        let madeKey = postSkyLightMakeKeyDown(pid: pid, windowID: windowID, element: element)
+        #if DEBUG
+        WindowRestoreTrace.markCurrent("native-make-key-result", detail: "window=\(windowID) accepted=\(madeKey)")
+        #endif
+        return madeKey
     }
 
     @discardableResult
@@ -839,13 +931,58 @@ struct PlatformActionExecutor: WindowActionExecuting {
             focusBackend: focusBackend, system: system)
     }
 
+    func hasNativeFocus(_ record: WindowRecord, cancellation: OperationCancellation) -> Bool {
+        guard !cancellation.isCancelled, let windowID = record.cgWindowID,
+              WindowCommandIdentity.validateProcess(record, system: system) else { return false }
+        let focused: AXElementKey?
+        if system.app(record.pid)?.isActive == true {
+            let observation = reader.focusedWindowRead(forPID: record.pid, messagingTimeout: 0.05,
+                                                       cancellation: cancellation)
+            guard observation.result == .window(windowID), system.app(record.pid)?.isActive == true else { return false }
+            focused = observation.windowElement
+        } else if windowExecutor.isCurrentActiveOwner(record.owningApplication) {
+            let observation = reader.systemFocusedWindowRead(messagingTimeout: 0.05, cancellation: cancellation)
+            guard observation.result == .window(pid: record.pid, windowID: windowID),
+                  windowExecutor.isCurrentActiveOwner(record.owningApplication) else { return false }
+            focused = observation.windowElement
+        } else {
+            return false
+        }
+        return !cancellation.isCancelled && (record.actionTarget.map { $0.element == focused } ?? true)
+    }
+
     @discardableResult
     func execute(
         _ request: PlatformActionRequest,
         snapshot: DockSnapshot,
         forcedMinimizedPrior: Bool,
         cancellation: OperationCancellation,
-        onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?
+        onHandoffTarget: (@Sendable (WindowID) -> Void)?
+    ) -> Bool {
+        execute(request, snapshot: snapshot, forcedMinimizedPrior: forcedMinimizedPrior,
+                cancellation: cancellation, onHandoffTarget: onHandoffTarget, onRestoredFocus: nil)
+    }
+
+    func executeWithFocusConfirmation(
+        _ request: PlatformActionRequest,
+        snapshot: DockSnapshot,
+        forcedMinimizedPrior: Bool,
+        cancellation: OperationCancellation,
+        onHandoffTarget: (@Sendable (WindowID) -> Void)?
+    ) -> WindowActionResult {
+        var focus: WindowFocusConfirmation?
+        let success = execute(request, snapshot: snapshot, forcedMinimizedPrior: forcedMinimizedPrior,
+            cancellation: cancellation, onHandoffTarget: onHandoffTarget, onRestoredFocus: { focus = $0 })
+        return WindowActionResult(success: success, focus: success && !cancellation.isCancelled ? focus : nil)
+    }
+
+    private func execute(
+        _ request: PlatformActionRequest,
+        snapshot: DockSnapshot,
+        forcedMinimizedPrior: Bool,
+        cancellation: OperationCancellation,
+        onHandoffTarget: (@Sendable (WindowID) -> Void)?,
+        onRestoredFocus: ((WindowFocusConfirmation) -> Void)?
     ) -> Bool {
         let commandBudget: OperationReadBudget? = request.kind == .activateWindow ? nil
             : OperationReadBudget(maximumDuration: 3, cancellation: cancellation)
@@ -939,6 +1076,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
         )
         #if DEBUG
         if switches.clickTraceEnabled { ClickLatencyTrace.markCurrent("handle", detail: captureTier) }
+        WindowRestoreTrace.markCurrent("native-handle-capture", detail: "tier=\(captureTier) found=\(handle != nil) explicit-unhide=\(hiddenFinder)")
         #endif
 
         guard !cancellation.isCancelled else { return false }
@@ -952,6 +1090,9 @@ struct PlatformActionExecutor: WindowActionExecuting {
             ) else {
                 return false
             }
+            #if DEBUG
+            WindowRestoreTrace.markCurrent("native-application-fallback")
+            #endif
             return executeAppFallback(request: request, record: record, executor: windowExecutor)
         }
         guard WindowCommandIdentity.permitsElement(record, element: handle.element) else { return false }
@@ -961,11 +1102,17 @@ struct PlatformActionExecutor: WindowActionExecuting {
             guard WindowCommandIdentity.validate(record, element: handle.element,
                 reader: reader.withOperationBudget(identityBudget), system: system),
                 !cancellation.isCancelled else { return false }
+            #if DEBUG
+            WindowRestoreTrace.markCurrent("native-application-unhide")
+            #endif
             system.unhide(record.pid)
             let deadline = ContinuousClock.now + .milliseconds(200)
             while !cancellation.isCancelled, system.app(record.pid)?.isHidden == true, ContinuousClock.now < deadline {
                 usleep(20_000)
             }
+            #if DEBUG
+            WindowRestoreTrace.markCurrent("native-unhide-wait-ended", detail: "cancelled=\(cancellation.isCancelled)")
+            #endif
         }
 
         switch request.kind {
@@ -978,6 +1125,15 @@ struct PlatformActionExecutor: WindowActionExecuting {
                 if switches.clickTraceEnabled { ClickLatencyTrace.markCurrent("earlyFocus") }
                 #endif
             }
+            let restoreFocusObserver: ((WindowFocusConfirmation) -> Void)?
+            if case .external = record.source, let expected = record.actionTarget?.element, let onRestoredFocus,
+               record.status == .minimized || !forcedMinimizedPrior {
+                restoreFocusObserver = { confirmation in
+                    if confirmation.element == expected { onRestoredFocus(confirmation) }
+                }
+            } else {
+                restoreFocusObserver = nil
+            }
             return windowExecutor.activate(
                 handle,
                 confirmationTimeout: effectiveKnownMinimized ? 0.9 : (isFinderWindow ? 0.6 : 0.2),
@@ -987,11 +1143,12 @@ struct PlatformActionExecutor: WindowActionExecuting {
                     && MinimizedRestorePreActivation.canPreActivate(snapshot: snapshot, target: record),
                 awaitOnScreenBeforeFocus: forcedMinimizedPrior,
                 owningApplication: record.owningApplication,
-                rebindAfterRestore: record.actionTarget != nil
+                rebindAfterRestore: record.actionTarget != nil,
+                onRestoredFocus: restoreFocusObserver
             )
         case .minimizeWindow:
             let handoff = beginHandoff(handle: handle, record: record, snapshot: snapshot,
-                                       onHandoffActivePrediction: onHandoffActivePrediction, executor: windowExecutor, patience: .minimize)
+                                       onHandoffTarget: onHandoffTarget, executor: windowExecutor, patience: .minimize)
             let preSwitched = handoff?.preSwitched == true
 
             func finishSuccessfulMinimize(_ exec: AccessibilityWindowActionExecutor.ActionExecution) -> Bool {
@@ -1045,7 +1202,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
             return false
         case .closeWindow:
             let handoff = beginHandoff(handle: handle, record: record, snapshot: snapshot,
-                                       onHandoffActivePrediction: onHandoffActivePrediction, executor: windowExecutor, patience: .close)
+                                       onHandoffTarget: onHandoffTarget, executor: windowExecutor, patience: .close)
             if windowExecutor.close(handle) {
                 finishHandoff(handoff, executor: windowExecutor)
                 return true
@@ -1078,7 +1235,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
         handle: AccessibilityWindowActionExecutor.WindowHandle,
         record: WindowRecord,
         snapshot: DockSnapshot,
-        onHandoffActivePrediction: (@Sendable (WindowID) -> Void)?,
+        onHandoffTarget: (@Sendable (WindowID) -> Void)?,
         executor windowExecutor: AccessibilityWindowActionExecutor,
         patience: HandoffPatience
     ) -> Handoff? {
@@ -1088,7 +1245,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
         switch verdict {
         case .siblingTakesOver(let windowID):
             guard windowExecutor.canAct(on: handle) else { return nil }
-            onHandoffActivePrediction?(windowID)
+            onHandoffTarget?(windowID)
             return nil
         case .none:
             return nil
@@ -1103,7 +1260,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
                 element = nil
             }
             guard windowExecutor.canAct(on: handle) else { return nil }
-            onHandoffActivePrediction?(windowID)
+            onHandoffTarget?(windowID)
             let preSwitched = windowExecutor.switchFrontmostForHandoff(
                 to: candidate, windowID: wid, element: element, from: handle, original: record,
                 deactivationCap: patience.deactivationCap

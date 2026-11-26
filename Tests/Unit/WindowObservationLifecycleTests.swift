@@ -82,7 +82,7 @@ final class ObservationFixture: WindowObservationSession, Sendable {
 
 @MainActor
 final class WindowObservationLifecycleTests: XCTestCase {
-    func testApplicationObserverSubscribesToWindowMovement() async {
+    func testApplicationObserverSubscribesToWindowMovementAndResize() async {
         let fixture = ObservationFixture()
         let observer = AppWindowObserver(pid: 42, makeSession: { _, _ in fixture })
         defer { observer.stop() }
@@ -90,6 +90,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
         for task in observer.pendingWorkForTesting { await task.value }
 
         XCTAssertTrue(fixture.applicationNotifications.withLock { $0.contains(kAXWindowMovedNotification) })
+        XCTAssertTrue(fixture.applicationNotifications.withLock { $0.contains(kAXWindowResizedNotification) })
     }
 
     func testBlockedMovementRegistrationLeavesRequiredObserverReadyAndAttached() async {
@@ -207,7 +208,10 @@ final class WindowObservationLifecycleTests: XCTestCase {
         XCTAssertTrue(observer.isActive)
         XCTAssertEqual(attempts.withLock { $0 }, 2)
         XCTAssertEqual(fixture.attachments, 1)
-        XCTAssertEqual(fixture.applicationNotifications.withLock { $0.count }, 4)
+        XCTAssertEqual(fixture.applicationNotifications.withLock { $0 }, [
+            kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification,
+            kAXWindowMovedNotification, kAXWindowResizedNotification
+        ])
         observer.stop()
     }
 
@@ -253,14 +257,15 @@ final class WindowObservationLifecycleTests: XCTestCase {
         let instance = observer.subscribedElement(cgWindowID: 1)?.instanceID
         for _ in 0..<20 { observer.start() }
         for task in observer.pendingWorkForTesting { await task.value }
-        XCTAssertEqual(fixture.applicationCalls.withLock { $0.count }, 4)
+        XCTAssertEqual(fixture.applicationCalls.withLock { $0.count }, 5)
         now.withLock { $0 = 101 }
         observer.start()
         for task in observer.pendingWorkForTesting { await task.value }
         XCTAssertTrue(observer.isActive)
         XCTAssertEqual(fixture.applicationCalls.withLock { $0 }, [
             kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification,
-            kAXMainWindowChangedNotification, kAXWindowMovedNotification, kAXWindowCreatedNotification
+            kAXMainWindowChangedNotification, kAXWindowMovedNotification, kAXWindowResizedNotification,
+            kAXWindowCreatedNotification
         ])
         XCTAssertEqual(fixture.attachments, 1)
         XCTAssertTrue(observer.isCovered(cgWindowID: 1))
@@ -286,7 +291,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
             for task in observer.pendingWorkForTesting { await task.value }
         }
         XCTAssertFalse(observer.isActive)
-        XCTAssertEqual(fixture.applicationCalls.withLock { $0.count }, 4)
+        XCTAssertEqual(fixture.applicationCalls.withLock { $0.count }, 5)
         XCTAssertEqual(fixture.attachments, 1)
         observer.stop()
     }
@@ -351,7 +356,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
         fixture.blockedApplicationNotification.withLock { $0 = kAXWindowCreatedNotification }
         now.withLock { $0 = 101 }
         observer.start()
-        await waitUntil { fixture.applicationCalls.withLock { $0.count } == 5 }
+        await waitUntil { fixture.applicationCalls.withLock { $0.count } == 6 }
         let pending = observer.pendingWorkForTesting
         observer.stop()
         fixture.gate.signal()
@@ -359,7 +364,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
         XCTAssertFalse(observer.isActive)
         XCTAssertEqual(fixture.attachments, 1)
         XCTAssertEqual(fixture.detachments, 1)
-        XCTAssertEqual(fixture.applicationCalls.withLock { $0.count }, 5)
+        XCTAssertEqual(fixture.applicationCalls.withLock { $0.count }, 6)
     }
 
     func testGeometryRegistrationRetriesTransientFailureOnFallbackWithoutBusyLoop() async {
@@ -659,7 +664,9 @@ final class WindowObservationLifecycleTests: XCTestCase {
         _ = observer.registerWindow(AXUIElementCreateApplication(42), cgWindowID: 1)
         await waitUntil { observer.isCovered(cgWindowID: 1) }
         for task in observer.pendingWorkForTesting { await task.value }
-        XCTAssertEqual(fixture.calls.withLock { $0.count }, 8)
+        XCTAssertEqual(fixture.windowCalls.withLock { $0 }, 4)
+        XCTAssertEqual(fixture.applicationCalls.withLock { $0.count }, 5)
+        XCTAssertEqual(fixture.calls.withLock { $0.count }, 9)
         XCTAssertFalse(fixture.calls.withLock { $0.contains(true) })
         observer.stop()
         XCTAssertEqual(fixture.detachments, 1)

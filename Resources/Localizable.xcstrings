@@ -1403,106 +1403,6 @@
         }
       }
     },
-    "Putting the windows it moved back where they were.": {
-      "localizations": {
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "正在把之前让开过的窗口放回原位。"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Putting the windows it moved back where they were."
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "正在把先前挪開過的視窗放回原位。"
-          }
-        },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "避けていたウインドウを元の位置に戻しています。"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Die zuvor verschobenen Fenster werden an ihre alte Position zurückgesetzt."
-          }
-        },
-        "fr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Remise en place des fenêtres qui avaient été écartées."
-          }
-        },
-        "es": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Devolviendo a su sitio las ventanas que se habían apartado."
-          }
-        },
-        "es-419": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Devolviendo a su lugar las ventanas que se habían apartado."
-          }
-        },
-        "pt-BR": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Devolvendo ao lugar original as janelas que foram movidas."
-          }
-        },
-        "pt-PT": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "A devolver ao lugar original as janelas que foram movidas."
-          }
-        },
-        "it": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Le finestre spostate vengono rimesse al loro posto."
-          }
-        },
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이동했던 윈도우를 원래 위치로 되돌리는 중입니다."
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Окна, которые были сдвинуты, возвращаются на прежние места."
-          }
-        },
-        "tr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Taşıdığı pencereler eski yerlerine geri konuluyor."
-          }
-        },
-        "hi": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "जिन विंडो को हटाया गया था, उन्हें वापस उनकी जगह पर रखा जा रहा है।"
-          }
-        },
-        "vi": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Đang đưa các cửa sổ đã bị dời đi về vị trí ban đầu."
-          }
-        }
-      }
-    },
     "Options": {
       "localizations": {
         "zh-Hans": {
@@ -2199,106 +2099,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Đang khởi chạy lại DeskMote…"
-          }
-        }
-      }
-    },
-    "Restoring Windows…": {
-      "localizations": {
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "正在还原窗口…"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Restoring Windows…"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "正在還原視窗⋯"
-          }
-        },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "ウインドウを元に戻しています…"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Fenster werden wiederhergestellt …"
-          }
-        },
-        "fr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Restauration des fenêtres…"
-          }
-        },
-        "es": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Restaurando ventanas…"
-          }
-        },
-        "es-419": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Restaurando ventanas…"
-          }
-        },
-        "pt-BR": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Restaurando janelas…"
-          }
-        },
-        "pt-PT": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "A restaurar janelas…"
-          }
-        },
-        "it": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Ripristino delle finestre…"
-          }
-        },
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "윈도우 복원 중…"
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Восстановление окон…"
-          }
-        },
-        "tr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Pencereler geri yükleniyor…"
-          }
-        },
-        "hi": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "विंडो रीस्टोर की जा रही हैं…"
-          }
-        },
-        "vi": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Đang khôi phục các cửa sổ…"
           }
         }
       }
@@ -6303,6 +6103,306 @@
           "stringUnit": {
             "state": "translated",
             "value": "Di chuyển vào thư mục"
+          }
+        }
+      }
+    },
+    "DeskMote Couldn’t Read Spaces": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote Couldn’t Read Spaces"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote 无法读取空间"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote 無法讀取 Spaces"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote が操作スペースを読み取れませんでした"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote konnte Spaces nicht lesen"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote n’a pas pu lire les espaces"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote no ha podido leer los espacios"
+          }
+        },
+        "es-419": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote no pudo leer los espacios"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O DeskMote não conseguiu ler os Spaces"
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O DeskMote não conseguiu ler os Spaces"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote non ha potuto leggere gli spazi"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote가 Spaces를 읽지 못했습니다"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote не удалось прочитать данные Spaces"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote Spaces bilgilerini okuyamadı"
+          }
+        },
+        "hi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote Spaces नहीं पढ़ सका"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "DeskMote không đọc được Spaces"
+          }
+        }
+      }
+    },
+    "Some taskbars or window buttons may be unavailable. In Console, search for the error code in the taskbar-spaces category.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Some taskbars or window buttons may be unavailable. In Console, search for the error code in the taskbar-spaces category."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "部分任务栏或窗口按钮可能不可用。请在“控制台”的 taskbar-spaces 类别中搜索错误代码。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "部分工作列或視窗按鈕可能無法使用。請在「主控台」的 taskbar-spaces 類別搜尋錯誤代碼。"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "一部のタスクバーやウインドウボタンを利用できない場合があります。「コンソール」で taskbar-spaces カテゴリのエラーコードを検索してください。"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Einige Taskleisten oder Fenstertasten sind möglicherweise nicht verfügbar. Suchen Sie in der Konsole in der Kategorie „taskbar-spaces“ nach dem Fehlercode."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Certaines barres des tâches ou certains boutons de fenêtre peuvent être indisponibles. Dans Console, recherchez le code d’erreur dans la catégorie taskbar-spaces."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Algunas barras de tareas o botones de ventana pueden no estar disponibles. En Consola, busca el código de error en la categoría taskbar-spaces."
+          }
+        },
+        "es-419": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Es posible que algunas barras de tareas o botones de ventana no estén disponibles. En Consola, busca el código de error en la categoría taskbar-spaces."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Algumas barras de tarefas ou botões de janela podem estar indisponíveis. No Console, procure o código do erro na categoria taskbar-spaces."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Algumas barras de tarefas ou botões de janela podem estar indisponíveis. Na Consola, procure o código de erro na categoria taskbar-spaces."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Alcune barre delle applicazioni o alcuni pulsanti delle finestre potrebbero non essere disponibili. In Console, cerca il codice di errore nella categoria taskbar-spaces."
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "일부 작업 표시줄이나 윈도우 버튼을 사용하지 못할 수 있습니다. 콘솔의 taskbar-spaces 카테고리에서 오류 코드를 검색하십시오."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Некоторые панели задач или кнопки окон могут быть недоступны. Найдите код ошибки в категории taskbar-spaces в приложении «Консоль»."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bazı görev çubukları veya pencere düğmeleri kullanılamayabilir. Konsol’da taskbar-spaces kategorisinde hata kodunu arayın."
+          }
+        },
+        "hi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "कुछ टास्कबार या विंडो बटन उपलब्ध नहीं हो सकते हैं। कंसोल में taskbar-spaces श्रेणी में त्रुटि कोड खोजें।"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Một số thanh tác vụ hoặc nút cửa sổ có thể không khả dụng. Trong Console, hãy tìm mã lỗi trong danh mục taskbar-spaces."
+          }
+        }
+      }
+    },
+    "macOS app catalog is unavailable.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "macOS app catalog is unavailable."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "macOS 应用目录不可用。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "無法使用 macOS App 目錄。"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "macOS のアプリ一覧を利用できません。"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Der macOS-App-Katalog ist nicht verfügbar."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le catalogue d’apps de macOS est indisponible."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "El catálogo de apps de macOS no está disponible."
+          }
+        },
+        "es-419": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "El catálogo de apps de macOS no está disponible."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O catálogo de apps do macOS está indisponível."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O catálogo de aplicações do macOS está indisponível."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Il catalogo delle app di macOS non è disponibile."
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "macOS 앱 카탈로그를 사용할 수 없습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Каталог приложений macOS недоступен."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "macOS uygulama kataloğu kullanılamıyor."
+          }
+        },
+        "hi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "macOS ऐप कैटलॉग उपलब्ध नहीं है।"
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Không thể truy cập danh mục ứng dụng macOS."
           }
         }
       }

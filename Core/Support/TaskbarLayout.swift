@@ -34,6 +34,7 @@ enum TaskbarMetrics {
 enum AppsMenuGeometry {
     static let buttonFrame = CGRect(x: TaskbarMetrics.leadingInset, y: TaskbarMetrics.buttonTop,
                                    width: 29, height: TaskbarMetrics.buttonHeight)
+    static let buttonHitFrame = CGRect(x: 0, y: buttonFrame.minY, width: buttonFrame.maxX, height: buttonFrame.height)
     static let windowLeadingInset = buttonFrame.maxX + TaskbarMetrics.buttonSpacing
     static let popupGap: CGFloat = 12
 

@@ -76,8 +76,8 @@ struct PermissionOnboardingView: View {
         case .moveToApplications: return "folder.badge.plus"
         case .waiting, .stalled: return "lock.shield"
         case .recoveryWaiting, .recoveryStalled: return "exclamationmark.shield"
-        case .restoringWindows, .relaunching: return "arrow.clockwise"
-        case .restorationFailed, .relaunchFailed: return "xmark.octagon"
+        case .relaunching: return "arrow.clockwise"
+        case .relaunchFailed: return "xmark.octagon"
         }
     }
 
@@ -86,9 +86,8 @@ struct PermissionOnboardingView: View {
         case .moveToApplications: return String(localized: "Move DeskMote to Applications")
         case .waiting, .stalled: return String(localized: "Turn On Accessibility Permission")
         case .recoveryWaiting, .recoveryStalled: return String(localized: "Accessibility Permission Was Revoked")
-        case .restoringWindows: return String(localized: "Restoring Windows…")
         case .relaunching: return String(localized: "Restarting DeskMote…")
-        case .restorationFailed, .relaunchFailed: return String(localized: "Restart Failed")
+        case .relaunchFailed: return String(localized: "Restart Failed")
         }
     }
 
@@ -97,9 +96,8 @@ struct PermissionOnboardingView: View {
         case .moveToApplications: return String(localized: "This copy is running from a temporary or read-only location.")
         case .waiting, .stalled: return String(localized: "DeskMote needs this permission to read and manage your windows.")
         case .recoveryWaiting, .recoveryStalled: return String(localized: "DeskMote will restart itself once you grant it again.")
-        case .restoringWindows: return String(localized: "Putting the windows it moved back where they were.")
         case .relaunching: return String(localized: "This will only take a moment.")
-        case .restorationFailed, .relaunchFailed: return String(localized: "DeskMote is still running. You can try again.")
+        case .relaunchFailed: return String(localized: "DeskMote is still running. You can try again.")
         }
     }
 
@@ -116,10 +114,8 @@ struct PermissionOnboardingView: View {
             return String(format: String(localized: "Turn on DeskMote in %@. This window closes by itself once you do, and the taskbar finishes starting."), settingsPath)
         case .recoveryWaiting, .recoveryStalled:
             return String(format: String(localized: "DeskMote just lost its Accessibility permission, so the taskbar has been put away. Turn DeskMote back on in %@."), settingsPath)
-        case .restoringWindows, .relaunching:
+        case .relaunching:
             return String(localized: "Nothing to do here — just a moment.")
-        case .restorationFailed:
-            return nil
         case let .relaunchFailed(message):
             return String(format: String(localized: "Couldn’t start a new instance of DeskMote: %@\n\nYou can click Retry, or quit and open it manually from your Applications folder."), message)
         }
@@ -183,35 +179,27 @@ struct PermissionOnboardingView: View {
         case .moveToApplications:
             quitButton
             Button("Open Applications Folder") { coordinator.openApplications() }
-                .keyboardShortcut(.defaultAction)
 
         case .waiting, .recoveryWaiting:
             quitButton
             Button("Open System Settings") { coordinator.openSettings() }
-                .keyboardShortcut(.defaultAction)
 
         case .stalled, .recoveryStalled:
             quitButton
             Button("Check Again") { coordinator.recheck() }
             Button("Open System Settings") { coordinator.openSettings() }
-                .keyboardShortcut(.defaultAction)
 
-        case .restoringWindows, .relaunching:
+        case .relaunching:
             ProgressView()
                 .controlSize(.small)
 
-        case .restorationFailed, .relaunchFailed:
+        case .relaunchFailed:
             quitButton
-            if presentation == .restorationFailed {
-                Button("Open System Settings") { coordinator.openSettings() }
-            }
             Button("Retry") { coordinator.retryRelaunch() }
-                .keyboardShortcut(.defaultAction)
         }
     }
 
     private var quitButton: some View {
         Button("Quit") { coordinator.quit() }
-            .keyboardShortcut(.cancelAction)
     }
 }

@@ -34,8 +34,6 @@ enum UserIntent: Hashable, Sendable {
 
 final class LifecycleActionPlanner {
     private let isAppFrontmost: (pid_t) -> Bool
-    private static let staleActiveGuardEnabled =
-        DebugSwitch.staleActiveGuard.isEnabled(in: ProcessInfo.processInfo.environment)
 
     init(isAppFrontmost: @escaping (pid_t) -> Bool = {
         NSRunningApplication(processIdentifier: $0)?.isActive == true
@@ -46,7 +44,7 @@ final class LifecycleActionPlanner {
     func plan(
         intent: UserIntent,
         snapshot: DockSnapshot,
-        optimisticStates: [String: OptimisticWindowState] = [:]
+        pendingMinimize: Bool = false
     ) -> PlatformActionRequest {
         switch intent {
         case let .toggle(id):
@@ -55,13 +53,7 @@ final class LifecycleActionPlanner {
             }
             let appIsFrontmost = isAppFrontmost(record.pid)
                 || record.owningApplication.map { isAppFrontmost($0.pid) } == true
-            if appIsFrontmost, OptimisticWindowState.activeWindowID(in: snapshot, states: optimisticStates) == id {
-                if Self.staleActiveGuardEnabled,
-                   OptimisticWindowState.siblingActivationInFlight(
-                       windowID: id.rawValue, optimisticStates: optimisticStates, snapshot: snapshot
-                   ) {
-                    return PlatformActionRequest(kind: .activateWindow, windowID: id)
-                }
+            if appIsFrontmost, record.status == .active, !pendingMinimize {
                 return PlatformActionRequest(kind: .minimizeWindow, windowID: id)
             }
             return PlatformActionRequest(kind: .activateWindow, windowID: id)

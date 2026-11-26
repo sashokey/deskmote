@@ -1,53 +1,101 @@
 import AppKit
 import Combine
+import os
 
 @MainActor
 final class TaskbarSpaceStore: ObservableObject {
+    typealias Layouts = [String: SpaceLayoutSnapshot]
+    typealias LayoutRead = @Sendable () -> Result<Layouts, SpaceReadFailure>
+    typealias MembershipRead = @Sendable ([WindowSpaceRequest], Layouts, OperationCancellation)
+        -> Result<SpaceMembershipRead, SpaceReadFailure>
+
+    private enum LayoutTrigger: String {
+        case start
+        case explicitRefresh = "explicit-refresh"
+        case activeSpace = "active-space-notification"
+        case applicationActivated = "application-activated"
+        case windowEvent = "window-event"
+        case interfaceTopology = "display-topology"
+        case windowInventory = "window-inventory"
+
+        var corroboratesLayout: Bool {
+            switch self {
+            case .start, .activeSpace, .windowInventory: false
+            case .explicitRefresh, .applicationActivated, .windowEvent, .interfaceTopology: true
+            }
+        }
+    }
+
+    private typealias MembershipSample = Result<(WindowSpaceSnapshot?, [SpaceReadFailure]), SpaceReadFailure>
+
+    private struct TransferRead {
+        let request: WindowSpaceRequest
+        let batch: UInt64
+    }
+
+    @Published private(set) var activeLayouts: Layouts = [:]
     @Published private(set) var snapshot = WindowSpaceSnapshot()
     @Published private(set) var confirmedSpaceRevision: UInt64 = 0
     private let activeSpaceChange = PassthroughSubject<Void, Never>()
+    private let desktopReturn = PassthroughSubject<Set<String>, Never>()
+    var desktopReturns: AnyPublisher<Set<String>, Never> { desktopReturn.eraseToAnyPublisher() }
     var activeSpaceChanges: AnyPublisher<Void, Never> { activeSpaceChange.eraseToAnyPublisher() }
-    private let read: @Sendable ([WindowSpaceRequest], OperationCancellation) -> WindowSpaceSnapshot?
-    private let readTransfers: @Sendable ([WindowSpaceRequest], OperationCancellation) -> WindowSpaceSnapshot?
+    var onCompatibilityFailure: ((String, String) -> Void)?
+
+    private let readLayouts: LayoutRead?
+    private let readMemberships: MembershipRead?
+    private let readSnapshot: (@Sendable ([WindowSpaceRequest]) -> WindowSpaceSnapshot?)?
     private let notifications: NotificationCenter
-    private let pollInterval: TimeInterval
-    private let queue = DispatchQueue(label: "io.github.sashokey.deskmote.window-spaces", qos: .utility)
+    private let layoutQueue = DispatchQueue(label: "io.github.sashokey.deskmote.space-layout", qos: .userInitiated)
+    private let membershipQueue = DispatchQueue(label: "io.github.sashokey.deskmote.window-spaces", qos: .utility)
+    private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "taskbar-spaces")
     private let work = AsyncWorkScope()
     private var subscriptions = Set<AnyCancellable>()
     private var spaceObserver: NSObjectProtocol?
-    private var timer: Timer?
     private var requests: [WindowSpaceRequest] = []
     private var utilityOnActiveSpace: (WindowID) -> Bool? = { _ in nil }
-    private var revision: UInt64 = 0
     private var spaceRevision: UInt64 = 0
     private var minimumProjectionRevision: UInt64 = 0
+    private var layoutRevision: UInt64 = 0
+    private var membershipRevision: UInt64 = 0
+    private var transferRevision: UInt64 = 0
+    private var transferReads: [UInt64: Task<Void, Never>] = [:]
+    private var activeTransfers: [WindowSpaceIdentity: TransferRead] = [:]
+    private var pendingTransferEvents: Set<WindowSpaceIdentity> = []
+    private var nextWindowRevision: UInt64 = 0
+    private var windowRevisions: [WindowSpaceIdentity: UInt64] = [:]
+    private var corroboratedSpaceRevision: UInt64?
     private var invalidatedDisplays: Set<String> = []
-    private var inFlight = false
-    private var needsRefresh = false
+    private var layoutInFlight = false
+    private var nextLayoutSource: LayoutTrigger?
+    private var membershipInFlight = false
+    private var pendingMemberships: Set<WindowSpaceIdentity> = []
+    private var needsMembershipRead = false
     private var isRunning = false
     private var receivedInventory = false
-    private var unchangedLayoutDeadline: ContinuousClock.Instant?
     private var attachedDisplays: Set<String>?
     private var screenTopology: ScreenTopologySnapshot?
-    private var transferRead: Task<Void, Never>?
+    private var reportedFailures = Set<String>()
 
     init(read: (@Sendable ([WindowSpaceRequest]) -> WindowSpaceSnapshot?)? = nil,
          notifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
-         pollInterval: TimeInterval = 5) {
-        self.read = { requests, cancellation in
-            if let read { return read(requests) }
-            return WindowSpaceObservation.capture(requests, cancellation: cancellation, mode: .live)
-        }
-        self.readTransfers = { requests, cancellation in
-            if let read { return read(requests) }
-            return WindowSpaceObservation.capture(requests, cancellation: cancellation, maximumDuration: 0.2)
-        }
+         pollInterval _: TimeInterval = 0, readLayouts: LayoutRead? = nil, readMemberships: MembershipRead? = nil) {
+        readSnapshot = read
+        if let readLayouts { self.readLayouts = readLayouts }
+        else if read == nil { self.readLayouts = { ManagedSpaceLayoutReader.read() } }
+        else { self.readLayouts = nil }
+        if let readMemberships { self.readMemberships = readMemberships }
+        else if read == nil {
+            self.readMemberships = { requests, layouts, cancellation in
+                WindowSpaceObservation.readMemberships(requests, layouts: layouts, cancellation: cancellation, mode: .live)
+            }
+        } else { self.readMemberships = nil }
         self.notifications = notifications
-        self.pollInterval = pollInterval
     }
 
     func start(snapshots: AnyPublisher<DockSnapshot, Never>,
-               utilityOnActiveSpace: @escaping (WindowID) -> Bool? = { _ in nil }) {
+               utilityOnActiveSpace: @escaping (WindowID) -> Bool? = { _ in nil },
+               windowInvalidations: AnyPublisher<CGWindowID, Never> = Empty().eraseToAnyPublisher()) {
         guard !isRunning else { return }
         isRunning = true
         self.utilityOnActiveSpace = utilityOnActiveSpace
@@ -64,79 +112,93 @@ final class TaskbarSpaceStore: ObservableObject {
         }
         notifications.publisher(for: NSWorkspace.didActivateApplicationNotification)
             .receive(on: DispatchQueue.main).sink { [weak self] _ in
-                guard let self, self.work.isCurrent(generation) else { return }
-                self.refresh()
+                guard let self, self.work.isCurrent(generation),
+                      self.confirmedSpaceRevision != self.spaceRevision || self.activeLayouts.isEmpty else { return }
+                self.requestLayout(source: .applicationActivated)
             }.store(in: &subscriptions)
-        snapshots.receive(on: DispatchQueue.main).sink { [weak self] in
+        snapshots.receive(on: DispatchQueue.main).sink { [weak self] value in
             guard let self, self.work.isCurrent(generation) else { return }
-            self.updateWindows(from: $0)
+            self.updateWindows(from: value)
         }.store(in: &subscriptions)
-        if pollInterval > 0 {
-            let timer = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.refresh() }
-            }
-            timer.tolerance = min(0.5, pollInterval / 10)
-            RunLoop.main.add(timer, forMode: .common)
-            self.timer = timer
-        }
+        windowInvalidations.receive(on: DispatchQueue.main).sink { [weak self] id in
+            guard let self, self.work.isCurrent(generation) else { return }
+            self.windowChanged(id)
+        }.store(in: &subscriptions)
+        requestLayout(source: .start)
     }
 
     func stop() {
         if isRunning {
             spaceRevision &+= 1
             minimumProjectionRevision = spaceRevision
-            unchangedLayoutDeadline = nil
         }
         isRunning = false
         work.stop()
-        transferRead = nil
         if let spaceObserver { notifications.removeObserver(spaceObserver) }
         spaceObserver = nil
         subscriptions.removeAll()
-        timer?.invalidate()
-        timer = nil
-        inFlight = false
-        needsRefresh = false
+        layoutInFlight = false
+        nextLayoutSource = nil
+        cancelTransfers()
+        windowRevisions.removeAll()
+        membershipInFlight = false
+        pendingMemberships.removeAll()
+        needsMembershipRead = false
         receivedInventory = false
         utilityOnActiveSpace = { _ in nil }
+        if !activeLayouts.isEmpty { activeLayouts = [:] }
     }
 
     func refresh() {
         guard isRunning else { return }
-        revision &+= 1
-        if inFlight { needsRefresh = true; return }
-        beginRead()
+        membershipRevision &+= 1
+        requestLayout(source: .explicitRefresh)
+        if readLayouts != nil { requestMembership(Set(requests.map(\.identity))) }
     }
 
     func canUseProjection(on displayUUID: String?, renderedSpaceRevision: UInt64) -> Bool {
         guard renderedSpaceRevision >= minimumProjectionRevision,
               confirmedSpaceRevision >= minimumProjectionRevision,
               snapshot.permitsProjection(on: displayUUID) else { return false }
+        if readLayouts != nil {
+            guard !activeLayouts.isEmpty, !snapshot.layouts.isEmpty,
+                  requests.isEmpty || !snapshot.memberships.isEmpty else { return false }
+            if let displayUUID {
+                guard let active = activeLayouts[displayUUID] ?? activeLayouts["Main"],
+                      active == (snapshot.layouts[displayUUID] ?? snapshot.layouts["Main"]) else { return false }
+            } else if activeLayouts != snapshot.layouts { return false }
+        }
         if renderedSpaceRevision == spaceRevision { return true }
         guard let displayUUID else { return invalidatedDisplays.isEmpty }
         return !invalidatedDisplays.contains(displayUUID) && !invalidatedDisplays.contains("Main")
     }
 
     private func activeSpaceChanged() {
-        transferRead?.cancel()
+        #if DEBUG
+        let resources = ActionResourceLog.begin("spaces.activeSpaceChanged")
+        defer { resources?.finish() }
+        #endif
         invalidatedDisplays = Set(snapshot.layouts.keys)
         spaceRevision &+= 1
-        unchangedLayoutDeadline = nil
+        layoutRevision &+= 1
+        membershipRevision &+= 1
+        cancelTransfers()
         activeSpaceChange.send()
         publish(snapshot.recordingSpaceChange(requests: liveUtilityRequests(requests)))
-        refresh()
+        requestLayout(source: .activeSpace)
     }
 
     func updateTopology(_ snapshot: ScreenTopologySnapshot) {
-        if screenTopology != snapshot {
-            screenTopology = snapshot
-            publish(self.snapshot.clearingConfirmedTransfers())
-        }
+        guard screenTopology != snapshot else { return }
+        screenTopology = snapshot
+        layoutRevision &+= 1
+        membershipRevision &+= 1
+        cancelTransfers()
+        publish(self.snapshot.clearingConfirmedTransfers())
         let identifiers = Set(snapshot.identifiedDisplayUUIDs)
         attachedDisplays = snapshot.physicalDisplayCount > 0 &&
             identifiers.count == snapshot.physicalDisplayCount ? identifiers : nil
-        beginTransferRead(self.snapshot.transfers(in: requests, attachedDisplays: attachedDisplays))
-        refresh()
+        requestLayout(source: .interfaceTopology)
     }
 
     private func updateWindows(from source: DockSnapshot) {
@@ -151,142 +213,382 @@ final class TaskbarSpaceStore: ObservableObject {
                 isOnDesktop: item.isOnDesktop, displayUUID: item.displayUUID, isUtility: isUtility)
         }
         guard !receivedInventory || next != requests else { return }
-        let previous = requests
-        let hadInventory = receivedInventory
-        let oldTransfers = hadInventory ? snapshot.transfers(in: previous, attachedDisplays: attachedDisplays) : []
+        let previous = Dictionary(requests.map { ($0.identity, $0) }, uniquingKeysWith: { first, _ in first })
+        let current = Dictionary(next.map { ($0.identity, $0) }, uniquingKeysWith: { first, _ in first })
+        let changedRequests = next.filter { previous[$0.identity] != $0 }
+        windowRevisions = windowRevisions.filter { current[$0.key] != nil }
+        revise(changedRequests.map(\.identity))
+        discardTransfers { current[$0.identity] != $0 }
         receivedInventory = true
         requests = next
         let updated = snapshot.updating(with: nil, requests: liveUtilityRequests(next),
                                         afterSpaceChange: confirmedSpaceRevision != spaceRevision)
         publish(updated)
         let transfers = updated.transfers(in: next, attachedDisplays: attachedDisplays)
-        if transfers != oldTransfers {
-            beginTransferRead(transfers)
-            let moved = Set(transfers.filter { !oldTransfers.contains($0) }.map(\.identity))
-            if hadInventory, !inFlight, !updated.layouts.isEmpty, confirmedSpaceRevision == spaceRevision, !moved.isEmpty,
-               previous.filter({ !moved.contains($0.identity) }) == next.filter({ !moved.contains($0.identity) }) {
-                return
+        requestTransfers(transfers)
+        let transferring = Set(transfers.map(\.identity))
+        let changed = changedRequests.filter { !transferring.contains($0.identity) }
+        if readLayouts == nil {
+            if !changed.isEmpty || !needsMembershipRead && snapshot.layouts.isEmpty && transfers.isEmpty {
+                requestMembership(Set(next.lazy.map(\.identity).filter { !transferring.contains($0) }))
+            } else {
+                beginMembership()
             }
-        }
-        refresh()
-    }
-
-    private func beginTransferRead(_ requests: [WindowSpaceRequest]) {
-        transferRead?.cancel()
-        transferRead = nil
-        guard !requests.isEmpty, confirmedSpaceRevision == spaceRevision else { return }
-        let spaceRevision = spaceRevision
-        let startingLayouts = snapshot.layouts
-        let read = readTransfers
-        transferRead = work.launch(priority: .userInitiated) { [weak self] generation in
-            var outstanding = requests
-            var layouts = startingLayouts
-            for delay in [Duration.zero, .milliseconds(80), .milliseconds(160)] {
-                if delay > .zero {
-                    do { try await Task.sleep(for: delay) }
-                    catch { return }
-                }
-                let pending = outstanding
-                let expectedLayouts = layouts
-                let cancellation = OperationCancellation()
-                let observation = await AsyncWorkScope.performBlocking(cancellation: cancellation) {
-                    read(pending, cancellation)
-                } ?? nil
-                let next = await MainActor.run { [weak self] () -> ([WindowSpaceRequest], [String: SpaceLayoutSnapshot])? in
-                    guard let self, !Task.isCancelled, self.work.isCurrent(generation),
-                          self.spaceRevision == spaceRevision, self.snapshot.layouts == expectedLayouts else { return nil }
-                    let pending = self.snapshot.transfers(in: pending)
-                    guard !pending.isEmpty, let observation else { return (pending, expectedLayouts) }
-                    guard observation.layouts == expectedLayouts || expectedLayouts.isEmpty else {
-                        self.refresh()
-                        return nil
-                    }
-                    let updated = self.snapshot.updating(with: observation, requests: self.liveUtilityRequests(self.requests),
-                                                         attachedDisplays: self.attachedDisplays, targetedTransferRead: true)
-                    let remaining = updated.transfers(in: pending)
-                    if remaining != pending {
-                        if self.inFlight { self.refresh() }
-                        self.publish(updated)
-                        return (remaining, updated.layouts)
-                    }
-                    return (remaining, expectedLayouts)
-                }
-                guard let next, !next.0.isEmpty else { return }
-                (outstanding, layouts) = next
+        } else {
+            if activeLayouts.isEmpty && !layoutInFlight || confirmedSpaceRevision != spaceRevision {
+                requestLayout(source: .windowInventory)
             }
+            if !changed.isEmpty { requestMembership(Set(changed.map(\.identity))) }
+            beginMembership()
         }
     }
 
-    private func beginRead() {
-        inFlight = true
-        let requests = requests
-        let revision = revision
-        let read = read
-        let queue = queue
-        work.launch { [weak self] generation in
-            let cancellation = OperationCancellation()
-            let observation = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
-                read(requests, cancellation)
-            } ?? nil
+    private func windowChanged(_ id: CGWindowID) {
+        if confirmedSpaceRevision != spaceRevision || activeLayouts.isEmpty { requestLayout(source: .windowEvent) }
+        let matching = requests.filter { $0.identity.windowID == id }
+        revise(matching.map(\.identity))
+        refreshExactMemberships(matching)
+    }
+
+    private func refreshExactMemberships(_ matching: [WindowSpaceRequest]) {
+        let transfers = snapshot.transfers(in: matching, attachedDisplays: attachedDisplays)
+        pendingTransferEvents.formUnion(transfers.lazy.map(\.identity).filter { self.activeTransfers[$0] != nil })
+        requestTransfers(transfers)
+        let transferring = Set(transfers.map(\.identity))
+        let ordinary = Set(matching.lazy.map(\.identity).filter { !transferring.contains($0) })
+        if !ordinary.isEmpty { requestMembership(ordinary) }
+    }
+
+    private func revise(_ identities: [WindowSpaceIdentity]) {
+        guard !identities.isEmpty else { return }
+        nextWindowRevision &+= 1
+        for identity in identities { windowRevisions[identity] = nextWindowRevision }
+    }
+
+    private func beginWindowRead(_ requested: [WindowSpaceRequest]) -> UInt64 {
+        revise(requested.map(\.identity))
+        return nextWindowRevision
+    }
+
+    private func currentIdentities(_ sampled: [WindowSpaceRequest], windowRevision: UInt64) -> Set<WindowSpaceIdentity> {
+        let current = Dictionary(requests.map { ($0.identity, $0) }, uniquingKeysWith: { first, _ in first })
+        return Set(sampled.lazy.filter {
+            current[$0.identity] == $0 && self.windowRevisions[$0.identity] == windowRevision
+        }.map(\.identity))
+    }
+
+    private nonisolated static func sampleMemberships(_ requested: [WindowSpaceRequest], layouts: Layouts,
+        cancellation: OperationCancellation, readMemberships: MembershipRead?,
+        readSnapshot: (@Sendable ([WindowSpaceRequest]) -> WindowSpaceSnapshot?)?) -> MembershipSample {
+        if let readMemberships {
+            return readMemberships(requested, layouts, cancellation).map {
+                (WindowSpaceSnapshot(layouts: layouts, memberships: $0.memberships), $0.failures)
+            }
+        }
+        return .success((readSnapshot?(requested), []))
+    }
+
+    private func acceptSample(_ sample: MembershipSample?, source: String) -> WindowSpaceSnapshot? {
+        guard let sample else { return nil }
+        switch sample {
+        case let .failure(failure):
+            report(failure, source: source, reportToUser: true)
+            return nil
+        case let .success((observation, failures)):
+            for failure in failures {
+                let incompatible: Bool
+                switch failure.reason {
+                case .libraryUnavailable, .symbolUnavailable, .connectionUnavailable, .invalidType, .untestedSystemVersion:
+                    incompatible = true
+                default: incompatible = false
+                }
+                report(failure, source: source, reportToUser: incompatible)
+            }
+            return observation
+        }
+    }
+
+    private func cancelTransfers() {
+        transferReads.values.forEach { $0.cancel() }
+        transferReads.removeAll()
+        activeTransfers.removeAll()
+        pendingTransferEvents.removeAll()
+    }
+
+    private func discardTransfers(where invalid: (WindowSpaceRequest) -> Bool) {
+        let obsolete = activeTransfers.filter { invalid($0.value.request) }
+        guard !obsolete.isEmpty else { return }
+        for identity in obsolete.keys {
+            activeTransfers.removeValue(forKey: identity)
+            pendingTransferEvents.remove(identity)
+        }
+        let remaining = Set(activeTransfers.values.map(\.batch))
+        for batch in Set(obsolete.values.map(\.batch)).subtracting(remaining) {
+            transferReads.removeValue(forKey: batch)?.cancel()
+        }
+    }
+
+    private func requestTransfers(_ candidates: [WindowSpaceRequest]) {
+        guard confirmedSpaceRevision == spaceRevision, readLayouts == nil || !activeLayouts.isEmpty else { return }
+        let transfers = candidates.filter { activeTransfers[$0.identity] == nil }
+        guard !transfers.isEmpty else { return }
+        transferRevision &+= 1
+        let batch = transferRevision
+        for request in transfers { activeTransfers[request.identity] = .init(request: request, batch: batch) }
+        let windowRevision = beginWindowRead(transfers)
+        let layouts = activeLayouts
+        let readMemberships = readMemberships
+        let readSnapshot = readSnapshot
+        let cancellation = OperationCancellation()
+        transferReads[batch] = work.launch(priority: .userInitiated) { [weak self] generation in
+            let sample = await AsyncWorkScope.performBlocking(cancellation: cancellation,
+                                                               resourceOperation: "spaces.store.transfer-read") {
+                Self.sampleMemberships(transfers, layouts: layouts, cancellation: cancellation,
+                                       readMemberships: readMemberships, readSnapshot: readSnapshot)
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.work.isCurrent(generation), self.transferReads.removeValue(forKey: batch) != nil else { return }
+                let completed = transfers.filter { self.activeTransfers[$0.identity]?.batch == batch }
+                let identities = Set(completed.map(\.identity))
+                for identity in identities { self.activeTransfers.removeValue(forKey: identity) }
+                let deferred = self.pendingTransferEvents.intersection(identities)
+                self.pendingTransferEvents.subtract(deferred)
+                defer {
+                    if !deferred.isEmpty {
+                        self.refreshExactMemberships(self.requests.filter { deferred.contains($0.identity) })
+                    }
+                }
+                guard let observation = self.acceptSample(sample, source: "display-transfer") else { return }
+                let current = self.currentIdentities(completed, windowRevision: windowRevision)
+                let liveLayouts = self.activeLayouts.isEmpty ? observation.layouts : self.activeLayouts
+                let eligible = self.snapshot.transfers(in: completed.filter {
+                    current.contains($0.identity) &&
+                        Self.effectiveLayout(for: $0, in: liveLayouts) == Self.effectiveLayout(for: $0, in: observation.layouts)
+                }, attachedDisplays: self.attachedDisplays)
+                #if DEBUG
+                if eligible.count != transfers.count {
+                    self.logger.debug("transfer-discarded batch=\(batch) requested=\(transfers.count) current=\(eligible.count)")
+                }
+                #endif
+                guard !eligible.isEmpty else { return }
+                let accepted = Set(eligible.map(\.identity))
+                let relevant = WindowSpaceSnapshot(layouts: liveLayouts,
+                    memberships: observation.memberships.filter { accepted.contains($0.key) })
+                if self.readLayouts == nil { self.acceptLayouts(liveLayouts) }
+                self.publish(self.snapshot.updating(with: relevant, requests: self.liveUtilityRequests(self.requests),
+                    afterSpaceChange: self.readLayouts != nil && self.snapshot.layouts.isEmpty,
+                    attachedDisplays: self.attachedDisplays, targetedTransferRead: true))
+                #if DEBUG
+                self.logger.notice("transfer-membership batch=\(batch) requested=\(eligible.count) matched=\(relevant.memberships.count)")
+                #endif
+            }
+        }
+    }
+
+    private static func effectiveLayout(for request: WindowSpaceRequest, in layouts: Layouts) -> SpaceLayoutSnapshot? {
+        request.displayUUID.flatMap { layouts[$0] } ?? layouts["Main"]
+    }
+
+    private func requestLayout(source: LayoutTrigger) {
+        guard isRunning else { return }
+        guard let readLayouts else {
+            requestMembership(Set(requests.map(\.identity)))
+            return
+        }
+        if layoutInFlight {
+            if nextLayoutSource?.corroboratesLayout != true || source.corroboratesLayout {
+                nextLayoutSource = source
+            }
+            return
+        }
+        layoutInFlight = true
+        let requestedRevision = layoutRevision
+        let queue = layoutQueue
+        work.launch(priority: .userInitiated) { [weak self] generation in
+            let start = ContinuousClock.now
+            let result = await AsyncWorkScope.performBlocking(on: queue) { readLayouts() }
+            let elapsed = Int(start.duration(to: .now) / .milliseconds(1))
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation), self.isRunning else { return }
-                self.inFlight = false
-                if self.revision == revision {
-                    let spaceRevision = self.spaceRevision
-                    self.applyRead(observation, requests: requests, spaceRevision: spaceRevision)
+                self.layoutInFlight = false
+                if requestedRevision == self.layoutRevision, let result {
+                    self.applyLayoutResult(result, source: source, elapsed: elapsed)
+                } else {
+                    self.logger.debug("layout-superseded event=\(source.rawValue, privacy: .public) requested=\(requestedRevision) current=\(self.layoutRevision)")
                 }
-                if self.needsRefresh {
-                    self.needsRefresh = false
-                    self.beginRead()
+                if let pending = self.nextLayoutSource {
+                    self.nextLayoutSource = nil
+                    self.requestLayout(source: pending)
                 }
             }
         }
     }
 
-    private func applyRead(_ observation: WindowSpaceSnapshot?, requests: [WindowSpaceRequest], spaceRevision: UInt64) {
-        let changed = confirmedSpaceRevision != spaceRevision
-        let priorLayouts = snapshot.layouts
-        if changed, let observation, !observation.layouts.isEmpty, observation.layouts == snapshot.layouts {
-            if let deadline = unchangedLayoutDeadline {
-                guard ContinuousClock.now >= deadline else { return }
-            } else {
-                let deadline = ContinuousClock.now + .milliseconds(150)
-                unchangedLayoutDeadline = deadline
-                work.launch { [weak self] generation in
-                    try? await ContinuousClock().sleep(until: deadline)
-                    await MainActor.run { [weak self] in
-                        guard let self, self.work.isCurrent(generation), self.spaceRevision == spaceRevision,
-                              self.confirmedSpaceRevision != spaceRevision else { return }
-                        self.refresh()
-                    }
+    private func applyLayoutResult(_ result: Result<Layouts, SpaceReadFailure>, source: LayoutTrigger, elapsed: Int) {
+        switch result {
+        case let .failure(failure):
+            if !activeLayouts.isEmpty {
+                spaceRevision &+= 1
+                minimumProjectionRevision = spaceRevision
+                membershipRevision &+= 1
+                invalidatedDisplays = Set(snapshot.layouts.keys)
+                cancelTransfers()
+                activeSpaceChange.send()
+                activeLayouts = [:]
+            }
+            report(failure, source: source.rawValue, reportToUser: true)
+        case let .success(layouts):
+            let prior = activeLayouts
+            if source.corroboratesLayout {
+                corroboratedSpaceRevision = spaceRevision
+            }
+            let changed = Set(prior.keys).union(layouts.keys).filter { prior[$0] != layouts[$0] }
+            if !changed.isEmpty {
+                membershipRevision &+= 1
+                if !prior.isEmpty {
+                    discardTransfers { Self.effectiveLayout(for: $0, in: prior) != Self.effectiveLayout(for: $0, in: layouts) }
                 }
-                return
+                if confirmedSpaceRevision != spaceRevision, confirmedSpaceRevision >= minimumProjectionRevision {
+                    invalidatedDisplays = changed
+                }
+                acceptLayouts(layouts)
+            }
+            logger.debug("layout event=\(source.rawValue, privacy: .public) revision=\(self.spaceRevision) displays=\(layouts.count) changed=\(changed.count) elapsed-ms=\(elapsed)")
+            if !changed.isEmpty || confirmedSpaceRevision != spaceRevision {
+                let relevant = requests.filter { request in
+                    request.displayUUID.map { changed.isEmpty || changed.contains($0) || changed.contains("Main") } ?? true
+                }
+                requestMembership(Set(relevant.map(\.identity)))
+            }
+            requestTransfers(snapshot.transfers(in: requests, attachedDisplays: attachedDisplays))
+            if needsMembershipRead { beginMembership() }
+        }
+    }
+
+    private func acceptLayouts(_ layouts: Layouts) {
+        let prior = activeLayouts
+        guard prior != layouts else { return }
+        activeLayouts = layouts
+        #if DEBUG
+        let values = layouts.values.map { "\($0.currentSpaceID):\($0.fullscreenSpaceIDs.contains($0.currentSpaceID) ? "fullscreen" : "desktop")" }.sorted().joined(separator: ",")
+        logger.notice("space-layout-confirmed revision=\(self.spaceRevision) current=\(values, privacy: .public)")
+        #endif
+        let returned = Set(layouts.compactMap { display, current in
+            guard let previous = prior[display], previous.fullscreenSpaceIDs.contains(previous.currentSpaceID),
+                  !current.fullscreenSpaceIDs.contains(current.currentSpaceID) else { return nil as String? }
+            return display
+        })
+        if !returned.isEmpty { desktopReturn.send(returned) }
+    }
+
+    private func requestMembership(_ identities: Set<WindowSpaceIdentity>) {
+        guard isRunning else { return }
+        pendingMemberships.formUnion(identities)
+        needsMembershipRead = true
+        beginMembership()
+    }
+
+    private func beginMembership() {
+        guard needsMembershipRead, !membershipInFlight, receivedInventory,
+              readLayouts == nil || !activeLayouts.isEmpty else { return }
+        membershipInFlight = true
+        needsMembershipRead = false
+        let requested = requests.filter { pendingMemberships.contains($0.identity) && activeTransfers[$0.identity] == nil }
+        let windowRevision = beginWindowRead(requested)
+        let expectedLayouts = activeLayouts
+        let requestedRevision = membershipRevision
+        let eventRevision = spaceRevision
+        let readMemberships = readMemberships
+        let readSnapshot = readSnapshot
+        let queue = membershipQueue
+        pendingMemberships.removeAll()
+        let cancellation = OperationCancellation()
+        work.launch { [weak self] generation in
+            let start = ContinuousClock.now
+            let sampled = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation,
+                                                                resourceOperation: "spaces.store.membership-read") {
+                Self.sampleMemberships(requested, layouts: expectedLayouts, cancellation: cancellation,
+                                       readMemberships: readMemberships, readSnapshot: readSnapshot)
+            }
+            let elapsed = Int(start.duration(to: .now) / .milliseconds(1))
+            await MainActor.run { [weak self] in
+                guard let self, self.work.isCurrent(generation), self.isRunning else { return }
+                self.membershipInFlight = false
+                if self.membershipRevision == requestedRevision {
+                    let observation = self.acceptSample(sampled, source: "window-membership")
+                    self.applyMembership(observation, requested: requested, windowRevision: windowRevision,
+                                         eventRevision: eventRevision, elapsed: elapsed)
+                } else {
+                    self.pendingMemberships.formUnion(requested.lazy.map(\.identity))
+                    self.needsMembershipRead = true
+                    self.logger.debug("membership-superseded requested=\(requestedRevision) current=\(self.membershipRevision)")
+                }
+                self.beginMembership()
             }
         }
-        if changed, invalidatedDisplays.isEmpty, let observation {
-            invalidatedDisplays = Set(observation.layouts.keys)
+    }
+
+    private func applyMembership(_ observation: WindowSpaceSnapshot?, requested: [WindowSpaceRequest], windowRevision: UInt64,
+                                 eventRevision: UInt64, elapsed: Int) {
+        guard let observation, !observation.layouts.isEmpty else { return }
+        let changed = confirmedSpaceRevision != eventRevision
+        let priorLayouts = snapshot.layouts
+        if changed, invalidatedDisplays.isEmpty { invalidatedDisplays = Set(observation.layouts.keys) }
+        let unchangedWithoutEvidence = changed && observation.layouts == priorLayouts &&
+            confirmedSpaceRevision >= minimumProjectionRevision && corroboratedSpaceRevision != eventRevision
+        if unchangedWithoutEvidence {
+            logger.debug("space-unconfirmed unchanged-layout revision=\(eventRevision)")
         }
-        publish(snapshot.updating(with: observation, requests: liveUtilityRequests(requests),
-                                   afterSpaceChange: changed, attachedDisplays: attachedDisplays))
-        if changed, let observation, !observation.layouts.isEmpty {
-            confirmedSpaceRevision = spaceRevision
+        let stillCurrent = currentIdentities(requested, windowRevision: windowRevision).subtracting(pendingMemberships)
+        #if DEBUG
+        if stillCurrent.count != requested.count {
+            logger.debug("membership-discarded revision=\(windowRevision) requested=\(requested.count) current=\(stillCurrent.count)")
         }
-        if priorLayouts != snapshot.layouts || (changed && confirmedSpaceRevision == spaceRevision) {
-            beginTransferRead(snapshot.transfers(in: requests, attachedDisplays: attachedDisplays))
+        #endif
+        let relevant = WindowSpaceSnapshot(layouts: observation.layouts,
+            memberships: observation.memberships.filter { stillCurrent.contains($0.key) })
+        if readLayouts == nil { acceptLayouts(observation.layouts) }
+        let updated = snapshot.updating(with: relevant, requests: liveUtilityRequests(requests),
+            afterSpaceChange: changed || (readLayouts != nil && priorLayouts.isEmpty), attachedDisplays: attachedDisplays)
+        #if DEBUG
+        if snapshot != updated {
+            logger.notice("window-membership-changed revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count) elapsed-ms=\(elapsed)")
+        }
+        #endif
+        publish(updated)
+        if changed && !unchangedWithoutEvidence { confirmedSpaceRevision = eventRevision }
+        logger.debug("membership revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count) elapsed-ms=\(elapsed)")
+    }
+
+    private func report(_ failure: SpaceReadFailure, source: String, reportToUser: Bool) {
+        guard !failure.isInterruption else {
+            logger.debug("space-read-interrupted event=\(source, privacy: .public) reason=\(failure.reason.rawValue, privacy: .public)")
+            return
+        }
+        let detail = failure.description
+        let code = failure.diagnosticCode
+        logger.error("compatibility code=\(code, privacy: .public) event=\(source, privacy: .public) revision=\(self.spaceRevision) detail=\(detail, privacy: .public)")
+        if reportToUser, reportedFailures.insert(code).inserted {
+            onCompatibilityFailure?(code, "\(detail) [\(source), revision=\(spaceRevision)]")
         }
     }
 
     private func liveUtilityRequests(_ requests: [WindowSpaceRequest]) -> [WindowSpaceRequest] {
         requests.map { request in
             guard request.isUtility, !request.isParked else { return request }
-            let visible = utilityOnActiveSpace(request.identity.actionIdentity.windowID)
             return WindowSpaceRequest(identity: request.identity, isParked: false, isOnDesktop: request.isOnDesktop,
-                                      displayUUID: request.displayUUID, isUtility: true, isOnActiveSpace: visible)
+                displayUUID: request.displayUUID, isUtility: true,
+                isOnActiveSpace: utilityOnActiveSpace(request.identity.actionIdentity.windowID))
         }
     }
 
     private func publish(_ next: WindowSpaceSnapshot) {
-        if snapshot != next { snapshot = next }
+        guard snapshot != next else { return }
+        #if DEBUG
+        let resources = ActionResourceLog.begin("spaces.publish")
+        defer { resources?.finish() }
+        #endif
+        snapshot = next
     }
 
     #if DEBUG

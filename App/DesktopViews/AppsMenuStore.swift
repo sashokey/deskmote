@@ -7,6 +7,18 @@ struct AppsMenuApplication: Codable, Equatable, Sendable, Identifiable {
     let category: String
 }
 
+struct AppsMenuCatalog: Equatable, Sendable {
+    let installed: [AppsMenuApplication]
+    let all: [AppsMenuApplication]?
+    let allUnavailable: Bool
+}
+
+struct AppsMenuIndexedApplication: Sendable {
+    let url: URL
+    let displayName: String?
+    let hiddenBySystem: Bool
+}
+
 struct AppsMenuPin: Codable, Equatable, Identifiable {
     let id: UUID
     var name: String?
@@ -33,19 +45,25 @@ final class AppsMenuStore {
     private struct StoredCatalog: Codable {
         let directories: [URL]?
         let applications: [AppsMenuApplication]
+        let allApplications: [AppsMenuApplication]?
     }
+
+    typealias ReadIndex = @MainActor ([URL]) async -> [AppsMenuIndexedApplication]?
 
     private let defaults: UserDefaults
     private let applicationDirectories: [URL]?
+    private let readIndex: ReadIndex?
+    private let suppliedSystemFileManager: AppsMenuApplication?
+    private let openApplication: @MainActor (URL) -> Void
     private let runningApplicationSnapshot: () -> [NSRunningApplication]
     private let readIcon: @MainActor (URL) async -> NSImage
     private let applicationIcons = NSCache<NSURL, NSImage>()
     private var iconCompletions: [URL: [(NSImage) -> Void]] = [:]
     private var queuedIconURLs: [URL] = []
     private var activeIconReads = 0
-    private var catalogRead: Task<[AppsMenuApplication], Never>?
+    private var catalogRead: Task<AppsMenuCatalog, Never>?
     private var lastCatalogRefresh: ContinuousClock.Instant?
-    private(set) var catalogSnapshot: [AppsMenuApplication]?
+    private(set) var catalogSnapshot: AppsMenuCatalog?
 
     private(set) var pins: [AppsMenuPin]
     var catalogMode: AppsMenuCatalogMode {
@@ -63,16 +81,32 @@ final class AppsMenuStore {
 
     init(defaults: UserDefaults = .standard, applicationDirectories: [URL]? = nil,
          runningApplicationSnapshot: @escaping () -> [NSRunningApplication] = { NSWorkspace.shared.runningApplications },
-         readIcon: (@MainActor (URL) async -> NSImage)? = nil) {
+         readIcon: (@MainActor (URL) async -> NSImage)? = nil,
+         readIndex: ReadIndex? = nil,
+         systemFileManager: AppsMenuApplication? = nil,
+         openApplication: (@MainActor (URL) -> Void)? = nil) {
+        let catalogIndex: ReadIndex?
+        if let readIndex {
+            catalogIndex = readIndex
+        } else if applicationDirectories == nil {
+            catalogIndex = AppsMenuSpotlightQuery().read
+        } else {
+            catalogIndex = nil
+        }
         self.defaults = defaults
         self.applicationDirectories = applicationDirectories
+        self.readIndex = catalogIndex
+        suppliedSystemFileManager = systemFileManager
+        self.openApplication = openApplication ?? Self.openWorkspaceApplication
         self.runningApplicationSnapshot = runningApplicationSnapshot
         self.readIcon = readIcon ?? { await Self.workspaceIcon(at: $0) }
         applicationIcons.countLimit = 256
         if let data = defaults.data(forKey: Self.catalogKey), data.count <= Self.maxCatalogCacheBytes,
            let catalog = try? JSONDecoder().decode(StoredCatalog.self, from: data),
            catalog.directories == applicationDirectories {
-            catalogSnapshot = Self.disambiguatedCatalog(catalog.applications) ?? catalog.applications
+            let installed = Self.disambiguatedCatalog(catalog.applications) ?? catalog.applications
+            catalogSnapshot = AppsMenuCatalog(installed: installed,
+                all: catalogIndex == nil ? installed : catalog.allApplications, allUnavailable: false)
         }
         pins = defaults.data(forKey: Self.pinsKey)
             .flatMap { try? JSONDecoder().decode([AppsMenuPin].self, from: $0) } ?? []
@@ -81,86 +115,149 @@ final class AppsMenuStore {
     }
 
     func installedApplications() -> [AppsMenuApplication] {
-        Self.installedApplications(in: applicationDirectories)
+        Self.installedApplications(in: applicationDirectories, fileManagerApplication: systemFileManager)
     }
 
-    func loadInstalledApplications() async -> [AppsMenuApplication] {
+    var systemFileManager: AppsMenuApplication? {
+        suppliedSystemFileManager ?? (applicationDirectories == nil ? Self.builtInFileManager : nil)
+    }
+
+    func loadCatalog() async -> AppsMenuCatalog {
         if let catalogSnapshot, let lastCatalogRefresh, lastCatalogRefresh.duration(to: .now) < .seconds(5) {
             return catalogSnapshot
         }
         return await (catalogRead ?? beginCatalogRead()).value
     }
 
-    func preloadInstalledApplications() {
+    func preloadCatalog() {
         if lastCatalogRefresh == nil, catalogRead == nil { _ = beginCatalogRead() }
     }
 
-    private func beginCatalogRead() -> Task<[AppsMenuApplication], Never> {
+    private func beginCatalogRead() -> Task<AppsMenuCatalog, Never> {
         let directories = applicationDirectories
+        let readIndex = readIndex
+        let suppliedSystemFileManager = suppliedSystemFileManager
         let read = Task { [weak self] in
-            let applications = await Self.discoverInstalledApplications(in: directories)
-            self?.updateCatalogSnapshot(applications)
-            return applications
+            #if DEBUG
+            let span = ActionResourceLog.begin("apps.catalog.read")
+            defer { span?.finish() }
+            #endif
+            async let installed = Self.discoverInstalledApplications(in: directories, fileManager: suppliedSystemFileManager)
+            let all: [AppsMenuApplication]?
+            if let readIndex {
+                let roots = directories ?? Self.defaultApplicationDirectories()
+                let indexed = await readIndex(roots)
+                all = await Self.discoverIndexedApplications(indexed, in: roots)
+            } else {
+                all = await installed
+            }
+            let snapshot = AppsMenuCatalog(installed: await installed, all: all ?? self?.catalogSnapshot?.all,
+                                           allUnavailable: all == nil)
+            self?.updateCatalogSnapshot(snapshot)
+            return snapshot
         }
         catalogRead = read
         return read
     }
 
-    private func updateCatalogSnapshot(_ applications: [AppsMenuApplication]) {
+    private func updateCatalogSnapshot(_ snapshot: AppsMenuCatalog) {
         catalogRead = nil
         lastCatalogRefresh = .now
-        guard applications != catalogSnapshot else { return }
-        catalogSnapshot = applications
-        let catalog = StoredCatalog(directories: applicationDirectories, applications: applications)
+        guard snapshot != catalogSnapshot else { return }
+        catalogSnapshot = snapshot
+        let catalog = StoredCatalog(directories: applicationDirectories, applications: snapshot.installed,
+                                    allApplications: readIndex == nil ? nil : snapshot.all)
         if let data = try? JSONEncoder().encode(catalog), data.count <= Self.maxCatalogCacheBytes {
             defaults.set(data, forKey: Self.catalogKey)
         }
     }
 
     @concurrent
-    private nonisolated static func discoverInstalledApplications(in directories: [URL]?) async -> [AppsMenuApplication] {
-        installedApplications(in: directories)
+    private nonisolated static func discoverInstalledApplications(
+        in directories: [URL]?, fileManager: AppsMenuApplication?
+    ) async -> [AppsMenuApplication] {
+        installedApplications(in: directories, fileManagerApplication: fileManager ?? (directories == nil ? builtInFileManager : nil))
     }
 
-    private nonisolated static func installedApplications(in directories: [URL]?) -> [AppsMenuApplication] {
+    private nonisolated static func defaultApplicationDirectories() -> [URL] {
+        FileManager.default.urls(for: .applicationDirectory, in: [.userDomainMask, .localDomainMask, .systemDomainMask])
+    }
+
+    @concurrent
+    private nonisolated static func discoverIndexedApplications(
+        _ indexed: [AppsMenuIndexedApplication]?, in directories: [URL]
+    ) async -> [AppsMenuApplication]? {
+        guard let indexed else { return nil }
+        let roots = directories.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
+        let ordered = indexed.map { entry in
+            let url = entry.url.standardizedFileURL.resolvingSymlinksInPath()
+            let rank = roots.firstIndex { url.path.hasPrefix($0 + "/") } ?? roots.count
+            return (entry: entry, url: url, rank: rank)
+        }.sorted { ($0.rank, $0.url.path) < ($1.rank, $1.url.path) }
+        var paths = Set<URL>()
+        var identifiers = Set<String>()
+        var applications: [AppsMenuApplication] = []
+        for (entry, url, _) in ordered {
+            guard !Task.isCancelled else { return nil }
+            guard !entry.hiddenBySystem, entry.url.isFileURL, url.pathExtension.lowercased() == "app",
+                  !url.pathComponents.dropLast().contains(where: { $0.lowercased().hasSuffix(".app") }),
+                  paths.insert(url).inserted, let bundle = Bundle(url: url),
+                  let metadata = bundle.infoDictionary,
+                  (metadata["LSBackgroundOnly"] as? Bool != true || metadata["LSUIElement"] as? Bool == true) else { continue }
+            let identifier = nonEmpty(bundle.bundleIdentifier) ?? url.path
+            guard identifier != "com.apple.apps.launcher", !ApplicationIdentity.isDeskMote(identifier),
+                  identifiers.insert(identifier).inserted else { continue }
+            let name = nonEmpty(entry.displayName) ?? FileManager.default.displayName(atPath: url.path)
+            applications.append(.init(id: identifier, name: displayTitle(name), url: url,
+                                      category: applicationCategory(metadata)))
+        }
+        return sortedCatalog(applications)
+    }
+
+    private nonisolated static let builtInFileManager: AppsMenuApplication? = {
+        let fileManager = FileManager.default
+        guard let coreServices = fileManager.urls(for: .coreServiceDirectory, in: .systemDomainMask).first,
+              let children = try? fileManager.contentsOfDirectory(at: coreServices, includingPropertiesForKeys: nil,
+                                                                  options: [.skipsHiddenFiles]) else { return nil }
+        let candidates = children.compactMap { path -> AppsMenuApplication? in
+            guard path.pathExtension.lowercased() == "app", let bundle = Bundle(url: path),
+                  let identifier = nonEmpty(bundle.bundleIdentifier), let metadata = bundle.infoDictionary,
+                  metadata["CFBundlePackageType"] as? String == "FNDR" else { return nil }
+            let url = path.standardizedFileURL.resolvingSymlinksInPath()
+            return .init(id: identifier, name: bundleDisplayTitle(bundle, metadata: metadata, url: url), url: url,
+                         category: applicationCategory(metadata))
+        }
+        return candidates.count == 1 ? candidates.first : nil
+    }()
+
+    private nonisolated static func installedApplications(
+        in directories: [URL]?, fileManagerApplication: AppsMenuApplication?
+    ) -> [AppsMenuApplication] {
         let fileManager = FileManager.default
         var paths: Set<URL> = []
         var identifiers: Set<String> = []
         var applications: [AppsMenuApplication] = []
 
-        func appendApplication(at candidate: URL, isSystemFinder: Bool = false) {
+        func appendApplication(at candidate: URL) {
             let url = candidate.standardizedFileURL.resolvingSymlinksInPath()
             guard paths.insert(url).inserted,
                   let bundle = Bundle(url: url),
                   let metadata = bundle.infoDictionary,
-                  let packageType = metadata["CFBundlePackageType"] as? String,
-                  packageType == "APPL" || (isSystemFinder && packageType == "FNDR"),
+                  metadata["CFBundlePackageType"] as? String == "APPL",
                   metadata["LSBackgroundOnly"] as? Bool != true else { return }
             let identifier = nonEmpty(bundle.bundleIdentifier) ?? url.path
-            guard !isSystemFinder || identifier == "com.apple.finder",
-                  identifiers.insert(identifier).inserted else { return }
-
-            let local = bundle.localizedInfoDictionary
-            let name = nonEmpty(local?["CFBundleDisplayName"] as? String)
-                ?? nonEmpty(local?["CFBundleName"] as? String)
-                ?? nonEmpty(metadata["CFBundleDisplayName"] as? String)
-                ?? nonEmpty(metadata["CFBundleName"] as? String)
-                ?? fileManager.displayName(atPath: url.path)
-            let displayName = name.lowercased().hasSuffix(".app") && name.count > 4
-                ? String(name.dropLast(4)) : name
-            let categoryPrefix = "public.app-category."
-            let category = (metadata["LSApplicationCategoryType"] as? String)
-                .flatMap { $0.hasPrefix(categoryPrefix) ? nonEmpty(String($0.dropFirst(categoryPrefix.count))) : nil }
-                ?? "other"
-            applications.append(.init(id: identifier, name: displayName, url: url, category: category))
+            guard identifiers.insert(identifier).inserted else { return }
+            applications.append(.init(id: identifier, name: bundleDisplayTitle(bundle, metadata: metadata, url: url), url: url,
+                                      category: applicationCategory(metadata)))
         }
 
         guard !Task.isCancelled else { return [] }
-        if directories == nil, let coreServices = fileManager.urls(for: .coreServiceDirectory, in: .systemDomainMask).first {
-            appendApplication(at: coreServices.appendingPathComponent("Finder.app", isDirectory: true), isSystemFinder: true)
+        if let fileManagerApplication {
+            paths.insert(fileManagerApplication.url)
+            identifiers.insert(fileManagerApplication.id)
+            applications.append(fileManagerApplication)
         }
-        let applicationDirectories = directories ?? fileManager.urls(for: .applicationDirectory,
-                                                                      in: [.userDomainMask, .localDomainMask, .systemDomainMask])
+        let applicationDirectories = directories ?? defaultApplicationDirectories()
         for directory in applicationDirectories {
             guard let enumerator = fileManager.enumerator(at: directory, includingPropertiesForKeys: nil,
                                                            options: [.skipsHiddenFiles, .skipsPackageDescendants],
@@ -173,6 +270,26 @@ final class AppsMenuStore {
             }
         }
         return disambiguatedCatalog(applications) ?? sortedCatalog(applications)
+    }
+
+    private nonisolated static func displayTitle(_ name: String) -> String {
+        name.lowercased().hasSuffix(".app") && name.count > 4 ? String(name.dropLast(4)) : name
+    }
+
+    private nonisolated static func bundleDisplayTitle(_ bundle: Bundle, metadata: [String: Any], url: URL) -> String {
+        let local = bundle.localizedInfoDictionary
+        let name = nonEmpty(local?["CFBundleDisplayName"] as? String)
+            ?? nonEmpty(local?["CFBundleName"] as? String)
+            ?? nonEmpty(metadata["CFBundleDisplayName"] as? String)
+            ?? nonEmpty(metadata["CFBundleName"] as? String)
+            ?? FileManager.default.displayName(atPath: url.path)
+        return displayTitle(name)
+    }
+
+    private nonisolated static func applicationCategory(_ metadata: [String: Any]) -> String {
+        let prefix = "public.app-category."
+        return (metadata["LSApplicationCategoryType"] as? String)
+            .flatMap { $0.hasPrefix(prefix) ? nonEmpty(String($0.dropFirst(prefix.count))) : nil } ?? "other"
     }
 
     private nonisolated static func disambiguatedCatalog(_ applications: [AppsMenuApplication]) -> [AppsMenuApplication]? {
@@ -288,9 +405,35 @@ final class AppsMenuStore {
     }
 
     func launch(_ application: AppsMenuApplication) {
+        openApplication(application.url)
+    }
+
+    func reopen(_ application: NSRunningApplication) {
+        if let url = application.bundleURL, url.isFileURL {
+            openApplication(url)
+        } else {
+            #if DEBUG
+            let span = ActionResourceLog.begin("apps.application.activate")
+            defer { span?.finish() }
+            #endif
+            application.activate(options: [])
+        }
+    }
+
+    private static func openWorkspaceApplication(at url: URL) {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
-        NSWorkspace.shared.openApplication(at: application.url, configuration: configuration, completionHandler: nil)
+        let completion: (@Sendable (NSRunningApplication?, (any Error)?) -> Void)?
+        #if DEBUG
+        if let span = ActionResourceLog.begin("apps.application.open") {
+            completion = { _, _ in span.finish() }
+        } else {
+            completion = nil
+        }
+        #else
+        completion = nil
+        #endif
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration, completionHandler: completion)
     }
 
     func pin(_ application: AppsMenuApplication) {
@@ -307,6 +450,19 @@ final class AppsMenuStore {
         guard let index = pins.firstIndex(where: { $0.id == pinID }), pins[index].name == nil else { return nil }
         updatePins { $0[index].name = "" }
         return pinID
+    }
+
+    func groupPin(_ id: UUID, into targetID: UUID) {
+        guard id != targetID,
+              let source = pins.firstIndex(where: { $0.id == id }),
+              let target = pins.firstIndex(where: { $0.id == targetID }),
+              pins[source].name == nil, pins[source].applicationIDs.count == 1,
+              let applicationID = pins[source].applicationIDs.first else { return }
+        updatePins {
+            $0[target].name = $0[target].name ?? ""
+            $0[target].applicationIDs.append(applicationID)
+            $0.remove(at: source)
+        }
     }
 
     func moveApp(_ appID: String, to folderID: UUID) {
@@ -370,10 +526,122 @@ final class AppsMenuStore {
     }
 
     private func updatePins(_ edit: (inout [AppsMenuPin]) -> Void) {
+        #if DEBUG
+        let span = ActionResourceLog.begin("apps.pin.persist")
+        defer { span?.finish() }
+        #endif
         var updated = pins
         edit(&updated)
         guard updated != pins, let data = try? JSONEncoder().encode(updated) else { return }
         defaults.set(data, forKey: Self.pinsKey)
         pins = updated
+    }
+}
+
+@MainActor
+private final class AppsMenuSpotlightQuery {
+    private struct Entry: Sendable {
+        let url: URL
+        let displayName: String?
+    }
+
+    private var query: NSMetadataQuery?
+    private var observer: (any NSObjectProtocol)?
+    private var timeout: Task<Void, Never>?
+    private var visibilityRead: Task<Void, Never>?
+    private var completion: CheckedContinuation<[AppsMenuIndexedApplication]?, Never>?
+
+    func read(in roots: [URL]) async -> [AppsMenuIndexedApplication]? {
+        guard completion == nil, visibilityRead == nil else { return nil }
+        let scopes = roots.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !scopes.isEmpty else { return nil }
+
+        return await withCheckedContinuation { continuation in
+            completion = continuation
+            let query = NSMetadataQuery()
+            query.predicate = NSPredicate(format: "%K == %@", NSMetadataItemContentTypeKey, "com.apple.application-bundle")
+            query.searchScopes = scopes
+            self.query = query
+            let queryID = ObjectIdentifier(query)
+            observer = NotificationCenter.default.addObserver(
+                forName: .NSMetadataQueryDidFinishGathering, object: query, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.finishGathering(queryID: queryID) }
+            }
+            timeout = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(5))
+                if !Task.isCancelled { self?.finish(nil) }
+            }
+            if !query.start() { finish(nil) }
+        }
+    }
+
+    private func finishGathering(queryID: ObjectIdentifier) {
+        guard let query, ObjectIdentifier(query) == queryID else { return }
+        query.disableUpdates()
+        let results = query.results
+        let entries: [Entry] = results.compactMap { result in
+            guard let item = result as? NSMetadataItem,
+                  let path = item.value(forAttribute: NSMetadataItemPathKey) as? String,
+                  path.hasPrefix("/") else { return nil }
+            return Entry(url: URL(fileURLWithPath: path),
+                         displayName: item.value(forAttribute: NSMetadataItemDisplayNameKey) as? String)
+        }
+        stopQuery()
+        guard !entries.isEmpty, entries.count == results.count else {
+            finish(nil)
+            return
+        }
+        visibilityRead = Task { [weak self] in
+            let indexed = await Self.checkVisibility(entries)
+            guard let self else { return }
+            visibilityRead = nil
+            finish(indexed)
+        }
+    }
+
+    private func finish(_ indexed: [AppsMenuIndexedApplication]?) {
+        guard let completion else { return }
+        self.completion = nil
+        timeout?.cancel()
+        timeout = nil
+        visibilityRead?.cancel()
+        stopQuery()
+        completion.resume(returning: indexed)
+    }
+
+    private func stopQuery() {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        let query = query
+        self.query = nil
+        query?.stop()
+    }
+
+    @concurrent
+    private nonisolated static func checkVisibility(_ entries: [Entry]) async -> [AppsMenuIndexedApplication]? {
+        let key = "_NSURLIsHiddenBySystemKey" as CFString
+        var indexed: [AppsMenuIndexedApplication] = []
+        indexed.reserveCapacity(entries.count)
+        for entry in entries {
+            guard !Task.isCancelled else { return nil }
+            let url = entry.url.standardizedFileURL.resolvingSymlinksInPath()
+            var value: Unmanaged<CFTypeRef>?
+            let succeeded = CFURLCopyResourcePropertyForKey(url as CFURL, key, &value, nil)
+            let hidden = value?.takeRetainedValue()
+            guard succeeded else {
+                if !FileManager.default.fileExists(atPath: url.path) { continue }
+                return nil
+            }
+            let hiddenBySystem: Bool
+            if let hidden {
+                guard let flag = hidden as? NSNumber, CFGetTypeID(flag) == CFBooleanGetTypeID() else { return nil }
+                hiddenBySystem = flag.boolValue
+            } else {
+                hiddenBySystem = false
+            }
+            indexed.append(.init(url: url, displayName: entry.displayName, hiddenBySystem: hiddenBySystem))
+        }
+        return indexed.isEmpty ? nil : indexed
     }
 }

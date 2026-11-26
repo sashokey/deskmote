@@ -40,6 +40,9 @@ struct WindowEntry {
     var createdAt = Date()
     var confirmedCGDisplayBounds: CGRect? = nil
     var actionTarget: WindowActionTarget? = nil
+    var supportsTargetedMove = false
+    var displayEvidenceAt: ContinuousClock.Instant? = nil
+    var displayMoveAt: ContinuousClock.Instant? = nil
 
     func matchesAXElement(_ element: AXUIElement) -> Bool {
         actionTarget?.element == AXElementKey(e: element)
@@ -129,7 +132,11 @@ struct LiveAppTrackerProcessProvider: AppTrackerProcessProviding {
 @MainActor
 final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopologyUpdating {
     var snapshots: AnyPublisher<DockSnapshot, Never> { $snapshot.eraseToAnyPublisher() }
+    var windowSpaceInvalidations: AnyPublisher<CGWindowID, Never> { spaceInvalidations.eraseToAnyPublisher() }
+    var launchWindowFocus: AnyPublisher<WindowLaunchFocus, Never> { launchFocusEvents.eraseToAnyPublisher() }
     @Published private(set) var snapshot: DockSnapshot = .empty
+    private let spaceInvalidations = PassthroughSubject<CGWindowID, Never>()
+    private let launchFocusEvents = PassthroughSubject<WindowLaunchFocus, Never>()
 
     private var apps: [pid_t: AppEntry] = [:]
     private struct OwnerBinding {
@@ -161,12 +168,11 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     private struct LaunchObservation {
         let identity: ScanAdmissionDecision.ProcessIdentity
         var receivedLaunch = false
+        var admittedFirstWindow = false
         var retries: [UUID: Task<Void, Never>] = [:]
     }
     private var launchObservations: [pid_t: LaunchObservation] = [:]
     private var workspaceObservers: [NSObjectProtocol] = []
-    private var reconcileTimer: Timer?
-    private var frontmostPollTimer: Timer?
     private var isScanningCandidates = false
     private let work = AsyncWorkScope()
     private let elementCache = AXElementCache.shared
@@ -204,6 +210,20 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     private struct WindowMoveHint: Sendable {
         let target: WindowActionTarget
         let processGeneration: ProcessGeneration
+        let spaceRevision: UInt64
+        let observedAt: ContinuousClock.Instant
+    }
+
+    private struct TargetedMove: Sendable {
+        let pid: pid_t
+        let id: CGWindowID
+        let hint: WindowMoveHint
+        let mutationGeneration: UInt64
+        let topologyRevision: UInt64
+    }
+
+    private struct TargetedMoveWork {
+        var pending: TargetedMove? = nil
     }
 
     private struct EventReadIntent: Sendable {
@@ -231,9 +251,11 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
 
     private struct PendingEventRead: Sendable {
         let token: UInt64
+        let displayReadStartedAt = ContinuousClock.now
         let mutationGeneration: UInt64
         let identity: ScanAdmissionDecision.ProcessIdentity
         let intent: EventReadIntent
+        var launchFocusRevisions: (focus: UInt64, foreground: UInt64)? = nil
         var skipsCGWithoutWindows = false
         var absenceProbes: [AbsentSeatProbeRequest] = []
         var isSuperseded = false
@@ -277,12 +299,15 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
 
     private static let reconcileInterval: TimeInterval = 5
     private static let inventoryRetryDelays: [TimeInterval] = [0.5, 1, 2]
+    private nonisolated static let displayConfirmationDelay: Duration = .milliseconds(100)
 
     private var nextEventReadToken: UInt64 = 0
     private var pendingEventReads: [pid_t: PendingEventRead] = [:]
     private var queuedPeriodicReads: [pid_t: QueuedPeriodicRead] = [:]
     private var trailingEventReads: [pid_t: EventReadIntent] = [:]
     private var pendingDisplayConfirmations: [pid_t: [CGWindowID: PendingDisplayConfirmation]] = [:]
+    private var targetedMoves: [UUID: TargetedMoveWork] = [:]
+    private var moveSpaceRevision: UInt64 = 0
     private var inventoryTimeouts: [pid_t: InventoryTimeout] = [:]
     private var frontmostProbeIDs: [pid_t: Set<CGWindowID>] = [:]
     private var frontmostProbePending = false
@@ -304,6 +329,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         let element: AXElementKey?
     }
     private var focusRevisions: [pid_t: UInt64] = [:]
+    private var focusInvalidatedAt: [pid_t: TimeInterval] = [:]
     private var confirmedFocus: [pid_t: ConfirmedFocus] = [:]
     private var pendingFocusReads: [pid_t: PendingFocusRead] = [:]
     private var trailingFocusReads = Set<pid_t>()
@@ -330,6 +356,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     private var unreadSystemFocusForegroundRevision: UInt64?
     private var focusForegroundPID: pid_t?
     private var focusForegroundRevision: UInt64 = 0
+    private var focusForegroundChangedAt: TimeInterval = 0
     var mutationGenerations: [pid_t: UInt64] = [:]
 
     private let reader: any AppTrackerWindowReading
@@ -341,6 +368,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     private let waitForLaunchRetry: @Sendable (TimeInterval) async throws -> Void
     private let cgSnapshotProvider: @Sendable () -> AppTrackerCGWindowSnapshot
     private let cgWindowSnapshotProvider: (@Sendable (CGWindowID) -> AppTrackerCGWindowSnapshot)?
+    private let cgRootSnapshotProvider: (@Sendable (CGWindowID) -> AppTrackerCGWindowSnapshot)?
     private var latestCGSnapshot: AppTrackerCGWindowSnapshot?
     private let onScreenWindowIDsProvider: @Sendable () -> Set<CGWindowID>?
     private let periodicReconcileTimeout: TimeInterval
@@ -392,6 +420,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     private let windowEligibility = AppTrackerWindowEligibility()
     #if DEBUG
     private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "app-tracker")
+    var onWindowRestoreOnScreenSample: ((Set<CGWindowID>, String) -> Void)?
     #endif
     #if DEBUG
     private let inventoryLog: WindowInventoryAnomalyLog
@@ -430,7 +459,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         },
         displayTableProvider: @escaping @MainActor () -> WindowDisplayAttribution.Table = { .empty },
         workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
-        isAccessibilityTrusted: @escaping @MainActor () -> Bool = { AXIsProcessTrusted() },
+        isAccessibilityTrusted: @escaping @MainActor () -> Bool = { RuntimeAccessibilityAccess.shared.allowsCalls },
         makeWindowObserver: @escaping @MainActor (pid_t) -> AppWindowObserver = { AppWindowObserver(pid: $0) },
         launchRetryDelays: [TimeInterval] = [0.2, 0.5, 1.0, 2.0],
         waitForLaunchRetry: @escaping @Sendable (TimeInterval) async throws -> Void = {
@@ -450,7 +479,23 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         self.launchRetryDelays = launchRetryDelays
         self.waitForLaunchRetry = waitForLaunchRetry
         self.cgSnapshotProvider = { AppTrackerCGWindowSnapshot.timedCapture(cgSnapshotProvider ?? AppTrackerCGWindowSnapshot.capture) }
-        self.cgWindowSnapshotProvider = cgWindowSnapshotProvider ?? (cgSnapshotProvider == nil ? AppTrackerCGWindowSnapshot.capture(windowID:) : nil)
+        if let cgWindowSnapshotProvider {
+            let capture: @Sendable (CGWindowID) -> AppTrackerCGWindowSnapshot = { id in
+                AppTrackerCGWindowSnapshot.timedCapture { cgWindowSnapshotProvider(id) }
+            }
+            self.cgWindowSnapshotProvider = capture
+            self.cgRootSnapshotProvider = capture
+        } else if cgSnapshotProvider == nil {
+            self.cgWindowSnapshotProvider = { id in
+                AppTrackerCGWindowSnapshot.timedCapture { AppTrackerCGWindowSnapshot.capture(windowID: id) }
+            }
+            self.cgRootSnapshotProvider = { id in
+                AppTrackerCGWindowSnapshot.timedCapture { AppTrackerCGWindowSnapshot.captureRootCandidate(windowID: id) }
+            }
+        } else {
+            self.cgWindowSnapshotProvider = nil
+            self.cgRootSnapshotProvider = nil
+        }
         self.onScreenWindowIDsProvider = onScreenWindowIDsProvider
         self.periodicReconcileTimeout = TimeInterval(max(1, periodicAXTimeoutMS)) / 1000.0
         self.reconcileSkipEnabled = reconcileSkipEnabled
@@ -491,16 +536,6 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         }
         displayTable = displayTableProvider()
         seedRunningApps()
-        startReconcileTimer()
-        startFrontmostPollTimer()
-        for delay in [0.5, 1.0, 2.0, 4.0] {
-            work.launch(after: delay) { [weak self] generation in
-                await MainActor.run {
-                    guard let self, self.work.isCurrent(generation) else { return }
-                    self.scanNonAdmittedApps()
-                }
-            }
-        }
     }
 
     func stop() {
@@ -515,10 +550,6 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         latestCGSnapshot = nil
         pendingCGDisplayKeys.removeAll()
         for pid in appOrder { AXElementCache.shared.removeAll(pid: pid) }
-        reconcileTimer?.invalidate()
-        reconcileTimer = nil
-        frontmostPollTimer?.invalidate()
-        frontmostPollTimer = nil
         if let screenParametersObserver {
             NotificationCenter.default.removeObserver(screenParametersObserver)
             self.screenParametersObserver = nil
@@ -548,11 +579,14 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         queuedPeriodicReads.removeAll()
         trailingEventReads.removeAll()
         pendingDisplayConfirmations.removeAll()
+        targetedMoves.removeAll()
         inventoryTimeouts.removeAll()
         frontmostProbeIDs.removeAll()
         frontmostProbePending = false
         pendingPeriodicSnapshot = nil
         focusRevisions.removeAll()
+        focusInvalidatedAt.removeAll()
+        focusForegroundChangedAt = 0
         confirmedFocus.removeAll()
         pendingFocusReads.removeAll()
         trailingFocusReads.removeAll()
@@ -612,14 +646,15 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     }
 
     private func retireConflictingOwners(
-        claimedIDs: Set<CGWindowID>, ownerPID: pid_t, cgIDs: Set<CGWindowID>
+        claimedIDs: Set<CGWindowID>, ownerPID: pid_t, cgIDs: Set<CGWindowID>, capturedAt: ContinuousClock.Instant?
     ) -> Bool {
         guard !claimedIDs.isEmpty else { return false }
         var changed = false
         for pid in appOrder where pid != ownerPID {
             guard var app = apps[pid] else { continue }
             let conflicts = claimedIDs.filter { id in
-                app.windowsByID[id] != nil || app.shadowTabCgIDs.contains(id)
+                if let seat = app.windowsByID[id] { return acceptsDisplayEvidence(capturedAt, for: seat) }
+                return app.shadowTabCgIDs.contains(id)
                     || app.windowsByID.values.contains { $0.priorTabWindowNumbers.contains(id) }
                     || subscribedElement(pid: pid, cgWindowID: id) != nil
             }
@@ -650,7 +685,8 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         preloadedReadMode: InventoryReconcileReadMode? = nil,
         rawAXCgIDs: Set<CGWindowID>? = nil,
         rawAXWindows: [AXWindowSnapshot]? = nil,
-        absenceEvidence: [CGWindowID: AbsentSeatProbeEvidence] = [:]
+        absenceEvidence: [CGWindowID: AbsentSeatProbeEvidence] = [:],
+        displayReadStartedAt: ContinuousClock.Instant? = nil
     ) -> Bool {
         guard var app = apps[pid] else { return false }
         let onScreenCGIDs = cgSnapshot.onScreenWindowIDs
@@ -658,12 +694,16 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         let before = seatSignature(app)
         let observedWindows = (rawAXWindows ?? preloadedEligible).filter { $0.pid == pid }
         let observedByID = InventoryWindowSelection.preferredByID(observedWindows, matching: app.windowsByID)
+        func hasFreshNativeEvidence(for id: CGWindowID) -> Bool {
+            guard let seat = app.windowsByID[id] else { return true }
+            return acceptsDisplayEvidence(cgSnapshot.capturedAt, for: seat)
+        }
         let foreignIDs = cgSnapshot.captureFailed ? [] : Set(cgSnapshot.ownerPIDByWindowID.compactMap { id, owner in
-            owner == pid ? nil : id
+            owner != pid && hasFreshNativeEvidence(for: id) ? id : nil
         })
         let cgIDs = cgSnapshot.allWindowIDs.subtracting(foreignIDs)
         let nativeChildren = cgSnapshot.captureFailed ? [] : Set(cgPidIDs.filter {
-            cgSnapshot.parentWindowIDs[$0].map { $0 != 0 } ?? false
+            hasFreshNativeEvidence(for: $0) && cgSnapshot.parentWindowIDs[$0].map { $0 != 0 } == true
         })
         let ineligibleIDs = nativeChildren.union(foreignIDs)
         let axWindowIDs = Set(preloadedEligible.compactMap(\.cgWindowID))
@@ -696,11 +736,11 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         let eligibleCandidates = preloadedEligible.filter {
             $0.pid == pid && ($0.cgWindowID.map { !excludedIDs.contains($0) && !contestedAXIDs.contains($0) } ?? true)
         }
-        let confirmedClaims: Set<CGWindowID> = cgSnapshot.captureFailed ? [] : cgPidIDs.filter {
-            cgSnapshot.ownerPIDByWindowID[$0] == pid
+        let confirmedClaims: Set<CGWindowID> = cgSnapshot.captureFailed ? [] : cgPidIDs.filter { id in
+            cgSnapshot.ownerPIDByWindowID[id] == pid
         }
         let movedOwnership = retireConflictingOwners(claimedIDs: confirmedClaims, ownerPID: pid,
-                                                     cgIDs: cgSnapshot.allWindowIDs)
+                                                     cgIDs: cgSnapshot.allWindowIDs, capturedAt: cgSnapshot.capturedAt)
         let axReadOutcome = preloadedReadOutcome ?? .success(count: preloadedEligible.count)
 
         if axReadOutcome.kind == .unread {
@@ -734,6 +774,10 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         let reconcileContext: InventoryReconcileContext? = nil
         #endif
         func fk(_ b: CGRect?) -> String? { frameKey(pid, b) }
+        func lacksCurrentGeometryEvidence(_ seat: WindowEntry) -> Bool {
+            !acceptsDisplayEvidence(displayReadStartedAt, for: seat)
+                && !acceptsDisplayEvidence(cgSnapshot.capturedAt, for: seat)
+        }
 
         var eligibleByCgID = InventoryWindowSelection.preferredByID(eligibleCandidates, matching: app.windowsByID)
         func hasVisibleRoot(_ id: CGWindowID) -> Bool {
@@ -839,10 +883,11 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                   history: Set<CGWindowID> = [], wasEverVisible: Bool = false,
                   previousDisplayUUID: String? = nil, retainedMinimized: Bool? = nil,
                   confirmedCGDisplayBounds: CGRect? = nil,
-                  previousActionTarget: WindowActionTarget? = nil) -> WindowEntry {
+                  previousActionTarget: WindowActionTarget? = nil,
+                  keepPreviousDisplay: Bool = false) -> WindowEntry {
             let isMinimized = retainedMinimized ?? s.isMinimized
             let visible = !isMinimized && !app.isHidden
-            let fresh = visible && confirmedCGDisplayBounds == nil
+            let fresh = visible && confirmedCGDisplayBounds == nil && !keepPreviousDisplay
                 ? WindowDisplayAttribution.displayUUID(for: s.bounds, table: displayTable) : nil
             let displayUUID = fresh ?? previousDisplayUUID
             let former = history.subtracting([s.cgWindowID!])
@@ -854,10 +899,23 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                                displayUUID: displayUUID,
                                createdAt: createdAtByToken[token] ?? now,
                                confirmedCGDisplayBounds: confirmedCGDisplayBounds,
-                               actionTarget: previousActionTarget ?? WindowActionTarget(element: AXElementKey(e: s.element)))
+                               actionTarget: previousActionTarget ?? WindowActionTarget(element: AXElementKey(e: s.element)),
+                               supportsTargetedMove: s.subrole == kAXStandardWindowSubrole as String
+                                   && cgSnapshot.isNormalRoot(windowID: s.cgWindowID!, pid: pid),
+                               displayEvidenceAt: displayReadStartedAt)
+        }
+        func seatFrameKey(_ seat: WindowEntry) -> String? {
+            let id = seat.cgWindowID
+            guard rawAXCgIDs?.contains(id) == false, !onScreenCGIDs.contains(id),
+                  acceptsDisplayEvidence(cgSnapshot.capturedAt, for: seat),
+                  cgSnapshot.isNormalRoot(windowID: id, pid: pid),
+                  let recent = fk(seat.confirmedCGDisplayBounds), fk(cgSnapshot.boundsByWindowID[id]) == recent else {
+                return fk(seat.bounds)
+            }
+            return recent
         }
         let seatCountByFrame = app.windowOrder.reduce(into: [String: Int]()) { counts, id in
-            if let key = fk(app.windowsByID[id]?.bounds) { counts[key, default: 0] += 1 }
+            if let seat = app.windowsByID[id], let key = seatFrameKey(seat) { counts[key, default: 0] += 1 }
         }
         func seatsAtFrame(_ key: String) -> Int { seatCountByFrame[key] ?? 0 }
 
@@ -904,7 +962,8 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         let tentativeUptime = uptimeProvider()
         for id in app.windowOrder {
             guard let seat = app.windowsByID[id],
-                  let tentative = seat.absentProbe?.tentativeTabReplacement else { continue }
+                  let tentative = seat.absentProbe?.tentativeTabReplacement,
+                  !lacksCurrentGeometryEvidence(seat) else { continue }
             let handle = subscribedElement(pid: pid, cgWindowID: id)
             let target = eligibleByCgID[tentative.cgWindowID]
             let targetSeat = app.windowsByID[tentative.cgWindowID]
@@ -915,7 +974,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
             )
             guard tentativeUptime < tentative.expiresAt, !retainedDestroyedIDs.contains(id), !seat.isMinimized, !app.isHidden,
                   rawAXCgIDs?.contains(id) == false, !onScreenCGIDs.contains(id),
-                  fk(seat.bounds) == tentative.frameKey,
+                  seatFrameKey(seat) == tentative.frameKey,
                   let target, !target.isMinimized, fk(target.bounds) == tentative.frameKey,
                   targetSeat?.token == tentative.seatToken,
                   CFEqual(target.element, tentative.element.e),
@@ -948,7 +1007,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                 continue
             }
             let X = seat.cgWindowID
-            let seatKey = fk(seat.bounds)
+            let seatKey = seatFrameKey(seat)
             if let snapX = eligibleByCgID[X], !usedEligible.contains(X) {
                 let sameElement = seat.matchesAXElement(snapX.element)
                 let isMinimized = snapX.isMinimizedRead ?? (snapX.isMinimized || (sameElement && seat.isMinimized))
@@ -984,7 +1043,8 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                         )))
                     }
                     #endif
-                    let displayBounds = retainedCGDisplayBounds(
+                    let keepDisplay = sameElement && !acceptsDisplayEvidence(displayReadStartedAt, for: seat)
+                    let displayBounds = keepDisplay ? seat.confirmedCGDisplayBounds : retainedCGDisplayBounds(
                         for: seat, after: snapX, cgSnapshot: cgSnapshot, isVisible: !isMinimized && !app.isHidden
                     )
                     var continuation = make(token: seat.token, snapX, previousTitle: previousTitle,
@@ -993,7 +1053,15 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                                             previousDisplayUUID: seat.displayUUID,
                                             retainedMinimized: isMinimized,
                                             confirmedCGDisplayBounds: displayBounds,
-                                            previousActionTarget: sameElement ? seat.actionTarget : nil)
+                                            previousActionTarget: sameElement ? seat.actionTarget : nil,
+                                            keepPreviousDisplay: keepDisplay)
+                    if sameElement {
+                        continuation.displayMoveAt = seat.displayMoveAt
+                        if keepDisplay || displayBounds != nil ||
+                            (continuation.displayUUID == seat.displayUUID && continuation.bounds == seat.bounds) {
+                            continuation.displayEvidenceAt = seat.displayEvidenceAt
+                        }
+                    }
                     if sameElement, snapX.isMinimizedRead == true, snapX.bounds == nil {
                         continuation.bounds = seat.bounds
                     }
@@ -1009,13 +1077,18 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                 } else if observation.isMinimizedRead == false, hasVisibleRoot(X) {
                     seat.isMinimized = false
                     seat.everSeenVisible = true
-                    let displayBounds = retainedCGDisplayBounds(
+                    let previousBounds = seat.bounds
+                    let keepDisplay = !acceptsDisplayEvidence(displayReadStartedAt, for: seat)
+                    let displayBounds = keepDisplay ? seat.confirmedCGDisplayBounds : retainedCGDisplayBounds(
                         for: seat, after: observation, cgSnapshot: cgSnapshot, isVisible: !app.isHidden
                     )
                     seat.confirmedCGDisplayBounds = displayBounds
                     seat.bounds = observation.bounds ?? seat.bounds
-                    if !app.isHidden, displayBounds == nil,
+                    if !keepDisplay, !app.isHidden, displayBounds == nil,
                        let display = WindowDisplayAttribution.displayUUID(for: observation.bounds, table: displayTable) {
+                        if display != seat.displayUUID || seat.bounds != previousBounds {
+                            seat.displayEvidenceAt = displayReadStartedAt
+                        }
                         seat.displayUUID = display
                     }
                 }
@@ -1025,6 +1098,10 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                 place(seat)
                 subscribeWindow(pid: pid, element: observation.element, cgWindowID: X, context: reconcileContext)
             } else {
+                if !retainedDestroyedIDs.contains(X), lacksCurrentGeometryEvidence(seat) {
+                    place(seat)
+                    continue
+                }
                 if observedByID[X]?.titleRead == .empty { seat.title = "" }
                 if seat.absentProbe?.tentativeTabReplacement == nil,
                    !cgSnapshot.captureFailed, !seat.isMinimized, !app.isHidden,
@@ -1777,14 +1854,39 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     }
 
 
-    private struct CGDisplayEvidence: Equatable {
+    private struct CGDisplayEvidence {
         let pid: pid_t
         let seatCreatedAt: Date
         let actionTargetID: UUID?
         let key: String
+        let capturedAt: ContinuousClock.Instant?
+
+        func confirms(_ prior: Self) -> Bool {
+            guard pid == prior.pid, seatCreatedAt == prior.seatCreatedAt,
+                  actionTargetID == prior.actionTargetID, key == prior.key else { return false }
+            guard let earlier = prior.capturedAt else { return true }
+            return capturedAt.map { $0 > earlier } == true
+        }
     }
 
     private var pendingCGDisplayKeys: [CGWindowID: CGDisplayEvidence] = [:]
+
+    private func acceptsDisplayEvidence(_ time: ContinuousClock.Instant?, for seat: WindowEntry) -> Bool {
+        if let evidence = seat.displayEvidenceAt, time.map({ $0 >= evidence }) != true { return false }
+        if let moved = seat.displayMoveAt, time.map({ $0 >= moved }) != true { return false }
+        return true
+    }
+
+    @discardableResult
+    private func applyDisplaySample(_ sample: CGMoveCacheCheck.Sample, to seat: WindowEntry,
+                                    pid: pid_t, id: CGWindowID) -> Bool {
+        guard acceptsDisplayEvidence(sample.capturedAt, for: seat) else { return false }
+        apps[pid]?.windowsByID[id]?.displayUUID = sample.display
+        apps[pid]?.windowsByID[id]?.confirmedCGDisplayBounds = sample.bounds
+        apps[pid]?.windowsByID[id]?.displayEvidenceAt = sample.capturedAt
+        pendingCGDisplayKeys.removeValue(forKey: id)
+        return sample.display != seat.displayUUID
+    }
 
     private func clearPendingCGDisplayKeys(pid: pid_t) {
         for id in apps[pid]?.windowOrder ?? [] where pendingCGDisplayKeys[id]?.pid == pid {
@@ -1808,7 +1910,8 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
            WindowDisplayAttribution.displayUUID(for: confirmedBounds, table: displayTable) == axDisplay {
             return nil
         }
-        if !cgSnapshot.captureFailed, cgSnapshot.ownerPIDByWindowID[seat.cgWindowID] == window.pid,
+        if !cgSnapshot.captureFailed, acceptsDisplayEvidence(cgSnapshot.capturedAt, for: seat),
+           cgSnapshot.ownerPIDByWindowID[seat.cgWindowID] == window.pid,
            let cgBounds = cgSnapshot.boundsByWindowID[seat.cgWindowID], WindowFrameMatchPolicy.isValid(cgBounds) {
             let agrees = WindowFrameMatchPolicy.areClose(axBounds, cgBounds)
                 && WindowDisplayAttribution.displayUUID(for: cgBounds, table: displayTable) == axDisplay
@@ -1829,24 +1932,25 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
             guard let app = apps[pid], !app.isHidden else { continue }
             for cgID in app.windowOrder {
                 guard let seat = app.windowsByID[cgID], !seat.isMinimized,
+                      acceptsDisplayEvidence(cgSnapshot.capturedAt, for: seat),
                       cgSnapshot.ownerPIDByWindowID[cgID] == pid,
                       let rect = cgSnapshot.boundsByWindowID[cgID],
                       let key = WindowDisplayAttribution.displayUUID(for: rect, table: displayTable) else { continue }
+                let sample = CGMoveCacheCheck.Sample(bounds: rect, display: key, capturedAt: cgSnapshot.capturedAt)
                 if key == seat.displayUUID {
                     if seat.confirmedCGDisplayBounds != nil {
-                        apps[pid]?.windowsByID[cgID]?.confirmedCGDisplayBounds = rect
+                        applyDisplaySample(sample, to: seat, pid: pid, id: cgID)
                     }
                     continue
                 }
                 let evidence = CGDisplayEvidence(pid: pid, seatCreatedAt: seat.createdAt,
-                                                 actionTargetID: seat.actionTarget?.id, key: key)
-                guard pendingCGDisplayKeys[cgID] == evidence else {
+                                                 actionTargetID: seat.actionTarget?.id, key: key,
+                                                 capturedAt: cgSnapshot.capturedAt)
+                guard let prior = pendingCGDisplayKeys[cgID], evidence.confirms(prior) else {
                     pending[cgID] = evidence
                     continue
                 }
-                apps[pid]?.windowsByID[cgID]?.displayUUID = key
-                apps[pid]?.windowsByID[cgID]?.confirmedCGDisplayBounds = rect
-                changed = true
+                changed = applyDisplaySample(sample, to: seat, pid: pid, id: cgID) || changed
             }
         }
         pendingCGDisplayKeys = pending
@@ -2032,6 +2136,15 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         let nc = workspaceNotifications
 
         workspaceObservers.append(nc.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.work.isCurrent(generation) else { return }
+                self.moveSpaceRevision &+= 1
+            }
+        })
+
+        workspaceObservers.append(nc.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification,
             object: nil, queue: .main
         ) { [weak self] notification in
@@ -2087,7 +2200,17 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
             Task { @MainActor [weak self] in
                 guard let self, self.work.isCurrent(generation) else { return }
                 self.cachedFrontmostPID = pid
+                self.resumeDeferredInventoryEvents(isPeriodic: true, processes: self.trackedFrontmostPIDs(pid))
                 self.handleAppActivated(app)
+            }
+        })
+        workspaceObservers.append(nc.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.work.isCurrent(generation) else { return }
+                self.reconcile()
             }
         })
     }
@@ -2124,7 +2247,6 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         guard let observation = launchObservations[pid], observation.identity == identity,
               !observation.receivedLaunch else { return }
         launchObservations[pid]?.receivedLaunch = true
-        scheduleLaunchProbe(pid: pid)
         let wait = waitForLaunchRetry
         for delay in launchRetryDelays {
             let id = UUID()
@@ -2144,17 +2266,69 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
             }
             launchObservations[pid]?.retries[id] = task
         }
+        scheduleLaunchProbe(pid: pid)
     }
 
     private func scheduleLaunchProbe(pid: pid_t) {
-        guard launchObservations[pid] != nil else { return }
+        guard let launch = launchObservations[pid] else { return }
+        if launch.admittedFirstWindow {
+            guard isAccessibilityTrusted() else {
+                finishLaunchObservation(pid: pid, focusOutcome: "foreground-or-permission-changed")
+                return
+            }
+            let foreground = refreshFocusForeground()
+            guard foreground.pid == pid else {
+                finishLaunchObservation(pid: pid, focusOutcome: "foreground-or-permission-changed")
+                return
+            }
+            #if DEBUG
+            logger.notice("launch-focus event=continue pid=\(pid) remaining-retries=\(launch.retries.count)")
+            #endif
+            requestFocusedWindowRead(pid: pid, refreshSystemFocus: false, foreground: foreground)
+            finishExhaustedLaunchFocus(pid: pid)
+            return
+        }
         scheduleEventRead(pid: pid, intent: EventReadIntent(source: .initialEnumeration, launchProbe: true,
                                                             requestsInventory: false))
     }
 
-    private func finishLaunchObservation(pid: pid_t) {
+    private func finishLaunchObservation(pid: pid_t, focusOutcome: String? = nil) {
         guard let launch = launchObservations.removeValue(forKey: pid) else { return }
         for retry in launch.retries.values { retry.cancel() }
+        #if DEBUG
+        if let focusOutcome {
+            logger.notice("launch-focus event=finished pid=\(pid) outcome=\(focusOutcome, privacy: .public)")
+        }
+        #endif
+    }
+
+    private func recordLaunchWindowAdmission(pid: pid_t) {
+        guard let launch = launchObservations[pid], !launch.admittedFirstWindow,
+              let firstWindow = apps[pid]?.windowOrder.first else { return }
+        guard frontmostPIDProvider() == pid else {
+            finishLaunchObservation(pid: pid)
+            return
+        }
+        launchObservations[pid]?.admittedFirstWindow = true
+        #if DEBUG
+        logger.notice("launch-focus event=first-seat pid=\(pid) window=\(firstWindow) remaining-retries=\(launch.retries.count)")
+        #endif
+    }
+
+    private func completeLaunchFocus(pid: pid_t, windowID: CGWindowID, element: AXElementKey) -> Bool {
+        guard let launch = launchObservations[pid], launch.receivedLaunch, launch.admittedFirstWindow,
+              isAccessibilityTrusted(), frontmostPIDProvider() == pid,
+              let app = apps[pid], app.processGeneration == processGeneration(launch.identity), !app.isHidden,
+              let seat = app.windowsByID[windowID], seat.isFocused, !seat.isMinimized,
+              seat.actionTarget?.element == element, destroyedWindows[pid]?[windowID] == nil else { return false }
+        finishLaunchObservation(pid: pid, focusOutcome: "exact-focus")
+        return true
+    }
+
+    private func finishExhaustedLaunchFocus(pid: pid_t) {
+        guard let launch = launchObservations[pid], launch.receivedLaunch, launch.admittedFirstWindow, launch.retries.isEmpty,
+              pendingFocusReads[pid] == nil, pendingEventReads[pid] == nil else { return }
+        finishLaunchObservation(pid: pid, focusOutcome: "retry-budget-exhausted")
     }
 
     private func handleAppActivated(_ app: NSRunningApplication) {
@@ -2163,6 +2337,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         requestSystemFocusedWindowRead(foreground: foreground)
         guard isWindowCandidate(app) else { return }
         let pid = app.processIdentifier
+        observers[pid]?.start()
         if apps[pid] != nil, applicationOwner(for: pid) != nil {
             markReconcileGateDirty(pid: pid)
             requestFocusedWindowRead(pid: pid, refreshSystemFocus: false, foreground: foreground)
@@ -2213,6 +2388,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         inventoryTimeouts.removeValue(forKey: pid)
         frontmostProbeIDs.removeValue(forKey: pid)
         focusRevisions.removeValue(forKey: pid)
+        focusInvalidatedAt.removeValue(forKey: pid)
         confirmedFocus.removeValue(forKey: pid)
         pendingFocusReads.removeValue(forKey: pid)
         trailingFocusReads.remove(pid)
@@ -2239,6 +2415,8 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         cancelDisplayConfirmations(pid: pid)
         if pendingEventReads[pid]?.intent.moves.isEmpty == false { supersedeEventRead(pid: pid) }
         trailingEventReads[pid]?.moves.removeAll()
+        let changedAt = ContinuousClock.now
+        for id in apps[pid]?.windowOrder ?? [] { apps[pid]?.windowsByID[id]?.displayMoveAt = changedAt }
         apps[pid]?.isHidden = true
         rebuildSnapshot()
     }
@@ -2307,7 +2485,8 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         #endif
         if launchObservations[pid] != nil {
             observer.onWindowCreationReady = { [weak self] pid in
-                self?.scheduleEventRead(pid: pid, source: .initialEnumeration)
+                guard let self, self.launchObservations[pid]?.admittedFirstWindow == false else { return }
+                self.scheduleEventRead(pid: pid, source: .initialEnumeration)
             }
         }
         observer.onWindowCreated = { [weak self] pid, element in self?.handleWindowCreated(pid: pid, element: element) }
@@ -2555,7 +2734,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     private func handleWindowCreated(pid: pid_t, element: AXElementKey) {
         markReconcileGateDirty(pid: pid)
         clearFirstHiddenMarks(pid: pid)
-        if launchObservations[pid] != nil {
+        if launchObservations[pid]?.admittedFirstWindow == false {
             scheduleEventRead(pid: pid, intent: EventReadIntent(source: .windowCreated, requestsInventory: false,
                                                                 createdElements: [element]))
         } else {
@@ -2577,10 +2756,12 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         destroyedWindows[pid, default: [:]][cgWindowID] = DestroyedWindow(element: element)
         purgeFromSeatHistories(cgWindowID)
         elementCache.remove(pid: pid, cgWindowID: cgWindowID)
+        spaceInvalidations.send(cgWindowID)
         scheduleEventRead(pid: pid, source: .windowDestroyed)
     }
 
     private func handleWindowMinimized(pid: pid_t, cgWindowID: CGWindowID) {
+        focusInvalidatedAt[pid] = uptimeProvider()
         markReconcileGateDirty(pid: pid)
         clearFirstHiddenMarks(pid: pid)
         invalidateEventReads(pid: pid, removingMoveFor: cgWindowID)
@@ -2588,20 +2769,26 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         apps[pid]?.windowsByID[cgWindowID]?.isMinimized = true
         apps[pid]?.windowsByID[cgWindowID]?.isFocused = false
         rebuildSnapshot()
+        spaceInvalidations.send(cgWindowID)
     }
 
     private func handleWindowDeminiaturized(pid: pid_t, cgWindowID: CGWindowID) {
+        recordWindowDeminiaturized(pid: pid, cgWindowID: cgWindowID)
+        rebuildSnapshot()
+        spaceInvalidations.send(cgWindowID)
+    }
+
+    private func recordWindowDeminiaturized(pid: pid_t, cgWindowID: CGWindowID) {
         markReconcileGateDirty(pid: pid)
         clearFirstHiddenMarks(pid: pid)
         invalidateEventReads(pid: pid, removingMoveFor: cgWindowID)
         apps[pid]?.windowsByID[cgWindowID]?.isMinimized = false
-        rebuildSnapshot()
     }
 
     func handleFocusedWindowChanged(pid: pid_t) {
+        if apps[pid] != nil { focusInvalidatedAt[pid] = uptimeProvider() }
         markReconcileGateDirty(pid: pid)
         requestFocusedWindowRead(pid: pid)
-        scheduleEventRead(pid: pid, source: .focusChanged)
     }
 
     private func requestFocusedWindowRead(pid: pid_t, refreshSystemFocus: Bool = true,
@@ -2640,11 +2827,13 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation), self.pendingFocusReads[pid]?.id == request.id else { return }
                 self.pendingFocusReads.removeValue(forKey: pid)
+                defer { self.finishExhaustedLaunchFocus(pid: pid) }
                 if self.trailingFocusReads.remove(pid) != nil {
                     self.beginFocusedWindowRead(pid: pid, foreground: self.focusForegroundForRead())
                     return
                 }
                 guard self.focusRevisions[pid] == request.revision,
+                      self.focusForegroundRevision == request.foregroundRevision,
                       self.mutationGenerations[pid, default: 0] == request.mutationGeneration,
                       let app = self.apps[pid],
                       app.processGeneration != nil,
@@ -2657,12 +2846,25 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                 switch result.result {
                 case let .window(id): focused = id
                 case .none: focused = nil
-                case .unread: return
+                case .unread(let error):
+                    #if DEBUG
+                    self.logger.notice("focus-read event=unread pid=\(pid, privacy: .public) foregroundRevision=\(request.foregroundRevision, privacy: .public) axError=\(error.rawValue, privacy: .public)")
+                    #endif
+                    return
+                }
+                if let focused, app.windowsByID[focused] == nil
+                    || result.windowElement.map({ app.windowsByID[focused]?.actionTarget?.element != $0 }) == true {
+                    self.scheduleEventRead(pid: pid, source: .focusChanged)
                 }
                 let focusElement = result.windowElement ?? focused.flatMap { app.windowsByID[$0]?.actionTarget?.element }
                 let previous = self.confirmedFocus[pid]
                 if let previous, previous.observedAt > result.observedAt,
                    previous.windowID != focused || previous.element != focusElement { return }
+                #if DEBUG
+                if previous?.windowID != focused {
+                    self.logger.info("focus-read event=confirmed pid=\(pid, privacy: .public) window=\(focused ?? 0, privacy: .public) foregroundRevision=\(request.foregroundRevision, privacy: .public)")
+                }
+                #endif
                 if liveForeground?.pid == pid, liveForeground?.revision == request.foregroundRevision,
                    self.unreadSystemFocusForegroundRevision == request.foregroundRevision,
                    self.applicationOwner(for: pid) != nil {
@@ -2674,15 +2876,84 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                         self.confirmedLocalFocus = nil
                     }
                 }
-                self.confirmedFocus[pid] = ConfirmedFocus(observedAt: max(previous?.observedAt ?? 0, result.observedAt), windowID: focused,
-                                                          element: focusElement)
-                for id in app.windowOrder {
-                    self.apps[pid]?.windowsByID[id]?.isFocused = id == focused &&
-                        (focusElement.map { app.windowsByID[id]?.actionTarget?.element == $0 } ?? true)
-                }
+                self.recordConfirmedFocus(pid: pid, windowID: focused, element: focusElement,
+                                          observedAt: result.observedAt)
                 self.rebuildSnapshot(onScreenCGIDs: self.lastOnScreenCGIDs, foreground: liveForeground)
+                if let focused, let exact = result.windowElement, result.observedAt >= (previous?.observedAt ?? 0) {
+                    self.publishLaunchFocusIfPending(pid: pid, windowID: focused, element: exact,
+                                                     observedAt: result.observedAt)
+                }
             }
         }
+    }
+
+    private func recordConfirmedFocus(pid: pid_t, windowID: CGWindowID?, element: AXElementKey?,
+                                      observedAt: TimeInterval) {
+        guard let app = apps[pid] else { return }
+        confirmedFocus[pid] = ConfirmedFocus(observedAt: max(confirmedFocus[pid]?.observedAt ?? 0, observedAt),
+                                            windowID: windowID, element: element)
+        for id in app.windowOrder {
+            apps[pid]?.windowsByID[id]?.isFocused = id == windowID &&
+                (element.map { app.windowsByID[id]?.actionTarget?.element == $0 } ?? true)
+        }
+    }
+
+    func acceptRestoredWindowFocus(_ focus: WindowFocusConfirmation, target: WindowActionIdentity) {
+        let pid = focus.pid
+        guard work.isActive, isAccessibilityTrusted() else { return }
+        let foreground = frontmostPIDProvider()
+        guard foreground == pid, focus.observedAt >= focusForegroundChangedAt,
+              focus.observedAt >= (focusInvalidatedAt[pid] ?? 0),
+              focus.observedAt >= (confirmedFocus[pid]?.observedAt ?? 0) else {
+            #if DEBUG
+            logger.notice("restore-focus event=discarded pid=\(pid) window=\(focus.windowID) reason=foreground-or-newer-focus")
+            #endif
+            return
+        }
+        guard systemFocusFamily(frontmostPID: pid) == nil, target.pid == pid, let app = apps[pid], !app.isHidden,
+              let generation = target.processGeneration, app.processGeneration == generation,
+              processGeneration(processIdentity(pid: pid, bundleID: app.bundleIdentifier)) == generation,
+              let seat = app.windowsByID[focus.windowID], seat.actionTarget?.element == focus.element,
+              destroyedWindows[pid]?[focus.windowID] == nil,
+              target.targetID == nil ? target.cgWindowID == focus.windowID : target.targetID == seat.actionTarget?.id else {
+            #if DEBUG
+            logger.notice("restore-focus event=discarded pid=\(pid) window=\(focus.windowID) reason=target-identity")
+            #endif
+            return
+        }
+        if frontmostCacheEnabled { cachedFrontmostPID = pid }
+        observeFocusForeground(pid)
+        if seat.isMinimized { recordWindowDeminiaturized(pid: pid, cgWindowID: focus.windowID) }
+        recordConfirmedFocus(pid: pid, windowID: focus.windowID, element: focus.element, observedAt: focus.observedAt)
+        #if DEBUG
+        logger.notice("restore-focus event=accepted pid=\(pid) window=\(focus.windowID) foregroundRevision=\(self.focusForegroundRevision)")
+        #endif
+        rebuildSnapshot(onScreenCGIDs: lastOnScreenCGIDs, foreground: .init(pid: pid, revision: focusForegroundRevision))
+        if seat.isMinimized { spaceInvalidations.send(focus.windowID) }
+    }
+
+    private func publishLaunchFocusIfPending(pid: pid_t, windowID: CGWindowID, element: AXElementKey,
+                                             observedAt: TimeInterval) {
+        guard launchObservations[pid] != nil, let generation = apps[pid]?.processGeneration else { return }
+        let focus = WindowLaunchFocus(pid: pid, processGeneration: generation, windowID: windowID, element: element,
+            observedAt: observedAt, focusRevision: focusRevisions[pid, default: 0], foregroundRevision: focusForegroundRevision)
+        guard isLaunchWindowFocusCurrent(focus), completeLaunchFocus(pid: pid, windowID: windowID, element: element) else { return }
+        #if DEBUG
+        logger.notice("launch-window-focus event=confirmed pid=\(pid) window=\(windowID) foregroundRevision=\(self.focusForegroundRevision)")
+        #endif
+        launchFocusEvents.send(focus)
+    }
+
+    func isLaunchWindowFocusCurrent(_ focus: WindowLaunchFocus) -> Bool {
+        let pid = focus.pid
+        guard work.isActive, isAccessibilityTrusted(), focusForegroundForRead().pid == pid,
+              focus.foregroundRevision == focusForegroundRevision, focus.focusRevision == focusRevisions[pid, default: 0],
+              let confirmation = confirmedFocus[pid], confirmation.observedAt == focus.observedAt,
+              confirmation.windowID == focus.windowID, confirmation.element == focus.element,
+              let app = apps[pid], app.processGeneration == focus.processGeneration, !app.isHidden,
+              let seat = app.windowsByID[focus.windowID], seat.isFocused, !seat.isMinimized,
+              seat.actionTarget?.element == focus.element, destroyedWindows[pid]?[focus.windowID] == nil else { return false }
+        return true
     }
 
     private func systemFocusFamily(frontmostPID: pid_t?) -> pid_t? {
@@ -2796,12 +3067,107 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         guard let app = apps[pid], !app.isHidden, let seat = app.windowsByID[cgWindowID],
               let generation = app.processGeneration, let target = seat.actionTarget,
               !seat.isMinimized, target.element == element else { return }
-        supersedeEventRead(pid: pid)
         cancelDisplayConfirmations(pid: pid, windowID: cgWindowID)
         pendingCGDisplayKeys.removeValue(forKey: cgWindowID)
+        let observedAt = ContinuousClock.now
+        let hint = WindowMoveHint(target: target, processGeneration: generation, spaceRevision: moveSpaceRevision,
+                                  observedAt: observedAt)
+        apps[pid]?.windowsByID[cgWindowID]?.displayMoveAt = observedAt
+        spaceInvalidations.send(cgWindowID)
+        guard let capture = cgRootSnapshotProvider, seat.supportsTargetedMove,
+              seat.displayUUID != nil, seat.minAbsentSince == nil, seat.absentProbe == nil,
+              seat.priorTabWindowNumbers.isEmpty, app.shadowTabCgIDs.isEmpty else {
+            reconcileMove(pid: pid, id: cgWindowID, hint: hint)
+            return
+        }
+        let move = TargetedMove(pid: pid, id: cgWindowID, hint: hint,
+            mutationGeneration: mutationGenerations[pid, default: 0], topologyRevision: displayTopologyRevision)
+        if targetedMoves[target.id] != nil {
+            targetedMoves[target.id]?.pending = move
+        } else {
+            beginTargetedMove(move, capture: capture)
+        }
+    }
+
+    private func reconcileMove(pid: pid_t, id: CGWindowID, hint: WindowMoveHint) {
         markReconcileGateDirty(pid: pid, invalidatingCGCache: false)
-        let hint = WindowMoveHint(target: target, processGeneration: generation)
-        scheduleEventRead(pid: pid, intent: EventReadIntent(source: .windowMoved, moves: [cgWindowID: hint]))
+        scheduleEventRead(pid: pid, intent: EventReadIntent(source: .windowMoved, moves: [id: hint]))
+    }
+
+    private func currentSeat(for move: TargetedMove) -> WindowEntry? {
+        guard move.topologyRevision == displayTopologyRevision, move.hint.spaceRevision == moveSpaceRevision,
+              mutationGenerations[move.pid, default: 0] == move.mutationGeneration,
+              let app = apps[move.pid], !app.isHidden, app.processGeneration == move.hint.processGeneration,
+              let seat = app.windowsByID[move.id], !seat.isMinimized, seat.actionTarget == move.hint.target,
+              seat.displayMoveAt == move.hint.observedAt, seat.supportsTargetedMove,
+              seat.minAbsentSince == nil, seat.absentProbe == nil,
+              seat.priorTabWindowNumbers.isEmpty, app.shadowTabCgIDs.isEmpty,
+              destroyedWindows[move.pid]?[move.id] == nil else { return nil }
+        return seat
+    }
+
+    private func beginTargetedMove(_ move: TargetedMove,
+                                   capture: @escaping @Sendable (CGWindowID) -> AppTrackerCGWindowSnapshot,
+                                   recent: AppTrackerCGWindowSnapshot? = nil) {
+        guard work.isActive, let source = currentSeat(for: move)?.displayUUID else { return }
+        let target = move.hint.target.id
+        let table = displayTable
+        let reusable = recent.flatMap { snapshot in
+            snapshot.capturedAt.map { $0 >= move.hint.observedAt } == true ? snapshot : nil
+        }
+        targetedMoves[target] = TargetedMoveWork()
+        work.launch { [weak self] generation in
+            let firstSnapshot: AppTrackerCGWindowSnapshot
+            if let reusable { firstSnapshot = reusable }
+            else {
+                guard let sampled = await AsyncWorkScope.performBlocking(on: .global(qos: .utility), operation: {
+                    capture(move.id)
+                }) else { return }
+                firstSnapshot = sampled
+            }
+            let first = CGMoveCacheCheck.sample(for: move.id, pid: move.pid, table: table, snapshot: firstSnapshot,
+                                                requiresRoot: true)
+            var accepted = first
+            var available = first != nil
+            if let first, first.display != source {
+                accepted = nil
+                if await Self.waitForDisplayConfirmation(), await MainActor.run(body: { [weak self] in
+                    self?.currentSeat(for: move) != nil && self?.work.isCurrent(generation) == true
+                }), let second = await AsyncWorkScope.performBlocking(on: .global(qos: .utility), operation: {
+                    CGMoveCacheCheck.sample(for: move.id, pid: move.pid, table: table, snapshot: capture(move.id),
+                                            requiresRoot: true)
+                }) {
+                    available = second != nil
+                    if let second, second.display == source || (second.display == first.display
+                        && WindowFrameMatchPolicy.areClose(second.bounds, first.bounds)) { accepted = second }
+                }
+            }
+            let sample = accepted
+            let hasSample = available
+            await MainActor.run { [weak self] in
+                guard let self, self.work.isCurrent(generation) else { return }
+                let pending = self.targetedMoves.removeValue(forKey: target)?.pending
+                if let pending {
+                    let sameEpoch = pending.topologyRevision == move.topologyRevision
+                        && pending.hint.spaceRevision == move.hint.spaceRevision
+                        && pending.mutationGeneration == move.mutationGeneration
+                    self.beginTargetedMove(pending, capture: capture, recent: sameEpoch ? firstSnapshot : nil)
+                    return
+                }
+                guard let seat = self.currentSeat(for: move), let app = self.apps[move.pid],
+                      self.processGeneration(self.processIdentity(pid: move.pid, bundleID: app.bundleIdentifier)) == move.hint.processGeneration else { return }
+                if let sample {
+                    if self.applyDisplaySample(sample, to: seat, pid: move.pid, id: move.id) {
+                        self.rebuildSnapshot(onScreenCGIDs: self.lastOnScreenCGIDs)
+                    }
+                } else if !hasSample {
+                    #if DEBUG
+                    self.logger.debug("targeted-move-fallback pid=\(move.pid) window=\(move.id)")
+                    #endif
+                    self.reconcileMove(pid: move.pid, id: move.id, hint: move.hint)
+                }
+            }
+        }
     }
 
     private func markReconcileGateDirty(pid: pid_t, invalidatingCGCache: Bool = true) {
@@ -2855,7 +3221,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
 
         let identity = processIdentity(pid: pid, bundleID: app.bundleIdentifier)
         guard canReadTrackedProcess(pid: pid, identity: identity) else { return }
-        let awaitsFirstWindow = launchObservations[pid] != nil && app.windowOrder.isEmpty
+        let awaitsFirstWindow = launchObservations[pid]?.admittedFirstWindow == false && app.windowOrder.isEmpty
         if !awaitsFirstWindow {
             if intent.launchProbe, !intent.requestsInventory, intent.createdElements.isEmpty {
                 trailingEventReads.removeValue(forKey: pid)
@@ -2883,6 +3249,9 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
             mutationGeneration: mutationGenerations[pid, default: 0],
             identity: identity,
             intent: intent,
+            launchFocusRevisions: launchObservations[pid].map { _ in
+                (focusRevisions[pid, default: 0], focusForegroundRevision)
+            },
             skipsCGWithoutWindows: awaitsFirstWindow,
             absenceProbes: intent.createdElements.isEmpty ? takeDueAbsenceProbes(pid: pid) : []
         )
@@ -2981,6 +3350,15 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                       pending.token == request.token else { return }
                 let superseded = pending.isSuperseded
                 if !superseded { self.noteCGSnapshotAcquisition(acquisition) }
+                #if DEBUG
+                if !superseded, let observe = self.onWindowRestoreOnScreenSample {
+                    if acquisition.fresh, !acquisition.snapshot.captureFailed {
+                        observe(acquisition.snapshot.onScreenWindowIDs, "fresh-cg-capture")
+                    } else if let probe = acquisition.probeIDs {
+                        observe(probe, "cg-onscreen-probe")
+                    }
+                }
+                #endif
                 self.completeEventRead(
                     pid: pid,
                     request: request,
@@ -3038,6 +3416,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         struct Sample: Sendable {
             let bounds: CGRect
             let display: String
+            let capturedAt: ContinuousClock.Instant?
         }
 
         struct FirstSample: Sendable {
@@ -3084,21 +3463,23 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                       let prior = windows[id], !prior.isMinimized, let source = prior.display,
                       prior.element == AXElementKey(e: window.element),
                       WindowDisplayAttribution.displayUUID(for: window.bounds, table: table) == source,
-                      let sample = sample(for: id, snapshot: capture(id)) else { continue }
+                      let sample = Self.sample(for: id, pid: pid, table: table, snapshot: capture(id)) else { continue }
                 exact[id] = FirstSample(source: source, sample: sample)
             }
             return exact
         }
 
-        private func sample(for id: CGWindowID, snapshot: AppTrackerCGWindowSnapshot) -> Sample? {
+        static func sample(for id: CGWindowID, pid: pid_t, table: WindowDisplayAttribution.Table,
+                           snapshot: AppTrackerCGWindowSnapshot, requiresRoot: Bool = false) -> Sample? {
             guard !snapshot.captureFailed, snapshot.ownerPIDByWindowID[id] == pid,
+                  !requiresRoot || (snapshot.isNormalRoot(windowID: id, pid: pid) && snapshot.alphaByWindowID[id] != 0),
                   snapshot.onScreenWindowIDs.contains(id), let bounds = snapshot.boundsByWindowID[id],
                   let display = WindowDisplayAttribution.displayUUID(for: bounds, table: table) else { return nil }
-            return Sample(bounds: bounds, display: display)
+            return Sample(bounds: bounds, display: display, capturedAt: snapshot.capturedAt)
         }
 
         func confirm(id: CGWindowID, first: Sample, with snapshot: AppTrackerCGWindowSnapshot) -> Sample? {
-            guard let current = sample(for: id, snapshot: snapshot), current.display == first.display,
+            guard let current = Self.sample(for: id, pid: pid, table: table, snapshot: snapshot), current.display == first.display,
                   WindowFrameMatchPolicy.areClose(current.bounds, first.bounds) else { return nil }
             return current
         }
@@ -3201,7 +3582,10 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
               mutationGenerations[pid, default: 0] == request.mutationGeneration else { return .skipped }
         if case .created(let windows) = result {
             let changed = admitCreatedWindows(windows, for: app, cgSnapshot: cgSnapshot)
-            if changed { finishLaunchObservation(pid: pid) }
+            if changed {
+                recordLaunchWindowAdmission(pid: pid)
+                finishExhaustedLaunchFocus(pid: pid)
+            }
             return .reconciled(seatsChanged: changed)
         }
         guard let inventory = result.inventory, !request.skipsCGWithoutWindows || !result.windows.isEmpty else {
@@ -3211,6 +3595,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         let readOutcome: InventoryAXReadOutcome
         let eligible: [AXWindowSnapshot]
         let rawAXWindows: [AXWindowSnapshot]?
+        var exactLaunchFocus: ConfirmedFocus?
         switch inventory {
         case .success(let windows):
             readOutcome = .success(count: windows.count)
@@ -3228,8 +3613,14 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                 observed = windows
                 if let observedAt {
                     let focused = windows.first(where: \.isFocusedWindow)
-                    confirmedFocus[pid] = ConfirmedFocus(observedAt: observedAt, windowID: focused?.cgWindowID,
-                                                         element: focused.map { AXElementKey(e: $0.element) })
+                    let focus = ConfirmedFocus(observedAt: observedAt, windowID: focused?.cgWindowID,
+                                               element: focused.map { AXElementKey(e: $0.element) })
+                    confirmedFocus[pid] = focus
+                    if let revisions = request.launchFocusRevisions,
+                       revisions.focus == focusRevisions[pid, default: 0],
+                       revisions.foreground == focusForegroundRevision {
+                        exactLaunchFocus = focus
+                    }
                 }
             }
             rawAXWindows = observed
@@ -3250,11 +3641,14 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
             preloadedReadOutcome: readOutcome,
             preloadedReadMode: .timed,
             rawAXWindows: rawAXWindows,
-            absenceEvidence: evidenceByCgID
+            absenceEvidence: evidenceByCgID,
+            displayReadStartedAt: request.displayReadStartedAt
         )
-        if launchObservations[pid] != nil, apps[pid]?.windowOrder.isEmpty == false {
-            finishLaunchObservation(pid: pid)
+        recordLaunchWindowAdmission(pid: pid)
+        if let exactLaunchFocus, let windowID = exactLaunchFocus.windowID, let element = exactLaunchFocus.element {
+            publishLaunchFocusIfPending(pid: pid, windowID: windowID, element: element, observedAt: exactLaunchFocus.observedAt)
         }
+        finishExhaustedLaunchFocus(pid: pid)
         return .reconciled(seatsChanged: seatsChanged)
     }
 
@@ -3280,7 +3674,10 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                 title: window.titleRead.resolvedTitle(previousTitle: nil), bounds: window.bounds,
                 isMinimized: window.isMinimized, isFocused: window.isFocusedWindow, everSeenVisible: !window.isMinimized,
                 displayUUID: visible ? WindowDisplayAttribution.displayUUID(for: window.bounds, table: displayTable) : nil,
-                createdAt: now, actionTarget: WindowActionTarget(element: element))
+                createdAt: now, actionTarget: WindowActionTarget(element: element),
+                supportsTargetedMove: window.subrole == kAXStandardWindowSubrole as String
+                    && cgSnapshot.isNormalRoot(windowID: id, pid: pid),
+                displayEvidenceAt: cgSnapshot.capturedAt)
             current.windowOrder.append(id)
             current.shadowTabCgIDs.remove(id)
             if AXElementCache.isEnabled { elementCache.store(pid: pid, cgWindowID: id, element: window.element) }
@@ -3301,11 +3698,32 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         moveCache: CGMoveCacheCheck?,
         exactSamples: [CGWindowID: CGMoveCacheCheck.FirstSample]
     ) {
+        #if DEBUG
+        let resources = ActionResourceLog.begin("inventory.apply.\(request.intent.source.rawValue)")
+        defer { resources?.finish() }
+        #endif
         let landing = landEventRead(
             pid: pid, request: request, result: result, cgSnapshot: cgSnapshot,
             absenceEvidence: absenceEvidence
         )
         #if DEBUG
+        if request.skipsCGWithoutWindows {
+            let outcome: String
+            switch result {
+            case .inventory(.success): outcome = "inventory"
+            case .inventory(.unread(let error)): outcome = "unread-\(error.rawValue)"
+            case .created: outcome = "created"
+            case .deferred: outcome = "deferred"
+            }
+            let disposition: String
+            switch landing {
+            case .reconciled: disposition = "reconciled"
+            case .skipped: disposition = "skipped"
+            case .staleToken: disposition = "stale-token"
+            }
+            let focusedWindow = result.windows.first(where: \.isFocusedWindow)?.cgWindowID ?? 0
+            logger.notice("launch-window-read pid=\(pid) source=\(request.intent.source.rawValue, privacy: .public) outcome=\(outcome, privacy: .public) landing=\(disposition, privacy: .public) windows=\(result.windows.count) focused=\(focusedWindow) admitted=\(self.apps[pid]?.windowOrder.count ?? 0) cg-capture-failed=\(cgSnapshot.captureFailed)")
+        }
         if case .reconciled = landing {} else {
             for item in absenceEvidence {
                 recordAbsenceProbe(
@@ -3354,12 +3772,13 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                                            samples: [CGWindowID: CGMoveCacheCheck.FirstSample]) {
         guard let capture = cgWindowSnapshotProvider else { return }
         for (id, first) in samples where first.sample.display != first.source {
-            guard isDisplayConfirmationCurrent(pid: pid, id: id, request: request, check: check, source: first.source) else { continue }
-            let task = work.launch(after: 0.1) { [weak self] generation in
+            guard isDisplayConfirmationCurrent(pid: pid, id: id, request: request, check: check, first: first) else { continue }
+            let task = work.launch { [weak self] generation in
+                guard await Self.waitForDisplayConfirmation() else { return }
                 let shouldRead = await MainActor.run { [weak self] in
                     guard let self, self.work.isCurrent(generation),
                           self.pendingDisplayConfirmations[pid]?[id]?.token == request.token else { return false }
-                    return self.isDisplayConfirmationCurrent(pid: pid, id: id, request: request, check: check, source: first.source)
+                    return self.isDisplayConfirmationCurrent(pid: pid, id: id, request: request, check: check, first: first)
                 }
                 var sample: CGMoveCacheCheck.Sample?
                 if shouldRead {
@@ -3373,12 +3792,11 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
                           self.pendingDisplayConfirmations[pid]?[id]?.token == request.token else { return }
                     self.pendingDisplayConfirmations[pid]?.removeValue(forKey: id)
                     if self.pendingDisplayConfirmations[pid]?.isEmpty == true { self.pendingDisplayConfirmations[pid] = nil }
-                    guard let confirmed,
-                          self.isDisplayConfirmationCurrent(pid: pid, id: id, request: request, check: check, source: first.source) else { return }
-                    self.apps[pid]?.windowsByID[id]?.displayUUID = confirmed.display
-                    self.apps[pid]?.windowsByID[id]?.confirmedCGDisplayBounds = confirmed.bounds
-                    self.pendingCGDisplayKeys.removeValue(forKey: id)
-                    self.rebuildSnapshot(onScreenCGIDs: self.lastOnScreenCGIDs)
+                    guard let confirmed, let seat = self.apps[pid]?.windowsByID[id],
+                          self.isDisplayConfirmationCurrent(pid: pid, id: id, request: request, check: check, first: first) else { return }
+                    if self.applyDisplaySample(confirmed, to: seat, pid: pid, id: id) {
+                        self.rebuildSnapshot(onScreenCGIDs: self.lastOnScreenCGIDs)
+                    }
                 }
             }
             if let task {
@@ -3388,13 +3806,24 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         }
     }
 
+    private nonisolated static func waitForDisplayConfirmation() async -> Bool {
+        do {
+            try await Task.sleep(for: displayConfirmationDelay)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func isDisplayConfirmationCurrent(pid: pid_t, id: CGWindowID, request: PendingEventRead,
-                                              check: CGMoveCacheCheck, source: String) -> Bool {
+                                              check: CGMoveCacheCheck, first: CGMoveCacheCheck.FirstSample) -> Bool {
         guard let hint = request.intent.moves[id], displayTopologyRevision == check.topologyRevision,
+              hint.spaceRevision == moveSpaceRevision,
               let app = apps[pid], !app.isHidden, app.processGeneration == hint.processGeneration,
               processGeneration(processIdentity(pid: pid, bundleID: app.bundleIdentifier)) == hint.processGeneration,
-              let seat = app.windowsByID[id], !seat.isMinimized else { return false }
-        return seat.displayUUID == source && seat.actionTarget == hint.target
+              let seat = app.windowsByID[id], !seat.isMinimized, seat.displayMoveAt == hint.observedAt,
+              first.sample.capturedAt.map({ $0 >= hint.observedAt }) == true else { return false }
+        return seat.displayUUID == first.source && seat.actionTarget == hint.target
     }
 
     private func cancelDisplayConfirmations(pid: pid_t, windowID: CGWindowID? = nil) {
@@ -3413,37 +3842,17 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         }
     }
 
-    private func resumeDeferredInventoryEvents(isPeriodic: Bool) {
+    private func resumeDeferredInventoryEvents(isPeriodic: Bool, processes: [pid_t]? = nil) {
+        guard !trailingEventReads.isEmpty else { return }
         let now = uptimeProvider()
-        for pid in Array(trailingEventReads.keys) where pendingEventReads[pid] == nil {
+        for pid in processes ?? Array(trailingEventReads.keys)
+            where trailingEventReads[pid] != nil && pendingEventReads[pid] == nil {
             if inventoryTimeouts[pid]?.nextReadUptime.map({ now >= $0 }) ?? isPeriodic {
                 consumeTrailingEventRead(pid: pid, isPeriodic: isPeriodic)
             }
         }
     }
 
-
-    private func startReconcileTimer() {
-        let generation = work.generation
-        reconcileTimer = Timer.scheduledTimer(withTimeInterval: Self.reconcileInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.work.isCurrent(generation) else { return }
-                self.reconcile()
-            }
-        }
-        reconcileTimer?.tolerance = 0.5
-    }
-
-    private func startFrontmostPollTimer() {
-        let generation = work.generation
-        frontmostPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.work.isCurrent(generation) else { return }
-                self.pollFrontmostApp()
-            }
-        }
-        frontmostPollTimer?.tolerance = 0.05
-    }
 
     private func currentFrontmostPID() -> pid_t? {
         if frontmostCacheEnabled, let cached = cachedFrontmostPID { return cached }
@@ -3474,11 +3883,37 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
 
     private func observeFocusForeground(_ pid: pid_t?) {
         guard pid != focusForegroundPID else { return }
+        if let previous = focusForegroundPID, let launch = launchObservations[previous],
+           launch.admittedFirstWindow, !launch.receivedLaunch {
+            finishLaunchObservation(pid: previous)
+        }
+        if let previous = focusForegroundPID, launchObservations[previous]?.admittedFirstWindow == true {
+            finishLaunchObservation(pid: previous, focusOutcome: "foreground-changed")
+        }
+        if let pid, focusForegroundPID != nil {
+            confirmedFocus.removeValue(forKey: pid)
+            for id in apps[pid]?.windowOrder ?? [] { apps[pid]?.windowsByID[id]?.isFocused = false }
+        }
         focusForegroundPID = pid
         focusForegroundRevision &+= 1
+        focusForegroundChangedAt = uptimeProvider()
         confirmedSystemFocus = nil
         confirmedLocalFocus = nil
         unreadSystemFocusForegroundRevision = nil
+    }
+
+    func refreshFrontmostWindow() {
+        guard work.isActive, isAccessibilityTrusted() else { return }
+        let foreground = refreshFocusForeground()
+        guard let pid = foreground.pid else { return }
+        let processes = trackedFrontmostPIDs(pid)
+        resumeDeferredInventoryEvents(isPeriodic: true, processes: processes)
+        requestSystemFocusedWindowRead(foreground: foreground)
+        for tracked in processes {
+            observers[tracked]?.start()
+            requestFocusedWindowRead(pid: tracked, refreshSystemFocus: false, foreground: foreground)
+            scheduleEventRead(pid: tracked, source: .frontmostPoll)
+        }
     }
 
     func pollFrontmostApp() {
@@ -3527,7 +3962,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
     }
 
     private func reconcile() {
-        guard AXIsProcessTrusted() else { return }
+        guard isAccessibilityTrusted() else { return }
         reconcileTrustedInventory()
     }
 
@@ -4014,6 +4449,10 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
 
 
     private func rebuildSnapshot(onScreenCGIDs: Set<CGWindowID>? = nil, foreground: FocusForeground? = nil) {
+        #if DEBUG
+        let resources = ActionResourceLog.begin("inventory.rebuildSnapshot")
+        defer { resources?.finish() }
+        #endif
         pendingPeriodicSnapshot = nil
         let frontmostPID: pid_t?
         if let foreground, foreground.revision == focusForegroundRevision {

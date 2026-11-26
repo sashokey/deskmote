@@ -1,6 +1,6 @@
 {
-  "version": "v6",
+  "version": "v7",
   "draft": false,
   "prerelease": false,
-  "notes": "- Fixed square corner artifacts and the extra window shadow around the Apps menu.\n- Extended the Apps button's hover area to the bottom edge of the display.\n- Fixed Apps highlighting that could remain after the pointer moved away or the menu closed."
+  "notes": "- Improved taskbar visibility and window routing across displays, Spaces, Full Screen and Mission Control. The taskbar returns as soon as macOS confirms a desktop. Active highlights follow confirmed window focus.\n- Reduced redundant Accessibility and WindowServer work during window movement. Fixed stale Space results and repeated activation after restoring a window from the taskbar.\n- Simplified window height adjustment to one size change when a focused window exactly matches the working height and overlaps the visible taskbar. Improved handling of windows that open at that height.\n- Made the Apps menu open faster while keeping its animations. The bottom-left corner opens Apps, All follows the macOS application catalog, Finder stays first in the running row, and running app icons can reopen their apps. Drag one pinned app onto another to create a folder.\n- Made the core stop sending new Accessibility requests promptly when access is revoked. Added compatibility notices and more detailed diagnostics in development builds."
 }

@@ -1,16 +1,9 @@
 import XCTest
 
 final class PanelVisibilityStateTests: XCTestCase {
-    func testWindowedTaskbarIsAlwaysVisible() {
-        XCTAssertTrue(PanelVisibilityState().isVisible)
+    func testOnlyConfirmedDesktopShowsThePanel() {
+        XCTAssertFalse(PanelVisibilityState.unknown.isVisible)
+        XCTAssertTrue(PanelVisibilityState.desktop.isVisible)
+        XCTAssertFalse(PanelVisibilityState.fullscreen.isVisible)
     }
-
-    func testFullscreenHidesAndExitingRestoresVisibility() {
-        var state = PanelVisibilityState()
-        state.setFullscreen(true)
-        XCTAssertFalse(state.isVisible)
-        state.setFullscreen(false)
-        XCTAssertTrue(state.isVisible)
-    }
-
 }
