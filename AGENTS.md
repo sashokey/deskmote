@@ -36,13 +36,15 @@ When the user reports a bug, including a message that says only `баг`, open t
 
 Send every proposed solution to an independent reviewer subagent before recommending or implementing it.
 
+Run focused checks by default. Run a full test suite or produce an application build only when the user explicitly requests that operation.
+
 Use the following procedure for fixes.
 
 1. Identify the affected subsystem, the last known working revision and the first build with evidence. Distinguish observations, hypotheses and confirmed causes.
 2. Add a regression test and make the smallest applicable change.
 3. Preserve DeskMote's open-window model and module boundaries.
 4. Check the diff for launchers, unrelated file operations, Dock changes and extra settings. Limit the Finder service to the two file creation commands and protect the existing taskbar behavior.
-5. Complete [automated verification](#build-and-verify) on the exact candidate source and hand off the locally signed full Dev build.
+5. Run focused checks on the exact candidate source using [Build and verify](#build-and-verify).
 6. Record the affected behavior, reasoning and verification in the commit message.
 
 Restoring a removed feature requires an explicit scope decision and review of its models, services, views, resources, project references and tests. Keep commits focused and explain the change, its reason, the preserved behavior and the verification. Follow SOLID, KISS and DRY. Review and test nontrivial changes before publishing directly to `master`.
