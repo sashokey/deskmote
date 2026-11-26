@@ -82,6 +82,8 @@ The full app contains `DeskMoteWidgets.appex` and `DeskMoteFinder.appex`. The tw
 
 CI tests and verifies the full and base variants from the same commit. The reusable workflow verifies the archived app after extraction and uploads only the full ZIP as the `DeskMote` artifact. Automated tests use injected inventory, window actions, permission, and system settings boundaries to avoid real window and Accessibility access.
 
+Run the packaged Release binary check for both variants before a release commit. An Xcode build can succeed while `verify_release_diagnostics` rejects imports for ordinary unified logs. Scope logging and its bookkeeping to Debug as well as the resource sampler. Keep user-facing compatibility notices in Release and include the diagnostic details directly.
+
 ### Extended core checks
 
 Run coverage and the constrained Swift executor for nontrivial core changes. Keep DerivedData and XCTest data in a location accessible to the runner, such as a temporary directory. When checking deployment availability, run `Scripts/check_availability_warnings.py` on the relevant test, build and WindowLab logs. Retain logs and result bundles on failure. Use the build script for the arm64 Release checks and `Scripts/package_release.sh` to verify the archive when changing packaging.
@@ -239,7 +241,7 @@ Read minimized state, title, position, size, role, and subrole in one AX attribu
 
 Queued AX subscription removal belongs to its observation session. Stopping that session cancels pending cleanup, releases its queued elements, and prevents the next native removal from starting. An already admitted call may drain. Retiring an element from a live session still removes all required notifications. Release phantom-held diagnostic episodes when their seats retire. Admission history used only by tests is Debug-only. Runtime diagnostics use the bounded inventory log rather than unconditional console dumps.
 
-Read managed layouts and targeted window memberships off the main actor. A blocked membership read must allow panel visibility to update. Check Space generation and window identity before accepting results. On an unverified Space ABI or malformed system result, suspend affected projections and show one diagnostic notice per error code with the event, macOS and source revision. Find the corresponding unified log entry in taskbar-spaces.
+Read managed layouts and targeted window memberships off the main actor. A blocked membership read must allow panel visibility to update. Check Space generation and window identity before accepting results. On an unverified Space ABI or malformed system result, suspend affected projections and show one diagnostic notice per error code with the event, macOS and source revision. In Dev, find the corresponding unified log entry in taskbar-spaces.
 
 Keep panel visibility, window membership and exact confirmed focus as independent facts. The panel projects them by physical display and active Space. An activation request alone cannot light the active indicator. Preserve the last confirmed result through a transient unread focus sample when its identity is still current. Use typed failure handling for native API changes. Notices must identify the failed operation and reason, affected feature, relevant event and platform/build context so the matching Dev trace can be found.
 

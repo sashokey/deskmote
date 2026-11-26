@@ -1,8 +1,11 @@
 import Combine
 import Foundation
+#if DEBUG
 import OSLog
+#endif
 import Synchronization
 
+#if DEBUG
 private extension PermissionPhase {
     var logName: String {
         switch self {
@@ -18,6 +21,7 @@ private extension PermissionPhase {
         }
     }
 }
+#endif
 
 final class PermissionWatchdogGate: Sendable {
     private struct State {
@@ -93,7 +97,9 @@ protocol PermissionEffectHandler: AnyObject {
 final class PermissionRecoveryCoordinator: ObservableObject {
     @Published private(set) var presentation: PermissionPresentation?
 
+    #if DEBUG
     private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "permissions")
+    #endif
     private weak var handler: PermissionEffectHandler?
     private let installLocation: AppInstallLocation
     private let now: () -> TimeInterval
@@ -144,7 +150,9 @@ final class PermissionRecoveryCoordinator: ObservableObject {
     func recheck() { dispatch(.recheckRequested) }
     func retryRelaunch() { dispatch(.retryRequested) }
     func quit() {
+        #if DEBUG
         logger.notice("permission-guide-quit-requested")
+        #endif
         dispatch(.quitRequested)
     }
     func terminationRequested() { dispatch(.terminationRequested) }
@@ -161,11 +169,15 @@ final class PermissionRecoveryCoordinator: ObservableObject {
         isDispatching = true
         defer { isDispatching = false }
         while !pendingEvents.isEmpty {
+            #if DEBUG
             let before = machine.phase
+            #endif
             let effects = machine.handle(pendingEvents.removeFirst())
+            #if DEBUG
             if before != machine.phase {
                 logger.notice("permission-phase from=\(before.logName, privacy: .public) to=\(self.machine.phase.logName, privacy: .public)")
             }
+            #endif
             run(effects)
         }
     }
@@ -178,10 +190,14 @@ final class PermissionRecoveryCoordinator: ObservableObject {
             case let .setActivationPolicy(policy):
                 handler?.setActivationPolicy(policy)
             case .showGuide:
+                #if DEBUG
                 logger.notice("permission-guide-opening")
+                #endif
                 refreshPresentation()
                 handler?.showGuideWindow()
+                #if DEBUG
                 logger.notice("permission-guide-opened")
+                #endif
             case .updateGuide:
                 refreshPresentation()
                 handler?.updateGuideWindow()
@@ -193,9 +209,13 @@ final class PermissionRecoveryCoordinator: ObservableObject {
             case .stopPermissionEpisode:
                 stopEpisode()
             case .requestSystemPrompt:
+                #if DEBUG
                 logger.notice("permission-system-prompt-check-started")
+                #endif
                 model?.requestSystemPromptIfNeeded()
+                #if DEBUG
                 logger.notice("permission-system-prompt-check-completed")
+                #endif
             case .recheckNow:
                 model?.checkNow()
             case .startWatchdog:

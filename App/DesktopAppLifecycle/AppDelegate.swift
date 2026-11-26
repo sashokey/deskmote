@@ -1,7 +1,9 @@
 import AppKit
 import Combine
 import CoreGraphics
+#if DEBUG
 import OSLog
+#endif
 import QuartzCore
 import SwiftUI
 
@@ -79,7 +81,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var permissionWatchdogTimer: DispatchSourceTimer?
     private let permissionWatchdogGate = PermissionWatchdogGate()
     private let permissionProbeQueue = DispatchQueue(label: "io.github.sashokey.deskmote.permission-probe", qos: .utility)
+    #if DEBUG
     private var cachedAccessibilityTrusted = false
+    #endif
     private var hasStartedApp = false
     private lazy var modules = environment.makeModules { [weak self] window in
         self?.runtime.registerUtilityWindow(window)
@@ -92,7 +96,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return toggle
         }
     }
+    #if DEBUG
     private let permissionLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "permissions")
+    #endif
     private lazy var statusMenuController = StatusMenuController(
         settingsCoordinator: settingsCoordinator,
         statusItem: environment.makeStatusItem(), modules: modules, quit: { [weak self] in
@@ -148,7 +154,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func finishLaunching(at location: AppInstallLocation) {
         let trusted = permissionService.hasRequiredPermissions()
+        #if DEBUG
         cachedAccessibilityTrusted = trusted
+        #endif
         #if DEBUG
         logPermissionLaunch(installLocation: location, isTrusted: trusted)
         #endif
@@ -286,12 +294,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #if DEBUG
         let resources = ActionResourceLog.begin("app.terminate")
         defer { resources?.finish() }
-        #endif
         if let event = NSAppleEventManager.shared().currentAppleEvent {
             permissionLogger.notice("application-termination-requested apple-event-class=\(event.eventClass, privacy: .public) apple-event-id=\(event.eventID, privacy: .public)")
         } else {
             permissionLogger.notice("application-termination-requested")
         }
+        #endif
         startupTask?.cancel()
         startupTask = nil
         permissionCoordinator?.terminationRequested()
@@ -299,12 +307,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if hasStartedApp { runtime.stop() }
 
         panelCoordinator?.stopWindowGeometryObservation()
+        #if DEBUG
         permissionLogger.notice("application-termination-ready")
+        #endif
         return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        #if DEBUG
         permissionLogger.notice("application-will-terminate")
+        #endif
         startupTask?.cancel()
         startupTask = nil
         permissionCoordinator?.terminationRequested()
@@ -390,8 +402,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = String(localized: "DeskMote Couldn’t Read Spaces")
         let macOS = ProcessInfo.processInfo.operatingSystemVersionString
         let build = Bundle.main.object(forInfoDictionaryKey: "DeskMoteSourceRevision") as? String ?? "-"
+        let diagnostic = "\(code)\n\(details)\n\(macOS) · \(build)"
+        #if DEBUG
         let guidance = String(localized: "Some taskbars or window buttons may be unavailable. In Console, search for the error code in the taskbar-spaces category.")
-        alert.informativeText = "\(guidance)\n\n\(code)\n\(details)\n\(macOS) · \(build)"
+        alert.informativeText = "\(guidance)\n\n\(diagnostic)"
+        #else
+        alert.informativeText = diagnostic
+        #endif
         let button = alert.buttons.first ?? alert.addButton(withTitle: String(localized: "OK"))
         let window = alert.window
         window.isReleasedWhenClosed = false
@@ -456,7 +473,9 @@ extension AppDelegate: PermissionEffectHandler {
     }
 
     private func requestTermination(source: String) {
+        #if DEBUG
         permissionLogger.notice("application-termination-trigger source=\(source, privacy: .public)")
+        #endif
         environment.terminate()
     }
 
@@ -484,33 +503,47 @@ extension AppDelegate: PermissionEffectHandler {
         let gate = permissionWatchdogGate
         let access = environment.runtimeAccessibilityAccess
         let probe = environment.permissionProbe
+        #if DEBUG
         let logger = permissionLogger
+        #endif
         return { [weak self] in
             guard let generation = gate.beginProbe(for: expectedGeneration) else { return }
             let trustGeneration = access.trustGeneration
             let trusted = probe()
+            #if DEBUG
             var changed = false
+            #endif
             let enqueue = gate.completeProbe(generation: generation, deliver: trusted) {
-                guard let didChange = access.updateTrust(trusted, for: trustGeneration) else { return false }
-                changed = didChange
-                return true
+                let update = access.updateTrust(trusted, for: trustGeneration)
+                #if DEBUG
+                changed = update == true
+                #endif
+                return update != nil
             }
+            #if DEBUG
             if changed { logger.notice("permission-probe-transition trusted=\(trusted, privacy: .public)") }
+            #endif
             guard enqueue else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self,
                       let trusted = gate.takeDelivery(generation: generation) else { return }
+                #if DEBUG
                 let changed = self.cachedAccessibilityTrusted != trusted
                 self.cachedAccessibilityTrusted = trusted
                 if changed {
                     self.permissionLogger.notice("permission-trust-changed trusted=\(trusted, privacy: .public)")
                 }
+                #endif
                 self.moduleToggles.forEach {
                     $0.accessibilityChanged(trusted: trusted, canResume: self.environment.moduleSessionIsActive)
                 }
+                #if DEBUG
                 if changed { self.permissionLogger.notice("permission-modules-notified trusted=\(trusted, privacy: .public)") }
+                #endif
                 self.permissionCoordinator?.sampleTrust(trusted)
+                #if DEBUG
                 if changed { self.permissionLogger.notice("permission-trust-delivered trusted=\(trusted, privacy: .public)") }
+                #endif
             }
         }
     }
@@ -519,13 +552,17 @@ extension AppDelegate: PermissionEffectHandler {
         #if DEBUG
         let resources = ActionResourceLog.begin("permission.suspendRuntime")
         defer { resources?.finish() }
-        #endif
         permissionLogger.notice("permission-loss-suspension-started")
+        #endif
         panelCoordinator?.suspendAndRelease()
         panelCoordinator = nil
+        #if DEBUG
         permissionLogger.notice("permission-loss-panels-suspended")
+        #endif
         runtime.stop()
+        #if DEBUG
         permissionLogger.notice("permission-loss-suspension-completed")
+        #endif
     }
 
     func launchNewInstance(episode: UInt64) async -> Result<Void, Error> {

@@ -1,6 +1,8 @@
 import AppKit
 import Combine
+#if DEBUG
 import os
+#endif
 
 @MainActor
 final class TaskbarSpaceStore: ObservableObject {
@@ -48,7 +50,9 @@ final class TaskbarSpaceStore: ObservableObject {
     private let notifications: NotificationCenter
     private let layoutQueue = DispatchQueue(label: "io.github.sashokey.deskmote.space-layout", qos: .userInitiated)
     private let membershipQueue = DispatchQueue(label: "io.github.sashokey.deskmote.window-spaces", qos: .utility)
+    #if DEBUG
     private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "taskbar-spaces")
+    #endif
     private let work = AsyncWorkScope()
     private var subscriptions = Set<AnyCancellable>()
     private var spaceObserver: NSObjectProtocol?
@@ -405,16 +409,18 @@ final class TaskbarSpaceStore: ObservableObject {
         let requestedRevision = layoutRevision
         let queue = layoutQueue
         work.launch(priority: .userInitiated) { [weak self] generation in
-            let start = ContinuousClock.now
-            let result = await AsyncWorkScope.performBlocking(on: queue) { readLayouts() }
-            let elapsed = Int(start.duration(to: .now) / .milliseconds(1))
+            let result = await AsyncWorkScope.performBlocking(on: queue, resourceOperation: "spaces.store.layout-read") {
+                readLayouts()
+            }
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation), self.isRunning else { return }
                 self.layoutInFlight = false
                 if requestedRevision == self.layoutRevision, let result {
-                    self.applyLayoutResult(result, source: source, elapsed: elapsed)
+                    self.applyLayoutResult(result, source: source)
                 } else {
+                    #if DEBUG
                     self.logger.debug("layout-superseded event=\(source.rawValue, privacy: .public) requested=\(requestedRevision) current=\(self.layoutRevision)")
+                    #endif
                 }
                 if let pending = self.nextLayoutSource {
                     self.nextLayoutSource = nil
@@ -424,7 +430,7 @@ final class TaskbarSpaceStore: ObservableObject {
         }
     }
 
-    private func applyLayoutResult(_ result: Result<Layouts, SpaceReadFailure>, source: LayoutTrigger, elapsed: Int) {
+    private func applyLayoutResult(_ result: Result<Layouts, SpaceReadFailure>, source: LayoutTrigger) {
         switch result {
         case let .failure(failure):
             if !activeLayouts.isEmpty {
@@ -453,7 +459,9 @@ final class TaskbarSpaceStore: ObservableObject {
                 }
                 acceptLayouts(layouts)
             }
-            logger.debug("layout event=\(source.rawValue, privacy: .public) revision=\(self.spaceRevision) displays=\(layouts.count) changed=\(changed.count) elapsed-ms=\(elapsed)")
+            #if DEBUG
+            logger.debug("layout event=\(source.rawValue, privacy: .public) revision=\(self.spaceRevision) displays=\(layouts.count) changed=\(changed.count)")
+            #endif
             if !changed.isEmpty || confirmedSpaceRevision != spaceRevision {
                 let relevant = requests.filter { request in
                     request.displayUUID.map { changed.isEmpty || changed.contains($0) || changed.contains("Main") } ?? true
@@ -504,24 +512,24 @@ final class TaskbarSpaceStore: ObservableObject {
         pendingMemberships.removeAll()
         let cancellation = OperationCancellation()
         work.launch { [weak self] generation in
-            let start = ContinuousClock.now
             let sampled = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation,
                                                                 resourceOperation: "spaces.store.membership-read") {
                 Self.sampleMemberships(requested, layouts: expectedLayouts, cancellation: cancellation,
                                        readMemberships: readMemberships, readSnapshot: readSnapshot)
             }
-            let elapsed = Int(start.duration(to: .now) / .milliseconds(1))
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation), self.isRunning else { return }
                 self.membershipInFlight = false
                 if self.membershipRevision == requestedRevision {
                     let observation = self.acceptSample(sampled, source: "window-membership")
                     self.applyMembership(observation, requested: requested, windowRevision: windowRevision,
-                                         eventRevision: eventRevision, elapsed: elapsed)
+                                         eventRevision: eventRevision)
                 } else {
                     self.pendingMemberships.formUnion(requested.lazy.map(\.identity))
                     self.needsMembershipRead = true
+                    #if DEBUG
                     self.logger.debug("membership-superseded requested=\(requestedRevision) current=\(self.membershipRevision)")
+                    #endif
                 }
                 self.beginMembership()
             }
@@ -529,16 +537,18 @@ final class TaskbarSpaceStore: ObservableObject {
     }
 
     private func applyMembership(_ observation: WindowSpaceSnapshot?, requested: [WindowSpaceRequest], windowRevision: UInt64,
-                                 eventRevision: UInt64, elapsed: Int) {
+                                 eventRevision: UInt64) {
         guard let observation, !observation.layouts.isEmpty else { return }
         let changed = confirmedSpaceRevision != eventRevision
         let priorLayouts = snapshot.layouts
         if changed, invalidatedDisplays.isEmpty { invalidatedDisplays = Set(observation.layouts.keys) }
         let unchangedWithoutEvidence = changed && observation.layouts == priorLayouts &&
             confirmedSpaceRevision >= minimumProjectionRevision && corroboratedSpaceRevision != eventRevision
+        #if DEBUG
         if unchangedWithoutEvidence {
             logger.debug("space-unconfirmed unchanged-layout revision=\(eventRevision)")
         }
+        #endif
         let stillCurrent = currentIdentities(requested, windowRevision: windowRevision).subtracting(pendingMemberships)
         #if DEBUG
         if stillCurrent.count != requested.count {
@@ -552,22 +562,28 @@ final class TaskbarSpaceStore: ObservableObject {
             afterSpaceChange: changed || (readLayouts != nil && priorLayouts.isEmpty), attachedDisplays: attachedDisplays)
         #if DEBUG
         if snapshot != updated {
-            logger.notice("window-membership-changed revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count) elapsed-ms=\(elapsed)")
+            logger.notice("window-membership-changed revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count)")
         }
         #endif
         publish(updated)
         if changed && !unchangedWithoutEvidence { confirmedSpaceRevision = eventRevision }
-        logger.debug("membership revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count) elapsed-ms=\(elapsed)")
+        #if DEBUG
+        logger.debug("membership revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count)")
+        #endif
     }
 
     private func report(_ failure: SpaceReadFailure, source: String, reportToUser: Bool) {
         guard !failure.isInterruption else {
+            #if DEBUG
             logger.debug("space-read-interrupted event=\(source, privacy: .public) reason=\(failure.reason.rawValue, privacy: .public)")
+            #endif
             return
         }
         let detail = failure.description
         let code = failure.diagnosticCode
+        #if DEBUG
         logger.error("compatibility code=\(code, privacy: .public) event=\(source, privacy: .public) revision=\(self.spaceRevision) detail=\(detail, privacy: .public)")
+        #endif
         if reportToUser, reportedFailures.insert(code).inserted {
             onCompatibilityFailure?(code, "\(detail) [\(source), revision=\(spaceRevision)]")
         }

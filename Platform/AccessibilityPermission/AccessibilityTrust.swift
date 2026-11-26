@@ -1,6 +1,8 @@
 import ApplicationServices
 import Foundation
+#if DEBUG
 import OSLog
+#endif
 import Synchronization
 
 final class RuntimeAccessibilityAccess: Sendable {
@@ -13,7 +15,9 @@ final class RuntimeAccessibilityAccess: Sendable {
     }
 
     static let shared = RuntimeAccessibilityAccess()
+    #if DEBUG
     private static let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "permissions")
+    #endif
     private let state = Mutex(State())
 
     var allowsCalls: Bool { state.withLock { $0.allowsCalls } }
@@ -36,7 +40,9 @@ final class RuntimeAccessibilityAccess: Sendable {
         guard let generation = admissionGeneration else { return false }
         guard read() else {
             if updateTrust(false, for: generation) == true {
+                #if DEBUG
                 Self.logger.notice("accessibility-runtime-disabled reason=native-trust-negative")
+                #endif
             }
             return false
         }
@@ -47,12 +53,15 @@ final class RuntimeAccessibilityAccess: Sendable {
         guard let generation = admissionGeneration else { return denied }
         let result = operation()
         if status(result) == .apiDisabled {
-            let firstDenial = state.withLock {
+            if state.withLock({
                 guard $0.generation == generation, !$0.apiDisabled else { return false }
                 $0.apiDisabled = true
                 return true
+            }) {
+                #if DEBUG
+                Self.logger.notice("accessibility-runtime-disabled reason=native-api-disabled")
+                #endif
             }
-            if firstDenial { Self.logger.notice("accessibility-runtime-disabled reason=native-api-disabled") }
         }
         return result
     }
