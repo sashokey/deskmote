@@ -34,6 +34,8 @@ Use DeskMote’s history and release tag archives to identify the source corresp
 
 When the user reports a bug, including a message that says only `баг`, open the first response with whether a fix is known, plausible but unverified, or still unknown. State the expected scope of code changes and the added runtime cost in CPU, GPU and RAM. Label estimates and identify any costs that are unknown.
 
+Send every proposed solution to an independent reviewer subagent before recommending or implementing it.
+
 Use the following procedure for fixes.
 
 1. Identify the affected subsystem, the last known working revision and the first build with evidence. Distinguish observations, hypotheses and confirmed causes.
