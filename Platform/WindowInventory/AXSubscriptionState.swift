@@ -140,12 +140,11 @@ struct WindowSubscriptionLedger<Element: Hashable> {
         return (cgWindowID, record.instanceID)
     }
 
-    mutating func retain(keep: Set<CGWindowID>) -> [(cgWindowID: CGWindowID, instanceID: UInt64)] {
+    mutating func retain(keep: Set<CGWindowID>) {
         for (cgWindowID, record) in records where !keep.contains(cgWindowID) {
             records.removeValue(forKey: cgWindowID)
             cgIDByElement.removeValue(forKey: record.element)
         }
-        return []
     }
 
     mutating func removeAll() {

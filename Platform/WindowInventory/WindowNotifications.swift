@@ -267,12 +267,12 @@ final class AppWindowObserver {
         subscriptions.record(for: cgWindowID).map { ($0.element.e, $0.instanceID) }
     }
 
-    func retainSubscriptions(keep: Set<CGWindowID>) -> [(cgWindowID: CGWindowID, instanceID: UInt64)] {
+    func retainSubscriptions(keep: Set<CGWindowID>) {
         waitingWindows = waitingWindows.filter { keep.contains($0.key) }
         for (id, record) in subscriptions.records where !keep.contains(id) {
             retire(record.element)
         }
-        return subscriptions.retain(keep: keep)
+        subscriptions.retain(keep: keep)
     }
 
     private func retire(_ key: AXElementKey) {

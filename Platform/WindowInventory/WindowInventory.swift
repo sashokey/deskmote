@@ -601,7 +601,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         app.windowOrder.removeAll { ids.contains($0) }
         app.shadowTabCgIDs.subtract(ids)
         for id in app.windowOrder { app.windowsByID[id]?.priorTabWindowNumbers.subtract(ids) }
-        _ = observers[app.pid]?.retainSubscriptions(keep: cgIDs.union(app.windowOrder).subtracting(ids))
+        observers[app.pid]?.retainSubscriptions(keep: cgIDs.union(app.windowOrder).subtracting(ids))
         return removedSeat
     }
 
@@ -1176,7 +1176,7 @@ final class AppTracker: ObservableObject, WindowInventoryTracking, DisplayTopolo
         }
 
         if !cgSnapshot.captureFailed, let observer = observers[pid] {
-            _ = observer.retainSubscriptions(
+            observer.retainSubscriptions(
                 keep: cgIDs.union(newOrder).union(eligibleByCgID.keys).subtracting(excludedIDs)
                     .subtracting(reboundWindowIDs.keys)
             )

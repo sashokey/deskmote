@@ -446,7 +446,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
         _ = observer.registerWindow(AXUIElementCreateApplication(42), cgWindowID: 1)
         await waitUntil { fixture.windowCalls.withLock { $0 } == 1 }
         let pending = observer.pendingWorkForTesting
-        _ = observer.retainSubscriptions(keep: [])
+        observer.retainSubscriptions(keep: [])
         for _ in 0..<4 { fixture.gate.signal() }
         for task in pending { await task.value }
         await waitUntil { fixture.removals.withLock { $0 } == 4 }
@@ -474,9 +474,9 @@ final class WindowObservationLifecycleTests: XCTestCase {
         }
         await waitUntil { (CGWindowID(1)...3).allSatisfy { observer.isCovered(cgWindowID: $0) } }
         old.blockNextRemoval.withLock { $0 = true }
-        _ = observer.retainSubscriptions(keep: [2, 3])
+        observer.retainSubscriptions(keep: [2, 3])
         await waitUntil { old.removals.withLock { $0 } == 1 }
-        _ = observer.retainSubscriptions(keep: [])
+        observer.retainSubscriptions(keep: [])
         observer.stop()
         old.removalGate.signal()
         observer.start()
@@ -499,7 +499,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
         await waitUntil { observer.isCovered(cgWindowID: 1) }
         fixture.transientRemovalFailures.withLock { $0 = 1 }
 
-        _ = observer.retainSubscriptions(keep: [])
+        observer.retainSubscriptions(keep: [])
         _ = observer.registerWindow(AXUIElementCreateApplication(43), cgWindowID: 2)
         await waitUntil { observer.isCovered(cgWindowID: 2) }
         XCTAssertEqual(fixture.registered.withLock { $0[key]?.count }, 1)
@@ -556,7 +556,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
 
         _ = observer.registerWindow(equalKey.e, cgWindowID: 88)
         for task in observer.pendingWorkForTesting { await task.value }
-        _ = observer.retainSubscriptions(keep: [88])
+        observer.retainSubscriptions(keep: [88])
         _ = observer.registerWindow(AXUIElementCreateApplication(43), cgWindowID: 99)
         for task in observer.pendingWorkForTesting { await task.value }
 
@@ -584,7 +584,7 @@ final class WindowObservationLifecycleTests: XCTestCase {
         let originalInstance = observer.subscribedElement(cgWindowID: 77)?.instanceID
 
         _ = observer.registerWindow(key.e, cgWindowID: 88)
-        _ = observer.retainSubscriptions(keep: [88])
+        observer.retainSubscriptions(keep: [88])
         for _ in 0..<8 { fixture.gate.signal() }
         for task in observer.pendingWorkForTesting { await task.value }
 

@@ -201,8 +201,10 @@ final class TaskbarDrawingTests: XCTestCase {
                         view.isActiveWindow = state == 2
                         if state == 1 {
                             view.mouseEntered(with: try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered,
-                                location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                                location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                windowNumber: 0, context: nil,
                                 eventNumber: 0, trackingNumber: 0, userData: nil)))
+                            XCTAssertGreaterThan(view.selectionView.alphaValue, 0)
                         }
                     }
                     let original = try render(reference, scale: scale)
@@ -319,12 +321,12 @@ final class TaskbarDrawingTests: XCTestCase {
             let view = button(dark: dark)
             let normal = try render(view, scale: 2)
             let entered = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
-                modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
                 trackingNumber: 0, userData: nil))
             view.mouseEntered(with: entered)
             let hover = try render(view, scale: 2)
             let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
-                modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
                 trackingNumber: 0, userData: nil))
             view.mouseExited(with: exit)
             view.isActiveWindow = true
