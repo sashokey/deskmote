@@ -5,11 +5,11 @@ import XCTest
 
 @MainActor
 private final class PanelInventory: WindowInventoryTracking {
-    let initial: DockSnapshot
-    var snapshots: AnyPublisher<DockSnapshot, Never> { Just(initial).eraseToAnyPublisher() }
+    let subject: CurrentValueSubject<DockSnapshot, Never>
+    var snapshots: AnyPublisher<DockSnapshot, Never> { subject.eraseToAnyPublisher() }
     private(set) var frontmostRefreshes = 0
 
-    init(_ initial: DockSnapshot = .empty) { self.initial = initial }
+    init(_ initial: DockSnapshot = .empty) { subject = CurrentValueSubject(initial) }
     func start() {}
     func stop() {}
     func refreshFrontmostWindow() { frontmostRefreshes += 1 }
@@ -42,34 +42,6 @@ final class PanelLifecycleTests: XCTestCase {
     }
 
     #if DEBUG
-    func testVisibilityJournalRecordsNativeLossEvenWhenThePanelIsStillRequested() throws {
-        let lines = Mutex<[Data]>([])
-        let journal = TaskbarVisibilityJournal { line in lines.withLock { $0.append(line) } }
-        let visible = TaskbarVisibilitySample(windowNumber: 25, primaryDisplay: true,
-                                              requestedVisible: true, spaceState: "desktop", appKitVisible: true,
-                                              onActiveSpace: true, occlusionVisible: true, alpha: "opaque")
-        let lost = TaskbarVisibilitySample(windowNumber: 25, primaryDisplay: true,
-                                           requestedVisible: true, spaceState: "desktop", appKitVisible: true,
-                                           onActiveSpace: false, occlusionVisible: false, alpha: "opaque")
-        journal.capture(visible)
-        journal.capture(visible)
-        journal.capture(lost, source: "appkit-occlusion")
-        journal.capture(visible, event: "order-front", source: "managed-space")
-        journal.flush()
-
-        let values = try lines.withLock { $0 }.map {
-            try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any])
-        }
-        XCTAssertEqual(values.map { $0["event"] as? String }, ["observed", "observed", "order-front"])
-        let changed = try XCTUnwrap(values.dropFirst().first)
-        let interrupted = try XCTUnwrap(changed["state"] as? [String: Any])
-        XCTAssertEqual(interrupted["primaryDisplay"] as? Bool, true)
-        XCTAssertEqual(interrupted["requestedVisible"] as? Bool, true)
-        XCTAssertEqual(interrupted["onActiveSpace"] as? Bool, false)
-        XCTAssertEqual(interrupted["spaceState"] as? String, "desktop")
-        XCTAssertNotNil(changed["timestamp"] as? String)
-        XCTAssertEqual(values.last?["source"] as? String, "managed-space")
-    }
     #endif
 
     func testInitialPresentationWaitsForConfirmedDesktop() {
@@ -85,6 +57,69 @@ final class PanelLifecycleTests: XCTestCase {
         XCTAssertEqual(frontOrders, 0)
         XCTAssertFalse(coordinator.panelsAreVisible)
         XCTAssertEqual(coordinator.visibilityState, .unknown)
+    }
+
+    func testBorderlessWoWHidesOnlyItsDisplayUntilItLeavesFullscreenOrLosesFocus() async throws {
+        let leftFrame = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+        let rightFrame = leftFrame.offsetBy(dx: leftFrame.width, dy: 0)
+        let topology = ScreenTopologySnapshot(
+            physicalDisplayCount: 2, identifiedDisplayUUIDs: ["left", "right"],
+            attributionTable: .init(displays: [.init(uuid: "left", cgFrame: leftFrame),
+                                               .init(uuid: "right", cgFrame: rightFrame)], primaryUUID: "left")
+        )
+        let layouts: TaskbarSpaceStore.Layouts = [
+            "left": .init(orderedSpaceIDs: [1], fullscreenSpaceIDs: [], currentSpaceID: 1),
+            "right": .init(orderedSpaceIDs: [2], fullscreenSpaceIDs: [], currentSpaceID: 2),
+        ]
+        let notifications = NotificationCenter()
+        let store = TaskbarSpaceStore(read: { _ in .init(layouts: layouts) }, notifications: notifications)
+        let inventory = PanelInventory()
+        let runtime = AppRuntime(tracker: inventory)
+        let orchestrator = TaskbarScreenOrchestrator(
+            runtime: runtime, stripOrderStore: StripOrderStore(),
+            displayTopologyStore: DisplayTopologyStore(initialSnapshot: topology), spaceStore: store,
+            topologySnapshotProvider: { topology }, startCoordinator: { _ in true }
+        )
+        defer {
+            orchestrator.suspendAndRelease()
+            runtime.stop()
+        }
+        runtime.start()
+        orchestrator.start()
+        let left = try XCTUnwrap(orchestrator.units.first { $0.key == "left" }?.coordinator)
+        let right = try XCTUnwrap(orchestrator.units.first { $0.key == "right" }?.coordinator)
+        await waitUntil { left.visibilityState == .desktop && right.visibilityState == .desktop }
+        XCTAssertEqual(left.visibilityState, .desktop)
+        XCTAssertEqual(right.visibilityState, .desktop)
+
+        let bundle = "com.blizzard.worldofwarcraft"
+        var game = WindowRecord(id: .init(rawValue: "cgw-4687"), appID: .init(rawValue: bundle), pid: 42,
+                                bundleIdentifier: bundle, title: "World of Warcraft", bounds: leftFrame,
+                                status: .active, cgWindowID: 4687, isOnDesktop: true, displayUUID: "left",
+                                borderlessFullscreenFrame: leftFrame)
+        inventory.subject.send(.init(windows: [game.id: game], orderedWindowIDs: [game.id]))
+        await waitUntil { runtime.snapshot.windows[game.id] == game }
+        XCTAssertEqual(left.visibilityState, .fullscreen)
+        XCTAssertEqual(right.visibilityState, .desktop)
+
+        game.bounds = CGRect(x: 0, y: 30, width: 2560, height: 1410)
+        game.borderlessFullscreenFrame = nil
+        inventory.subject.send(.init(windows: [game.id: game], orderedWindowIDs: [game.id]))
+        await waitUntil { runtime.snapshot.windows[game.id] == game }
+        XCTAssertEqual(left.visibilityState, .desktop)
+
+        game.bounds = rightFrame
+        game.displayUUID = "right"
+        game.borderlessFullscreenFrame = rightFrame
+        inventory.subject.send(.init(windows: [game.id: game], orderedWindowIDs: [game.id]))
+        await waitUntil { runtime.snapshot.windows[game.id] == game }
+        XCTAssertEqual(left.visibilityState, .desktop)
+        XCTAssertEqual(right.visibilityState, .fullscreen)
+
+        game.status = .inactive
+        inventory.subject.send(.init(windows: [game.id: game], orderedWindowIDs: [game.id]))
+        await waitUntil { runtime.snapshot.windows[game.id] == game }
+        XCTAssertEqual(right.visibilityState, .desktop)
     }
 
     func testConfirmedDesktopRestoresOnlyItsPanelWhileMembershipReadIsBlocked() async throws {
@@ -119,8 +154,7 @@ final class PanelLifecycleTests: XCTestCase {
         let orchestrator = TaskbarScreenOrchestrator(
             runtime: runtime, stripOrderStore: StripOrderStore(),
             displayTopologyStore: DisplayTopologyStore(initialSnapshot: topology), spaceStore: store,
-            topologySnapshotProvider: { topology }, startCoordinator: { _ in true },
-            workspaceNotifications: notifications, frontmostApplicationPID: { nil }, makeGeometryObserver: { nil }
+            topologySnapshotProvider: { topology }, startCoordinator: { _ in true }
         )
         defer {
             shouldBlock.withLock { $0 = false }
@@ -244,7 +278,7 @@ final class PanelLifecycleTests: XCTestCase {
         let panel = NonConstrainingPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                                           backing: .buffered, defer: true)
         panel.isReleasedWhenClosed = false
-        coordinator.configurePanel(panel, backgroundColor: .clear, appliesLevelOverride: true)
+        coordinator.configurePanel(panel, backgroundColor: .clear)
 
         XCTAssertTrue(panel.collectionBehavior.contains(.transient))
         XCTAssertFalse(panel.collectionBehavior.contains(.stationary))
@@ -299,7 +333,7 @@ final class PanelLifecycleTests: XCTestCase {
             stripOrderStore: StripOrderStore(),
             displayTopologyStore: DisplayTopologyStore(initialSnapshot: snapshot),
             spaceStore: TaskbarSpaceStore(read: { _ in nil }, notifications: NotificationCenter()),
-            topologySnapshotProvider: { snapshot }, startCoordinator: { _ in starts += 1; return true }, makeGeometryObserver: { nil })
+            topologySnapshotProvider: { snapshot }, startCoordinator: { _ in starts += 1; return true })
         orchestrator.start()
         XCTAssertTrue(orchestrator.units.isEmpty)
         snapshot = ScreenTopologySnapshot(physicalDisplayCount: 2, identifiedDisplayUUIDs: ["A", "B"], attributionTable: .empty)

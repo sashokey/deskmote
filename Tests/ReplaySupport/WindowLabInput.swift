@@ -7,19 +7,16 @@ struct AnalyzedObservation {
     let identity: IdentityDecision
 }
 
-enum LabMode: String {
-    case observe, minimizeRestore, closeTarget, replay, placementReplay, transitionReplay
-}
-
 enum WindowLabInputError: Error {
-    case invalidMode, invalidSelectorArguments, unexpectedArguments(LabMode)
-    case invalidScenarioName, invalidGeometry, invalidScenario, duplicateWindowID
+    case invalidGeometry, duplicateWindowID
 }
 
 enum WindowLabInput {
-    static func candidateOffset(_ raw: String, count: Int) -> Int? {
-        guard let index = Int(raw), index > 0, index <= count else { return nil }
-        return index - 1
+    static func permitsCommand(_ record: WindowRecord, pid: pid_t, windowID: CGWindowID?, element: AXUIElement?,
+                               reader: AXWindowReader = AXWindowReader(),
+                               system: any WindowSystemAccess = NativeWindowSystem()) -> Bool {
+        guard pid == record.pid, windowID == record.cgWindowID, let element else { return false }
+        return WindowCommandIdentity.validate(record, element: element, reader: reader, system: system)
     }
 
     static func didClose(windowID: CGWindowID, pid: pid_t, windowInfo: [[String: Any]]?) -> Bool? {
@@ -28,13 +25,6 @@ enum WindowLabInput {
 
     static func didMinimize(windowID: CGWindowID, pid: pid_t, windowInfo: [[String: Any]]?) -> Bool {
         isWindowAbsent(windowID: windowID, pid: pid, windowInfo: windowInfo) == true
-    }
-
-    static func permitsCommand(_ record: WindowRecord, pid: pid_t, windowID: CGWindowID?, element: AXUIElement?,
-                               reader: AXWindowReader = AXWindowReader(),
-                               system: any WindowSystemAccess = NativeWindowSystem()) -> Bool {
-        guard pid == record.pid, windowID == record.cgWindowID, let element else { return false }
-        return WindowCommandIdentity.validate(record, element: element, reader: reader, system: system)
     }
 
     static func restoredWindow(
@@ -81,16 +71,6 @@ enum WindowLabInput {
         return (analyzed, match)
     }
 
-    static func diagnosticLine(_ value: String) -> String {
-        let singleLine = value.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).joined(separator: " ")
-        return singleLine.unicodeScalars.map { scalar in
-            if scalar.properties.generalCategory == .control {
-                return "\\u{\(String(scalar.value, radix: 16))}"
-            }
-            return String(scalar)
-        }.joined()
-    }
-
     private static func isWindowAbsent(windowID: CGWindowID, pid: pid_t, windowInfo: [[String: Any]]?) -> Bool? {
         guard let windowInfo else { return nil }
         for info in windowInfo {
@@ -100,27 +80,6 @@ enum WindowLabInput {
             if owner == pid { return false }
         }
         return true
-    }
-
-    static func mode(_ arguments: [String]) throws -> LabMode {
-        guard let value = arguments.first, let mode = LabMode(rawValue: value) else { throw WindowLabInputError.invalidMode }
-        switch mode {
-        case .observe:
-            guard arguments.count == 1 else { throw WindowLabInputError.unexpectedArguments(mode) }
-        case .closeTarget, .minimizeRestore:
-            guard arguments.count <= 2 else { throw WindowLabInputError.invalidSelectorArguments }
-        case .replay, .placementReplay, .transitionReplay:
-            guard arguments.count <= 2 else { throw WindowLabInputError.unexpectedArguments(mode) }
-        }
-        return mode
-    }
-
-    static func scenarioURL(root: URL, name: String) throws -> URL {
-        guard !name.isEmpty, name.utf8.count <= 128,
-              name.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }) else {
-            throw WindowLabInputError.invalidScenarioName
-        }
-        return root.appendingPathComponent("Tools/DeskMoteWindowLab/ReplayFixtures/\(name).json")
     }
 
     static func bounds(_ raw: String?) throws -> CGRect? {
@@ -142,10 +101,4 @@ extension WindowLabInput {
         }
     }
 
-    static func decode<Scenario: Decodable>(_ type: Scenario.Type, from url: URL) throws -> Scenario {
-        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true,
-              let size = values.fileSize, size <= 1_048_576 else { throw WindowLabInputError.invalidScenario }
-        return try JSONDecoder().decode(type, from: Data(contentsOf: url))
-    }
 }

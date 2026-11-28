@@ -4,7 +4,6 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 const workflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
@@ -336,27 +335,6 @@ test('the release workflow queues pending requests', () => {
 
 test('publication is stopped when the workflow is cancelled', () => {
   assert.match(workflow, /^  publish:\n    if: >-\n      !cancelled\(\) &&/m);
-});
-
-test('the binary gate rejects every registered Debug-only switch', async () => {
-  const registry = await readFile(new URL('../Core/Support/DebugOptions.swift', import.meta.url), 'utf8');
-  const debugCases = registry.match(/#if DEBUG\n([\s\S]*?)#endif/)[1];
-  const flags = [...debugCases.matchAll(/case \w+ = "(DOCK_\w+)"/g)].map(match => match[1]);
-  assert.ok(flags.length > 0);
-  const script = fileURLToPath(new URL('lib/release_binary.sh', import.meta.url));
-  const check = flag => spawnSync('/bin/bash', ['-c', [
-    'source "$1"',
-    'literal="$2"',
-    'nm() { :; }',
-    'strings() { printf "%s\\n" "$literal"; }',
-    'verify_release_diagnostics fixture',
-  ].join('\n'), 'release-scan', script, flag], { encoding: 'utf8' });
-  for (const flag of flags) {
-    const result = check(flag);
-    assert.equal(result.status, 1, flag);
-    assert.match(result.stderr, /contains diagnostic settings/, flag);
-  }
-  assert.equal(check('DOCK_RECONCILE_SKIP').status, 0);
 });
 
 test('publication uses the documented tag namespace path instead of an encoded slash', async () => {

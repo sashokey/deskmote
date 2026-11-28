@@ -1,44 +1,7 @@
 import AppKit
 import ApplicationServices
 import Foundation
-#if DEBUG
-import Synchronization
-#endif
-#if DEBUG
-import OSLog
-#endif
 
-#if DEBUG
-final class WindowRestoreTrace: Sendable {
-    @TaskLocal static var current: WindowRestoreTrace?
-    private static let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "window-restore")
-    private let remaining = Mutex(32)
-    private let started = ContinuousClock.now
-    let token: UUID
-    let identity: WindowActionIdentity
-
-    init(token: UUID, identity: WindowActionIdentity) {
-        self.token = token
-        self.identity = identity
-    }
-
-    var isRecent: Bool { started.duration(to: .now) < .seconds(8) }
-
-    static func markCurrent(_ event: String, detail: @autoclosure () -> String = "") {
-        current?.mark(event, detail: detail())
-    }
-
-    func mark(_ event: String, detail: String = "") {
-        guard remaining.withLock({ count in
-            guard count > 0 else { return false }
-            count -= 1
-            return true
-        }) else { return }
-        let elapsed = Int(started.duration(to: .now) / .milliseconds(1))
-        Self.logger.notice("restore token=\(self.token.uuidString, privacy: .public) pid=\(self.identity.pid, privacy: .public) window=\(self.identity.cgWindowID ?? 0, privacy: .public) elapsed-ms=\(elapsed) event=\(event, privacy: .public) \(detail, privacy: .public)")
-    }
-}
-#endif
 
 struct WindowApplicationState: Sendable {
     let isActive: Bool
@@ -46,7 +9,18 @@ struct WindowApplicationState: Sendable {
     let isTerminated: Bool
     let activationPolicy: NSApplication.ActivationPolicy
     let bundleURL: URL?
+    let bundleIdentifier: String?
     var origin: ApplicationOrigin? { ApplicationOrigin(bundleURL: bundleURL) }
+
+    init(isActive: Bool, isHidden: Bool, isTerminated: Bool, activationPolicy: NSApplication.ActivationPolicy,
+         bundleURL: URL?, bundleIdentifier: String? = nil) {
+        self.isActive = isActive
+        self.isHidden = isHidden
+        self.isTerminated = isTerminated
+        self.activationPolicy = activationPolicy
+        self.bundleURL = bundleURL
+        self.bundleIdentifier = bundleIdentifier
+    }
 }
 
 protocol WindowSystemAccess: Sendable {
@@ -64,7 +38,7 @@ struct NativeWindowSystem: WindowSystemAccess {
     func app(_ pid: pid_t) -> WindowApplicationState? {
         guard let app = NSRunningApplication(processIdentifier: pid) else { return nil }
         return WindowApplicationState(isActive: app.isActive, isHidden: app.isHidden, isTerminated: app.isTerminated,
-            activationPolicy: app.activationPolicy, bundleURL: app.bundleURL)
+            activationPolicy: app.activationPolicy, bundleURL: app.bundleURL, bundleIdentifier: app.bundleIdentifier)
     }
     func activate(_ pid: pid_t) -> Bool { NSRunningApplication(processIdentifier: pid)?.activate(options: []) ?? false }
     func unhide(_ pid: pid_t) { NSRunningApplication(processIdentifier: pid)?.unhide() }
@@ -141,16 +115,12 @@ enum WindowCommandIdentity {
 struct AccessibilityWindowActionExecutor: Sendable {
     private let reader: AXWindowReader
     private let system: any WindowSystemAccess
-    private let chipProbeEnabled: Bool
     private let focusBackend: any WindowFocusRequesting
     private let cancellation: OperationCancellation
     private let budget: OperationReadBudget?
     private let authorization: @Sendable (pid_t, CGWindowID?, AXUIElement?) -> Bool
-    #if DEBUG
-    private static let chipProbeLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "ChipProbe")
-    #endif
 
-    init(reader: AXWindowReader = AXWindowReader(), chipProbeEnabled: Bool = false,
+    init(reader: AXWindowReader = AXWindowReader(),
          focusBackend: any WindowFocusRequesting = SkyLightWindowFocus(),
          system: any WindowSystemAccess = NativeWindowSystem(),
          cancellation: OperationCancellation = OperationCancellation(),
@@ -158,7 +128,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
          authorization: @escaping @Sendable (pid_t, CGWindowID?, AXUIElement?) -> Bool = { _, _, _ in true }) {
         self.reader = budget.map { reader.withOperationBudget($0) } ?? reader
         self.system = system
-        self.chipProbeEnabled = chipProbeEnabled
         self.focusBackend = focusBackend
         self.cancellation = cancellation
         self.budget = budget
@@ -167,12 +136,12 @@ struct AccessibilityWindowActionExecutor: Sendable {
 
     func withCancellation(_ cancellation: OperationCancellation, budget: OperationReadBudget? = nil,
                           authorization: @escaping @Sendable (pid_t, CGWindowID?, AXUIElement?) -> Bool) -> Self {
-        Self(reader: reader, chipProbeEnabled: chipProbeEnabled, focusBackend: focusBackend, system: system,
+        Self(reader: reader, focusBackend: focusBackend, system: system,
              cancellation: cancellation, budget: budget, authorization: authorization)
     }
 
     private func withBudget(_ budget: OperationReadBudget) -> Self {
-        Self(reader: reader, chipProbeEnabled: chipProbeEnabled, focusBackend: focusBackend, system: system,
+        Self(reader: reader, focusBackend: focusBackend, system: system,
              cancellation: cancellation, budget: budget, authorization: authorization)
     }
 
@@ -197,13 +166,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
     @discardableResult
     func activateApplication(pid: pid_t, windowID: CGWindowID? = nil, element: AXUIElement? = nil) -> Bool {
         guard canAct(pid: pid, windowID: windowID, element: element) else { return false }
-        #if DEBUG
-        WindowRestoreTrace.markCurrent("native-application-activate")
-        #endif
         let accepted = system.activate(pid)
-        #if DEBUG
-        WindowRestoreTrace.markCurrent("native-application-activate-result", detail: "accepted=\(accepted)")
-        #endif
         return accepted
     }
 
@@ -355,24 +318,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
         guard canAct(on: handle) else {
             return ActionExecution(success: false, mechanism: "stale-target", verifiedMinimized: nil)
         }
-        #if DEBUG
-        if chipProbeEnabled {
-            let role = reader.stringAttribute(kAXRoleAttribute as CFString, from: handle.element, maxAttempts: 1)
-            let subrole = reader.stringAttribute(kAXSubroleAttribute as CFString, from: handle.element, maxAttempts: 1)
-            let hasMinimizeButton = minimizeButton(for: handle) != nil
-            let currentMinimized = reader.boolAttribute(kAXMinimizedAttribute as CFString, from: handle.element, maxAttempts: 1)
-            let (_, minimizedSettable) = reader.accessibility.isSettable(handle.element, kAXMinimizedAttribute as CFString)
-            let probeApp = NSRunningApplication(processIdentifier: handle.pid)
-            let probePolicyStr: String
-            switch probeApp?.activationPolicy {
-            case .regular: probePolicyStr = "regular"
-            case .accessory: probePolicyStr = "accessory"
-            case .prohibited: probePolicyStr = "prohibited"
-            default: probePolicyStr = "nil"
-            }
-            Self.chipProbeLogger.info("minimize-ax-probe app=\(probeApp?.localizedName ?? "(unknown)", privacy: .public) bundleID=\(probeApp?.bundleIdentifier ?? "(none)", privacy: .public) activationPolicy=\(probePolicyStr, privacy: .public) role=\(role ?? "nil", privacy: .public) subrole=\(subrole ?? "nil", privacy: .public) hasMinimizeButton=\(hasMinimizeButton, privacy: .public) currentMinimized=\(String(describing: currentMinimized), privacy: .public) minimizedSettable=\(minimizedSettable, privacy: .public)")
-        }
-        #endif
 
         if setMinimized(true, for: handle) {
             let verified = reader.boolAttribute(kAXMinimizedAttribute as CFString, from: handle.element)
@@ -458,9 +403,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
                     guard !knownMinimized, knownCGWindowID != nil, canAct(pid: handle.pid) else { return false }
                     if visibleRetryDeadline == nil {
                         visibleRetryDeadline = now + min(0.15, max(0, confirmationTimeout))
-                        #if DEBUG
-                        ClickLatencyTrace.markCurrent("visibleIdentityRetry")
-                        #endif
                     }
                     guard let visibleRetryDeadline, now < visibleRetryDeadline else { return false }
                 }
@@ -476,9 +418,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
                 postSkyLightFrontSwitchOnly(pid: handle.pid, windowID: wid, element: handle.element)
             }
             let restored = setMinimized(false, for: handle)
-            #if DEBUG
-            WindowRestoreTrace.markCurrent("native-deminiaturize", detail: "accepted=\(restored)")
-            #endif
             if rebindAfterRestore, !cancellation.isCancelled {
                 let readBudget = OperationReadBudget(maximumDuration: 0.05, cancellation: cancellation)
                 canRebind = restored || reader.withOperationBudget(readBudget)
@@ -487,19 +426,11 @@ struct AccessibilityWindowActionExecutor: Sendable {
             }
             if (awaitOnScreenBeforeFocus && !preActivateForRestore) || (canRebind && !revalidateHandle()) {
                 let onScreen = waitForWindowOnScreen { revalidateHandle() ? restoredNumber : nil }
-                #if DEBUG
-                WindowRestoreTrace.markCurrent("native-await-onscreen-result", detail: "on-screen=\(onScreen)")
-                #else
                 _ = onScreen
-                #endif
             }
             if revalidateHandle() {
                 let result = reader.accessibility.set(handle.element, kAXMainAttribute as CFString, kCFBooleanTrue)
-                #if DEBUG
-                WindowRestoreTrace.markCurrent("native-main-result", detail: "window=\(handle.cgWindowID ?? 0) ax-error=\(result.rawValue)")
-                #else
                 _ = result
-                #endif
             }
         }
 
@@ -518,9 +449,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
                                requiresRestored: wasMinimized, owningApplication: owningApplication,
                                restoredWindowNumber: canRebind ? { revalidateHandle() ? handle.cgWindowID : nil } : nil,
                                onRestoredFocus: wasMinimized ? onRestoredFocus : nil)
-                #if DEBUG
-                WindowRestoreTrace.markCurrent("native-focus-confirmation", detail: "confirmed=\(confirmed) timeout-ms=\(Int(timeout * 1_000))")
-                #endif
                 return confirmed
             },
             timeout: confirmationTimeout,
@@ -530,11 +458,7 @@ struct AccessibilityWindowActionExecutor: Sendable {
 
     private func raiseForActivation(_ element: AXUIElement, windowID: CGWindowID?) {
         let result = reader.accessibility.perform(element, kAXRaiseAction as CFString)
-        #if DEBUG
-        WindowRestoreTrace.markCurrent("native-raise-result", detail: "window=\(windowID ?? 0) ax-error=\(result.rawValue)")
-        #else
         _ = result
-        #endif
     }
 
     @discardableResult
@@ -571,23 +495,14 @@ struct AccessibilityWindowActionExecutor: Sendable {
             if readError == .success, let button = AXWindowReader.validatedElement(raw) {
                 guard canAct(on: handle), prepare(button), canAct(on: handle) else { return false }
                 let pressError = reader.accessibility.perform(button, kAXPressAction as CFString)
-                #if DEBUG
-                Self.chipProbeLogger.info("close-press pid=\(handle.pid, privacy: .public) error=\(pressError.rawValue, privacy: .public) attempt=\(attempts, privacy: .public)")
-                #endif
                 if pressError == .success { return true }
                 if pressError != .cannotComplete { return false }
             } else if readError != .cannotComplete {
-                #if DEBUG
-                Self.chipProbeLogger.info("close-button-read failed pid=\(handle.pid, privacy: .public) error=\(readError.rawValue, privacy: .public)")
-                #endif
                 return false
             }
             let wait = min(0.05, budget.remaining)
             if wait > 0 { usleep(useconds_t(wait * 1_000_000)) }
         } while budget.canContinue
-        #if DEBUG
-        Self.chipProbeLogger.info("close gave up pid=\(handle.pid, privacy: .public) attempts=\(attempts, privacy: .public)")
-        #endif
         return false
     }
 
@@ -679,9 +594,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
             usleep(20_000)
         } while true
         guard let focused, CFEqual(focused, handle.element) else {
-            #if DEBUG
-            Self.chipProbeLogger.info("postactivate-target focused-gate failed pid=\(handle.pid, privacy: .public) readError=\(readError.rawValue, privacy: .public)")
-            #endif
             return .none
         }
 
@@ -697,18 +609,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
         }
 
         let verdict = MinimizeHandoffTarget.select(zOrder: zOrder, target: record, snapshot: snapshot)
-        #if DEBUG
-        switch verdict {
-        case .switchTo(let pid, let wid, let windowID):
-            Self.chipProbeLogger.info(
-                "postactivate-target candidate=\(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "(unknown)", privacy: .public) pid=\(pid, privacy: .public) wid=\(wid, privacy: .public) windowID=\(windowID.rawValue, privacy: .public)"
-            )
-        case .siblingTakesOver(let windowID):
-            Self.chipProbeLogger.info("postactivate-target sibling-takes-over pid=\(handle.pid, privacy: .public) windowID=\(windowID.rawValue, privacy: .public)")
-        case .none:
-            Self.chipProbeLogger.info("postactivate-target no-eligible-candidate pid=\(handle.pid, privacy: .public)")
-        }
-        #endif
         return verdict
     }
 
@@ -719,32 +619,13 @@ struct AccessibilityWindowActionExecutor: Sendable {
         func authorizeHandoff() -> Bool {
             canSwitchForHandoff(to: candidate, windowID: windowID, element: element, from: source, original: original)
         }
-        #if DEBUG
-        let route: String
-        #endif
-        if Self.skyLightFocusEnabled, authorizeHandoff(),
-           focusBackend.setFrontmost(pid: pid, windowID: windowID, mode: Self.kCPSNoWindows) {
-            #if DEBUG
-            route = "skylight"
-            #endif
-        } else if activateApplicationViaAccessibility(pid: pid, authorized: authorizeHandoff) {
-            #if DEBUG
-            route = "ax-frontmost"
-            #endif
-        } else {
-            #if DEBUG
-            Self.chipProbeLogger.info("switch-frontmost-handoff unavailable pid=\(pid, privacy: .public)")
-            #endif
-            return false
-        }
+        let switched = authorizeHandoff()
+            && focusBackend.setFrontmost(pid: pid, windowID: windowID, mode: Self.kCPSNoWindows)
+        guard switched || activateApplicationViaAccessibility(pid: pid, authorized: authorizeHandoff) else { return false }
         let targetApp = reader.accessibility.application(source.pid)
         _ = reader.accessibility.setTimeout(targetApp, 0.05)
         let deadline = Date().addingTimeInterval(deactivationCap)
         var stillFrontmost: Bool? = true
-        #if DEBUG
-        var lastAXError: Int32 = 0
-        let waitStart = Date()
-        #endif
         repeat {
             guard !cancellation.isCancelled else { return false }
             var raw: CFTypeRef?
@@ -754,16 +635,10 @@ struct AccessibilityWindowActionExecutor: Sendable {
                 stillFrontmost = (raw as? NSNumber)?.boolValue
             } else {
                 stillFrontmost = nil
-                #if DEBUG
-                lastAXError = axError.rawValue
-                #endif
             }
             if stillFrontmost == false { break }
             usleep(2_000)
         } while Date() < deadline
-        #if DEBUG
-        Self.chipProbeLogger.info("switch-frontmost-handoff pid=\(pid, privacy: .public) route=\(route, privacy: .public) targetStillFrontmost=\(String(describing: stillFrontmost), privacy: .public) axError=\(lastAXError, privacy: .public) waitMs=\(Int(Date().timeIntervalSince(waitStart) * 1000), privacy: .public)")
-        #endif
         return stillFrontmost == false && system.app(pid)?.isActive == true
     }
 
@@ -797,9 +672,6 @@ struct AccessibilityWindowActionExecutor: Sendable {
         return reader.accessibility.set(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue) == .success
     }
 
-    private static let skyLightFocusEnabled =
-        DebugSwitch.skylightFocus.isEnabled(in: ProcessInfo.processInfo.environment)
-
     fileprivate static let kCPSUserGenerated: UInt32 = 0x200
     fileprivate static let kCPSNoWindows: UInt32 = 0x400
 
@@ -809,27 +681,21 @@ struct AccessibilityWindowActionExecutor: Sendable {
         mode: UInt32 = AccessibilityWindowActionExecutor.kCPSUserGenerated,
         element: AXUIElement?
     ) -> Bool {
-        guard Self.skyLightFocusEnabled, canAct(pid: pid, windowID: windowID, element: element) else { return false }
+        guard canAct(pid: pid, windowID: windowID, element: element) else { return false }
         return focusBackend.setFrontmost(pid: pid, windowID: windowID, mode: mode)
     }
 
     @discardableResult
     fileprivate func postSkyLightWindowFocus(pid: pid_t, windowID: CGWindowID, element: AXUIElement) -> Bool {
         let switched = postSkyLightFrontSwitchOnly(pid: pid, windowID: windowID, element: element)
-        #if DEBUG
-        WindowRestoreTrace.markCurrent("native-front-switch-result", detail: "window=\(windowID) accepted=\(switched)")
-        #endif
         guard switched else { return false }
         let madeKey = postSkyLightMakeKeyDown(pid: pid, windowID: windowID, element: element)
-        #if DEBUG
-        WindowRestoreTrace.markCurrent("native-make-key-result", detail: "window=\(windowID) accepted=\(madeKey)")
-        #endif
         return madeKey
     }
 
     @discardableResult
     fileprivate func postSkyLightMakeKeyDown(pid: pid_t, windowID: CGWindowID, element: AXUIElement?) -> Bool {
-        guard Self.skyLightFocusEnabled, canAct(pid: pid, windowID: windowID, element: element) else { return false }
+        guard canAct(pid: pid, windowID: windowID, element: element) else { return false }
         return focusBackend.makeKey(pid: pid, windowID: windowID)
     }
 
@@ -859,20 +725,10 @@ struct AccessibilityWindowActionExecutor: Sendable {
 struct ActionExecutionSwitches: Equatable {
     let fastWindowHandleEnabled: Bool
     let axElementCacheEnabled: Bool
-    let chipProbeEnabled: Bool
-    #if DEBUG
-    let clickTraceEnabled: Bool
-    #endif
 
-    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
-        fastWindowHandleEnabled = DebugSwitch.fastWindowHandle.isEnabled(in: environment)
-        axElementCacheEnabled = DebugSwitch.axElementCache.isEnabled(in: environment)
-        #if DEBUG
-        chipProbeEnabled = DebugSwitch.chipProbe.isEnabled(in: environment)
-        clickTraceEnabled = DebugSwitch.clickTrace.isEnabled(in: environment)
-        #else
-        chipProbeEnabled = false
-        #endif
+    init(fastWindowHandleEnabled: Bool = true, axElementCacheEnabled: Bool = true) {
+        self.fastWindowHandleEnabled = fastWindowHandleEnabled
+        self.axElementCacheEnabled = axElementCacheEnabled
     }
 }
 
@@ -914,9 +770,6 @@ enum MinimizedRestorePreActivation {
 struct PlatformActionExecutor: WindowActionExecuting {
     private let windowExecutor: AccessibilityWindowActionExecutor
     private let switches: ActionExecutionSwitches
-    #if DEBUG
-    private static let chipProbeLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "ChipProbe")
-    #endif
     private static let postMinimizeActivateDelayMicroseconds: useconds_t = 50_000
 
     private let reader: AXWindowReader
@@ -927,7 +780,7 @@ struct PlatformActionExecutor: WindowActionExecuting {
         self.switches = switches
         self.reader = reader
         self.system = system
-        windowExecutor = AccessibilityWindowActionExecutor(reader: reader, chipProbeEnabled: switches.chipProbeEnabled,
+        windowExecutor = AccessibilityWindowActionExecutor(reader: reader,
             focusBackend: focusBackend, system: system)
     }
 
@@ -1034,7 +887,6 @@ struct PlatformActionExecutor: WindowActionExecuting {
         let target = AccessibilityWindowActionExecutor.WindowTarget(
             pid: record.pid, title: record.title, bounds: record.bounds, cgWindowID: record.cgWindowID,
             expectedElement: record.actionTarget?.element)
-        var captureTier = "none"
         let handle = WindowHandleCapturePlan.capture(
             cachedEnabled: switches.axElementCacheEnabled,
             fastEnabled: switches.fastWindowHandleEnabled,
@@ -1048,7 +900,6 @@ struct PlatformActionExecutor: WindowActionExecuting {
                     bounds: record.bounds,
                     expectedElement: target.expectedElement
                 )
-                if h != nil { captureTier = "cached" }
                 return h
             },
             fast: {
@@ -1059,7 +910,6 @@ struct PlatformActionExecutor: WindowActionExecuting {
                     bounds: record.bounds,
                     expectedElement: target.expectedElement
                 )
-                if h != nil { captureTier = "fast" }
                 return h
             },
             fallback: { expectedCGWindowID in
@@ -1070,14 +920,9 @@ struct PlatformActionExecutor: WindowActionExecuting {
                     attempts: isFinderWindow ? 3 : 1,
                     retryIntervalMicroseconds: isFinderWindow ? 150_000 : 0
                 )
-                if h != nil { captureTier = "fallback" }
                 return h
             }
         )
-        #if DEBUG
-        if switches.clickTraceEnabled { ClickLatencyTrace.markCurrent("handle", detail: captureTier) }
-        WindowRestoreTrace.markCurrent("native-handle-capture", detail: "tier=\(captureTier) found=\(handle != nil) explicit-unhide=\(hiddenFinder)")
-        #endif
 
         guard !cancellation.isCancelled else { return false }
         guard let handle else {
@@ -1090,9 +935,6 @@ struct PlatformActionExecutor: WindowActionExecuting {
             ) else {
                 return false
             }
-            #if DEBUG
-            WindowRestoreTrace.markCurrent("native-application-fallback")
-            #endif
             return executeAppFallback(request: request, record: record, executor: windowExecutor)
         }
         guard WindowCommandIdentity.permitsElement(record, element: handle.element) else { return false }
@@ -1102,17 +944,11 @@ struct PlatformActionExecutor: WindowActionExecuting {
             guard WindowCommandIdentity.validate(record, element: handle.element,
                 reader: reader.withOperationBudget(identityBudget), system: system),
                 !cancellation.isCancelled else { return false }
-            #if DEBUG
-            WindowRestoreTrace.markCurrent("native-application-unhide")
-            #endif
             system.unhide(record.pid)
             let deadline = ContinuousClock.now + .milliseconds(200)
             while !cancellation.isCancelled, system.app(record.pid)?.isHidden == true, ContinuousClock.now < deadline {
                 usleep(20_000)
             }
-            #if DEBUG
-            WindowRestoreTrace.markCurrent("native-unhide-wait-ended", detail: "cancelled=\(cancellation.isCancelled)")
-            #endif
         }
 
         switch request.kind {
@@ -1121,9 +957,6 @@ struct PlatformActionExecutor: WindowActionExecuting {
                record.status == .active || record.status == .inactive,
                system.app(record.pid)?.isActive != true {
                 windowExecutor.requestWindowFocusViaSkyLight(handle)
-                #if DEBUG
-                if switches.clickTraceEnabled { ClickLatencyTrace.markCurrent("earlyFocus") }
-                #endif
             }
             let restoreFocusObserver: ((WindowFocusConfirmation) -> Void)?
             if case .external = record.source, let expected = record.actionTarget?.element, let onRestoredFocus,
@@ -1149,15 +982,9 @@ struct PlatformActionExecutor: WindowActionExecuting {
         case .minimizeWindow:
             let handoff = beginHandoff(handle: handle, record: record, snapshot: snapshot,
                                        onHandoffTarget: onHandoffTarget, executor: windowExecutor, patience: .minimize)
-            let preSwitched = handoff?.preSwitched == true
 
             func finishSuccessfulMinimize(_ exec: AccessibilityWindowActionExecutor.ActionExecution) -> Bool {
                 finishHandoff(handoff, executor: windowExecutor)
-                #if DEBUG
-                if switches.chipProbeEnabled {
-                    Self.chipProbeLogger.info("minimize-exec-result windowID=\(request.windowID?.rawValue ?? "nil", privacy: .public) success=\(exec.success, privacy: .public) preSwitched=\(preSwitched, privacy: .public) mechanism=\(exec.mechanism, privacy: .public) verifiedMinimized=\(String(describing: exec.verifiedMinimized), privacy: .public)")
-                }
-                #endif
                 return true
             }
 
@@ -1169,36 +996,21 @@ struct PlatformActionExecutor: WindowActionExecuting {
                 usleep(100_000)
                 if let h = windowExecutor.captureHandle(for: target, attempts: 2, retryIntervalMicroseconds: 100_000) {
                     let retryExec = windowExecutor.minimize(h)
-                    #if DEBUG
-                    if switches.chipProbeEnabled {
-                        Self.chipProbeLogger.info("minimize-exec-result windowID=\(request.windowID?.rawValue ?? "nil", privacy: .public) success=\(retryExec.success, privacy: .public) preSwitched=\(preSwitched, privacy: .public) mechanism=\(retryExec.mechanism, privacy: .public) verifiedMinimized=\(String(describing: retryExec.verifiedMinimized), privacy: .public)")
-                    }
-                    #endif
                     return retryExec.success
                 }
             }
             if minExec.verifiedMinimized != true {
-                for attempt in 1...8 {
+                for _ in 1...8 {
                     guard !cancellation.isCancelled, commandBudget?.canContinue != false else { return false }
                     let wait = min(0.12, commandBudget?.remaining ?? 0.12)
                     if wait > 0 { usleep(useconds_t(wait * 1_000_000)) }
                     guard !cancellation.isCancelled, commandBudget?.canContinue != false else { return false }
                     let retryExec = windowExecutor.minimize(handle)
-                    #if DEBUG
-                    if switches.chipProbeEnabled {
-                        Self.chipProbeLogger.info("minimize-retry attempt=\(attempt, privacy: .public) windowID=\(request.windowID?.rawValue ?? "nil", privacy: .public) success=\(retryExec.success, privacy: .public) mechanism=\(retryExec.mechanism, privacy: .public) verifiedMinimized=\(String(describing: retryExec.verifiedMinimized), privacy: .public)")
-                    }
-                    #endif
                     if retryExec.success {
                         return finishSuccessfulMinimize(retryExec)
                     }
                 }
             }
-            #if DEBUG
-            if switches.chipProbeEnabled {
-                Self.chipProbeLogger.info("minimize-exec-result windowID=\(request.windowID?.rawValue ?? "nil", privacy: .public) success=\(minExec.success, privacy: .public) preSwitched=\(preSwitched, privacy: .public) mechanism=\(minExec.mechanism, privacy: .public) verifiedMinimized=\(String(describing: minExec.verifiedMinimized), privacy: .public)")
-            }
-            #endif
             return false
         case .closeWindow:
             let handoff = beginHandoff(handle: handle, record: record, snapshot: snapshot,

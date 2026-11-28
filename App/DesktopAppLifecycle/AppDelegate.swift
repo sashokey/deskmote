@@ -1,9 +1,7 @@
 import AppKit
 import Combine
 import CoreGraphics
-#if DEBUG
-import OSLog
-#endif
+import Darwin
 import QuartzCore
 import SwiftUI
 
@@ -13,13 +11,15 @@ struct ApplicationEnvironment {
     var permissionService = PermissionService()
     var permissionProbe: @Sendable () -> Bool = { PermissionService().hasRequiredPermissions() }
     var runtimeAccessibilityAccess = RuntimeAccessibilityAccess()
-    var makeModules: @MainActor (@escaping UtilityWindowRegistration) -> [DeskMoteModule] = DeskMoteModuleRegistry.production
+    var makeModules: (@MainActor (@escaping UtilityWindowRegistration) -> [DeskMoteModule])?
+    var permissionClock: @Sendable () -> DispatchTime = DispatchTime.now
+    var schedulePermissionDeadline: RuntimePermissionWatchdog.Schedule?
+    var forceExit: @Sendable () -> Void = {}
     var moduleSessionIsActive: @MainActor () -> Bool = {
         let session = CGSessionCopyCurrentDictionary() as? [String: Any]
         return session?["kCGSSessionOnConsoleKey"] as? Bool ?? true
     }
     var moduleSessionNotifications = NSWorkspace.shared.notificationCenter
-    var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     var retirePreviousInstances: @MainActor @Sendable () -> (@MainActor @Sendable () async -> Bool)? = {
         AppDelegate.retirePreviousInstances()
     }
@@ -34,17 +34,7 @@ struct ApplicationEnvironment {
     var makePanels: @MainActor @Sendable (AppRuntime, StripOrderStore, DisplayTopologyStore) -> TaskbarScreenOrchestrator = {
         TaskbarScreenOrchestrator(runtime: $0, stripOrderStore: $1, displayTopologyStore: $2)
     }
-    var launchInstance: @MainActor @Sendable (URL) async -> Result<Void, Error> = { url in
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.createsNewApplicationInstance = true
-        configuration.activates = true
-        return await withCheckedContinuation { continuation in
-            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
-                if let error { continuation.resume(returning: .failure(error)) }
-                else { continuation.resume(returning: .success(())) }
-            }
-        }
-    }
+
 }
 
 @MainActor
@@ -55,23 +45,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ?? "DeskMote"
     }
 
-    private let inventoryLog = WindowInventoryAnomalyLog()
     private let environment: ApplicationEnvironment
     let displayTopologyStore: DisplayTopologyStore
     private(set) lazy var runtime = AppRuntime(
-        inventoryLog: inventoryLog,
+        accessibilityAccess: environment.runtimeAccessibilityAccess,
         displayTableProvider: { [displayTopologyStore] in displayTopologyStore.table }
     )
-    lazy var stripOrderStore = StripOrderStore(inventoryLog: inventoryLog)
+    lazy var stripOrderStore = StripOrderStore()
     private var panelCoordinator: TaskbarScreenOrchestrator?
     private lazy var launchAtLoginService = LaunchAtLoginService()
     private lazy var settingsCoordinator = SettingsCoordinator(
         launchAtLoginService: launchAtLoginService
     )
     private var startupTask: Task<Void, Never>?
-    #if DEBUG
-    private var mainLoopStallProbe: Timer?
-    #endif
     private var spaceCompatibilityAlert: NSAlert?
     private var permissionWindow: NSWindow?
     private var permissionHostingView: NSHostingView<PermissionOnboardingWindowContent>?
@@ -79,15 +65,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var installLocation: AppInstallLocation = .other
     private var permissionCoordinator: PermissionRecoveryCoordinator?
     private var permissionWatchdogTimer: DispatchSourceTimer?
-    private let permissionWatchdogGate = PermissionWatchdogGate()
     private let permissionProbeQueue = DispatchQueue(label: "io.github.sashokey.deskmote.permission-probe", qos: .utility)
-    #if DEBUG
-    private var cachedAccessibilityTrusted = false
-    #endif
-    private var hasStartedApp = false
-    private lazy var modules = environment.makeModules { [weak self] window in
-        self?.runtime.registerUtilityWindow(window)
+    private let permissionProtectionQueue = DispatchQueue(label: "io.github.sashokey.deskmote.permission-protection",
+                                                          qos: .userInitiated)
+    private var permissionSleepObservers: [NSObjectProtocol] = []
+    private var permissionSleeping = false
+    private var permissionStopping = false
+    private(set) lazy var permissionWatchdog: RuntimePermissionWatchdog = makePermissionWatchdog()
+
+    private func makePermissionWatchdog() -> RuntimePermissionWatchdog {
+        RuntimePermissionWatchdog(
+            access: environment.runtimeAccessibilityAccess,
+            now: environment.permissionClock,
+            schedule: environment.schedulePermissionDeadline ?? { [permissionProtectionQueue] time, work in
+                permissionProtectionQueue.asyncAfter(deadline: time, execute: work)
+            },
+            requestQuit: { [weak self] in
+                DispatchQueue.main.async { [weak self] in
+                    self?.permissionCoordinator?.terminationRequested()
+                    self?.requestTermination()
+                }
+            },
+            forceExit: environment.forceExit,
+            notifyReady: { [weak self] in
+                DispatchQueue.main.async { [weak self] in self?.restoreReadyAccessibilityModules() }
+            }
+        )
     }
+    private func restoreReadyAccessibilityModules() {
+        guard permissionWatchdog.isReady, environment.moduleSessionIsActive() else { return }
+        moduleToggles.forEach { $0.accessibilityChanged(trusted: true) }
+    }
+
+    private var hasStartedApp = false
+    private lazy var modules: [DeskMoteModule] = {
+        let register: UtilityWindowRegistration = { [weak self] window in self?.runtime.registerUtilityWindow(window) }
+        let result = environment.makeModules?(register) ?? DeskMoteModuleRegistry.production(
+            registerWindow: register, watchdog: permissionWatchdog)
+        for case let .toggle(toggle) in result {
+            toggle.mayStartWithAccessibility = { [weak self] in self?.permissionWatchdog.isReady == true }
+            toggle.requestStartupPermission = { [weak self] in
+                guard let self, self.permissionCoordinator?.phase != .running,
+                      self.permissionWatchdog.canRequestStartupPrompt else { return }
+                _ = self.permissionService.requestAccessibilityPermission()
+            }
+        }
+        return result
+    }()
     private var moduleSessionObserver: NSObjectProtocol?
     private var needsModuleRestore = false
     private var moduleToggles: [DeskMoteModuleToggle] {
@@ -96,18 +120,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return toggle
         }
     }
-    #if DEBUG
-    private let permissionLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "permissions")
-    #endif
     private lazy var statusMenuController = StatusMenuController(
         settingsCoordinator: settingsCoordinator,
         statusItem: environment.makeStatusItem(), modules: modules, quit: { [weak self] in
-            self?.requestTermination(source: "status-menu")
+            self?.requestTermination()
         }
     )
 
     override convenience init() {
-        self.init(environment: ApplicationEnvironment(runtimeAccessibilityAccess: .shared))
+        let access = RuntimeAccessibilityAccess.shared
+        _ = access.updateTrust(false)
+        var environment = ApplicationEnvironment(runtimeAccessibilityAccess: access)
+        environment.forceExit = { Darwin._exit(EXIT_FAILURE) }
+        self.init(environment: environment)
     }
 
     init(environment: ApplicationEnvironment, runtime: AppRuntime? = nil,
@@ -121,13 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        setvbuf(stdout, nil, _IOLBF, 0)
 
-        #if DEBUG
-        let resources = ActionResourceLog.begin("app.launch")
-        defer { resources?.finish() }
-        startMainLoopStallProbeIfTracing()
-        #endif
 
         environment.resetAppearance()
 
@@ -147,19 +166,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if ready {
                 self.finishLaunching(at: location)
             } else {
-                self.requestTermination(source: "previous-instance")
+                self.requestTermination()
             }
         }
     }
 
     private func finishLaunching(at location: AppInstallLocation) {
         let trusted = permissionService.hasRequiredPermissions()
-        #if DEBUG
-        cachedAccessibilityTrusted = trusted
-        #endif
-        #if DEBUG
-        logPermissionLaunch(installLocation: location, isTrusted: trusted)
-        #endif
 
         if !location.isTransient {
             restoreModulesWhenSessionIsActive()
@@ -169,7 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let coordinator = PermissionRecoveryCoordinator(
             handler: self,
             permissionService: permissionService,
-            installLocation: location, now: environment.now
+            installLocation: location
         )
         permissionCoordinator = coordinator
         coordinator.launched(trusted: trusted)
@@ -217,6 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidBecomeActive(_ notification: Notification) {
         guard let permissionCoordinator else { return }
         permissionCoordinator.applicationDidBecomeActive()
+        schedulePermissionProbe()
         if !installLocation.isTransient {
             if environment.moduleSessionIsActive() { restoreOrRetryModules() }
             Task { @MainActor [weak self] in
@@ -225,20 +239,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    #if DEBUG
-    private func logPermissionLaunch(installLocation: AppInstallLocation, isTrusted: Bool) {
-        let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "unknown"
-        let build = info?["CFBundleVersion"] as? String ?? "unknown"
-        permissionLogger.info("""
-            permission launch version=\(version, privacy: .public) \
-            build=\(build, privacy: .public) \
-            location=\(installLocation.rawValue, privacy: .public) \
-            trusted=\(isTrusted, privacy: .public) \
-            bundlePath=\(Bundle.main.bundleURL.path, privacy: .private(mask: .hash))
-            """)
-    }
-    #endif
 
     fileprivate static func retirePreviousInstances() -> (@MainActor @Sendable () async -> Bool)? {
         guard let bundleID = Bundle.main.bundleIdentifier,
@@ -291,37 +291,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("app.terminate")
-        defer { resources?.finish() }
-        if let event = NSAppleEventManager.shared().currentAppleEvent {
-            permissionLogger.notice("application-termination-requested apple-event-class=\(event.eventClass, privacy: .public) apple-event-id=\(event.eventID, privacy: .public)")
-        } else {
-            permissionLogger.notice("application-termination-requested")
-        }
-        #endif
         startupTask?.cancel()
         startupTask = nil
         permissionCoordinator?.terminationRequested()
         stopModules()
+        panelCoordinator?.stopWindowHeightPolling()
         if hasStartedApp { runtime.stop() }
-
-        panelCoordinator?.stopWindowGeometryObservation()
-        #if DEBUG
-        permissionLogger.notice("application-termination-ready")
-        #endif
         return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        #if DEBUG
-        permissionLogger.notice("application-will-terminate")
-        #endif
         startupTask?.cancel()
         startupTask = nil
         permissionCoordinator?.terminationRequested()
         stopModules()
-        panelCoordinator?.stopWindowGeometryObservation()
+        panelCoordinator?.stopWindowHeightPolling()
         if hasStartedApp { runtime.stop() }
     }
 
@@ -379,14 +363,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startTaskbarRuntime() {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("app.startTaskbarRuntime")
-        defer { resources?.finish() }
-        #endif
         runtime.start()
+        guard environment.runtimeAccessibilityAccess.allowsCalls else { return }
         let coordinator = environment.makePanels(runtime, stripOrderStore, displayTopologyStore)
+        coordinator.leadingSlotFactory = DeskMoteModuleRegistry.makeLeadingSlotFactory()
         panelCoordinator = coordinator
-        coordinator.windowAdjustmentAllowed = { [weak self] in self?.permissionCoordinator?.phase == .running }
+        coordinator.windowAdjustmentAllowed = { [weak self] in
+            guard let self else { return false }
+            return self.permissionCoordinator?.phase == .running && self.environment.runtimeAccessibilityAccess.allowsCalls
+        }
         coordinator.onSpaceCompatibilityFailure = { [weak self] code, details in
             self?.showSpaceCompatibilityNotice(code: code, details: details)
         }
@@ -403,12 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let macOS = ProcessInfo.processInfo.operatingSystemVersionString
         let build = Bundle.main.object(forInfoDictionaryKey: "DeskMoteSourceRevision") as? String ?? "-"
         let diagnostic = "\(code)\n\(details)\n\(macOS) · \(build)"
-        #if DEBUG
-        let guidance = String(localized: "Some taskbars or window buttons may be unavailable. In Console, search for the error code in the taskbar-spaces category.")
-        alert.informativeText = "\(guidance)\n\n\(diagnostic)"
-        #else
         alert.informativeText = diagnostic
-        #endif
         let button = alert.buttons.first ?? alert.addButton(withTitle: String(localized: "OK"))
         let window = alert.window
         window.isReleasedWhenClosed = false
@@ -422,25 +402,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
     }
 
-    #if DEBUG
-    private func startMainLoopStallProbeIfTracing() {
-        guard HoverTrace.isEnabled else { return }
-        let clock = StallProbeClock(expected: CACurrentMediaTime() + 0.008)
-        let timer = Timer(timeInterval: 0.008, repeats: true) { _ in
-            let now = CACurrentMediaTime()
-            HoverTrace.mainLoopStall(lateMs: (now - clock.expected) * 1000)
-            clock.expected = now + 0.008
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        mainLoopStallProbe = timer
-    }
-    #endif
 
 }
 
 extension AppDelegate: PermissionEffectHandler {
     func startApp() {
         guard !hasStartedApp else { return }
+        let watchdog = permissionWatchdog
+        let queue = permissionProtectionQueue
+        environment.runtimeAccessibilityAccess.activateRuntime { [weak watchdog] _ in
+            queue.async { [weak watchdog] in watchdog?.requiredPermissionLost() }
+        }
         hasStartedApp = true
         if environment.moduleSessionIsActive() { restoreOrRetryModules() }
         startTaskbarRuntime()
@@ -469,110 +441,77 @@ extension AppDelegate: PermissionEffectHandler {
     }
 
     func terminateSelf() {
-        requestTermination(source: "permission-flow")
+        requestTermination()
     }
 
-    private func requestTermination(source: String) {
-        #if DEBUG
-        permissionLogger.notice("application-termination-trigger source=\(source, privacy: .public)")
-        #endif
+    private func requestTermination() {
         environment.terminate()
     }
 
     func startWatchdog() {
-        stopWatchdog()
-        let generation = permissionWatchdogGate.start()
-        let timer = DispatchSource.makeTimerSource(queue: permissionProbeQueue)
-        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(100))
-        timer.setEventHandler(handler: makePermissionProbe(generation: generation))
+        guard !permissionStopping, !permissionSleeping, permissionWatchdogTimer == nil,
+              environment.runtimeAccessibilityAccess.allowsCalls else { return }
+        installPermissionSleepObservers()
+        let watchdog = permissionWatchdog
+        let generation = watchdog.start()
+        let timer = DispatchSource.makeTimerSource(queue: permissionProtectionQueue)
+        timer.schedule(deadline: .now() + .seconds(5), repeating: .seconds(5), leeway: .milliseconds(100))
+        let submit = makePermissionProbe()
+        let tick: @Sendable () -> Void = { submit(generation) }
+        timer.setEventHandler(handler: tick)
         permissionWatchdogTimer = timer
         timer.activate()
+        submit(generation)
     }
 
     func stopWatchdog() {
-        permissionWatchdogGate.stop()
+        permissionStopping = true
+        permissionWatchdog.stop()
         permissionWatchdogTimer?.cancel()
         permissionWatchdogTimer = nil
+        permissionSleepObservers.forEach(environment.moduleSessionNotifications.removeObserver)
+        permissionSleepObservers.removeAll()
     }
 
     func schedulePermissionProbe() {
-        permissionProbeQueue.async(execute: makePermissionProbe(generation: nil))
+        guard permissionWatchdogTimer != nil else { return }
+        makePermissionProbe()(nil)
     }
 
-    private func makePermissionProbe(generation expectedGeneration: UInt64?) -> @Sendable () -> Void {
-        let gate = permissionWatchdogGate
-        let access = environment.runtimeAccessibilityAccess
+    private func makePermissionProbe() -> @Sendable (UInt64?) -> Void {
+        let watchdog = permissionWatchdog
+        let queue = permissionProbeQueue
         let probe = environment.permissionProbe
-        #if DEBUG
-        let logger = permissionLogger
-        #endif
-        return { [weak self] in
-            guard let generation = gate.beginProbe(for: expectedGeneration) else { return }
-            let trustGeneration = access.trustGeneration
-            let trusted = probe()
-            #if DEBUG
-            var changed = false
-            #endif
-            let enqueue = gate.completeProbe(generation: generation, deliver: trusted) {
-                let update = access.updateTrust(trusted, for: trustGeneration)
-                #if DEBUG
-                changed = update == true
-                #endif
-                return update != nil
-            }
-            #if DEBUG
-            if changed { logger.notice("permission-probe-transition trusted=\(trusted, privacy: .public)") }
-            #endif
-            guard enqueue else { return }
-            DispatchQueue.main.async { [weak self] in
-                guard let self,
-                      let trusted = gate.takeDelivery(generation: generation) else { return }
-                #if DEBUG
-                let changed = self.cachedAccessibilityTrusted != trusted
-                self.cachedAccessibilityTrusted = trusted
-                if changed {
-                    self.permissionLogger.notice("permission-trust-changed trusted=\(trusted, privacy: .public)")
-                }
-                #endif
-                self.moduleToggles.forEach {
-                    $0.accessibilityChanged(trusted: trusted, canResume: self.environment.moduleSessionIsActive)
-                }
-                #if DEBUG
-                if changed { self.permissionLogger.notice("permission-modules-notified trusted=\(trusted, privacy: .public)") }
-                #endif
-                self.permissionCoordinator?.sampleTrust(trusted)
-                #if DEBUG
-                if changed { self.permissionLogger.notice("permission-trust-delivered trusted=\(trusted, privacy: .public)") }
-                #endif
+        return { expectedRun in
+            guard let reservation = watchdog.beginProbe(for: expectedRun) else { return }
+            queue.async {
+                let trusted = probe()
+                watchdog.completeProbe(reservation, verdict: trusted)
             }
         }
     }
 
-    func suspendPanelsAndStores() {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("permission.suspendRuntime")
-        defer { resources?.finish() }
-        permissionLogger.notice("permission-loss-suspension-started")
-        #endif
-        panelCoordinator?.suspendAndRelease()
-        panelCoordinator = nil
-        #if DEBUG
-        permissionLogger.notice("permission-loss-panels-suspended")
-        #endif
-        runtime.stop()
-        #if DEBUG
-        permissionLogger.notice("permission-loss-suspension-completed")
-        #endif
+    private func installPermissionSleepObservers() {
+        guard permissionSleepObservers.isEmpty else { return }
+        let notifications = environment.moduleSessionNotifications
+        permissionSleepObservers = [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification].map { name in
+            notifications.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, !self.permissionStopping else { return }
+                    if name == NSWorkspace.willSleepNotification {
+                        self.permissionSleeping = true
+                        self.permissionWatchdog.stop()
+                        self.permissionWatchdogTimer?.cancel()
+                        self.permissionWatchdogTimer = nil
+                    } else {
+                        self.permissionSleeping = false
+                        self.startWatchdog()
+                    }
+                }
+            }
+        }
     }
 
-    func launchNewInstance(episode: UInt64) async -> Result<Void, Error> {
-        await environment.launchInstance(environment.bundleURL)
-    }
+
 }
 
-#if DEBUG
-private final class StallProbeClock: @unchecked Sendable {
-    var expected: CFTimeInterval
-    init(expected: CFTimeInterval) { self.expected = expected }
-}
-#endif

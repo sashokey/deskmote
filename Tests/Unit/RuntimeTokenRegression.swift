@@ -34,10 +34,7 @@ final class RuntimeTokenRegressionTests: XCTestCase {
         }
         let inventory = TokenInventory(snapshot(records))
         let executor = TokenExecutor()
-        let log = WindowInventoryAnomalyLog(configuration: .init(enabled: false,
-            directoryURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
-            maxFileSize: 1_048_576, archiveCount: 0))
-        let runtime = AppRuntime(inventoryLog: log, tracker: inventory, actionExecutor: executor, isAppFrontmost: { _ in false })
+        let runtime = AppRuntime(tracker: inventory, actionExecutor: executor, isAppFrontmost: { _ in false })
         defer { executor.release.signal(); runtime.stop() }
         runtime.start()
         await waitUntil { runtime.snapshot.windows.count == 41 }

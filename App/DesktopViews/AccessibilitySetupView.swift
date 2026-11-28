@@ -75,9 +75,6 @@ struct PermissionOnboardingView: View {
         switch presentation {
         case .moveToApplications: return "folder.badge.plus"
         case .waiting, .stalled: return "lock.shield"
-        case .recoveryWaiting, .recoveryStalled: return "exclamationmark.shield"
-        case .relaunching: return "arrow.clockwise"
-        case .relaunchFailed: return "xmark.octagon"
         }
     }
 
@@ -85,9 +82,6 @@ struct PermissionOnboardingView: View {
         switch presentation {
         case .moveToApplications: return String(localized: "Move DeskMote to Applications")
         case .waiting, .stalled: return String(localized: "Turn On Accessibility Permission")
-        case .recoveryWaiting, .recoveryStalled: return String(localized: "Accessibility Permission Was Revoked")
-        case .relaunching: return String(localized: "Restarting DeskMote…")
-        case .relaunchFailed: return String(localized: "Restart Failed")
         }
     }
 
@@ -95,9 +89,6 @@ struct PermissionOnboardingView: View {
         switch presentation {
         case .moveToApplications: return String(localized: "This copy is running from a temporary or read-only location.")
         case .waiting, .stalled: return String(localized: "DeskMote needs this permission to read and manage your windows.")
-        case .recoveryWaiting, .recoveryStalled: return String(localized: "DeskMote will restart itself once you grant it again.")
-        case .relaunching: return String(localized: "This will only take a moment.")
-        case .relaunchFailed: return String(localized: "DeskMote is still running. You can try again.")
         }
     }
 
@@ -112,12 +103,6 @@ struct PermissionOnboardingView: View {
             """)
         case .waiting, .stalled:
             return String(format: String(localized: "Turn on DeskMote in %@. This window closes by itself once you do, and the taskbar finishes starting."), settingsPath)
-        case .recoveryWaiting, .recoveryStalled:
-            return String(format: String(localized: "DeskMote just lost its Accessibility permission, so the taskbar has been put away. Turn DeskMote back on in %@."), settingsPath)
-        case .relaunching:
-            return String(localized: "Nothing to do here — just a moment.")
-        case let .relaunchFailed(message):
-            return String(format: String(localized: "Couldn’t start a new instance of DeskMote: %@\n\nYou can click Retry, or quit and open it manually from your Applications folder."), message)
         }
     }
 
@@ -126,15 +111,6 @@ struct PermissionOnboardingView: View {
         switch presentation {
         case .stalled:
             return steps
-        case .recoveryStalled:
-            return steps + String(localized: """
-
-
-            If simply turning the switch back on works, DeskMote restarts itself and there is nothing else \
-            to do; going through the cleanup above means reopening it manually afterwards.
-            Also, windows the taskbar had moved out of its way may sit one taskbar height short — maximizing \
-            them once puts them back.
-            """)
         default:
             return nil
         }
@@ -180,22 +156,14 @@ struct PermissionOnboardingView: View {
             quitButton
             Button("Open Applications Folder") { coordinator.openApplications() }
 
-        case .waiting, .recoveryWaiting:
+        case .waiting:
             quitButton
             Button("Open System Settings") { coordinator.openSettings() }
 
-        case .stalled, .recoveryStalled:
+        case .stalled:
             quitButton
             Button("Check Again") { coordinator.recheck() }
             Button("Open System Settings") { coordinator.openSettings() }
-
-        case .relaunching:
-            ProgressView()
-                .controlSize(.small)
-
-        case .relaunchFailed:
-            quitButton
-            Button("Retry") { coordinator.retryRelaunch() }
         }
     }
 

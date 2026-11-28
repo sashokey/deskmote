@@ -244,10 +244,8 @@ final class AppTrackerPeriodicBatchTests: XCTestCase {
         XCTAssertEqual(after.title, before.title)
         XCTAssertEqual(after.actionTarget?.id, before.actionTarget?.id)
         XCTAssertNil(tracker.fixtureAppForTesting(pid: pidA)?.windowsByID[cgWindowB])
-        if AXElementCache.isEnabled {
-            let cached = try XCTUnwrap(AXElementCache.shared.element(pid: pidA, cgWindowID: cgWindowA))
-            XCTAssertTrue(CFEqual(cached, visible.element))
-        }
+        let cached = try XCTUnwrap(AXElementCache.shared.element(pid: pidA, cgWindowID: cgWindowA))
+        XCTAssertTrue(CFEqual(cached, visible.element))
     }
 
     func testStalePeriodicCaptureCannotRetireNewOwnerAfterUnreadAX() async {
@@ -702,7 +700,6 @@ final class AppTrackerPeriodicBatchTests: XCTestCase {
         app.windowsByID[cgWindowA]?.isMinimized = true
         app.windowsByID[cgWindowA]?.isFocused = false
         app.windowsByID[cgWindowA]?.minAbsentSince = Date(timeIntervalSince1970: 10)
-        app.windowsByID[cgWindowA]?.absenceEpisodeID = UUID()
         tracker.installFixtureForTesting(app)
         tracker.setObserverActiveForTesting(pid: pidA, active: true)
 

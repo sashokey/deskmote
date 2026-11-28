@@ -39,6 +39,15 @@ struct WindowSpaceRequest: Equatable, Sendable {
     }
 }
 
+struct HeightMembershipStamp: Equatable, Sendable {
+    let displayUUID: String
+    let spaceRevision: UInt64
+    let layoutRevision: UInt64
+    let windowRevision: UInt64
+    let spaceID: Int
+    let isMember: Bool
+}
+
 struct WindowSpaceSnapshot: Equatable, Sendable {
     private struct DisplayTransfer: Equatable, Sendable {
         let source: String
@@ -48,6 +57,7 @@ struct WindowSpaceSnapshot: Equatable, Sendable {
 
     var layouts: [String: SpaceLayoutSnapshot]
     var memberships: [WindowSpaceIdentity: Set<Int>]
+    var heightMembershipStamps: [WindowSpaceIdentity: HeightMembershipStamp] = [:]
     private var requestedIdentities: [UInt32: Set<WindowSpaceIdentity>] = [:]
     private var retiredWindowNumbers: [UInt32] = []
     private var requiresFreshMembership = false
@@ -61,6 +71,17 @@ struct WindowSpaceSnapshot: Equatable, Sendable {
     init(layouts: [String: SpaceLayoutSnapshot] = [:], memberships: [WindowSpaceIdentity: Set<Int>] = [:]) {
         self.layouts = layouts
         self.memberships = memberships
+    }
+
+    func confirmedMembership(for identity: WindowSpaceIdentity, on displayUUID: String,
+                             active: SpaceLayoutSnapshot) -> Bool? {
+        guard let stamp = heightMembershipStamps[identity], stamp.displayUUID == displayUUID,
+              displayTransfers[identity]?.confirmed != false,
+              (layouts[displayUUID] ?? (layouts.count == 1 ? layouts["Main"] : nil)) == active,
+              stamp.spaceID == active.currentSpaceID else { return nil }
+        return active.orderedSpaceIDs.contains(active.currentSpaceID)
+            && !active.fullscreenSpaceIDs.contains(active.currentSpaceID)
+            && stamp.isMember
     }
 
     func permitsProjection(on displayUUID: String?) -> Bool {
@@ -134,6 +155,7 @@ struct WindowSpaceSnapshot: Equatable, Sendable {
         next.retiredWindowNumbers.append(contentsOf: added.sorted())
         next.retiredWindowNumbers = Array(next.retiredWindowNumbers.suffix(4096))
         next.memberships = memberships.filter { identities.contains($0.key) }
+        next.heightMembershipStamps = next.heightMembershipStamps.filter { identities.contains($0.key) }
         next.requestedIdentities = Dictionary(grouping: identities, by: \.windowID).mapValues(Set.init)
         next.unconfirmedMemberships.formIntersection(identities)
         next.unconfirmedMemberships.formUnion(identities.filter(reusesWindowNumber))

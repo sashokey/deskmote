@@ -85,7 +85,7 @@ final class WindowActionQueue {
         if latestJobs[job.key]?.cancellation === job.cancellation { latestJobs[job.key] = nil }
     }
 
-    #if DEBUG
+    #if DESKMOTE_TEST
     var pendingForTesting: [Task<Void, Never>] { tail.map { [$0] } ?? [] }
     #endif
 

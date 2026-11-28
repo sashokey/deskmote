@@ -209,7 +209,7 @@ final class AppRuntimeTests: XCTestCase {
         await drainFocusPanels()
         XCTAssertEqual(panels.highlights, ["chrome"])
         panels.runtime.toggle(windowID: "steam")
-        XCTAssertEqual(panels.runtime.debugState.feedbackEntriesByWindowID["steam"]?.action, .activate)
+        XCTAssertEqual(panels.runtime.feedbackTestProbe.feedbackEntriesByWindowID["steam"]?.action, .activate)
         executor.gates[0].signal()
         executor.gates[1].signal()
         for task in panels.runtime.pendingActionsForTesting { await task.value }
@@ -243,7 +243,7 @@ final class AppRuntimeTests: XCTestCase {
         await waitUntil { executor.calls.withLock { $0 } == 1 }
         runtime.toggle(windowID: "window-2")
 
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-2"]?.action, .activate)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID["window-2"]?.action, .activate)
         executor.gates[0].signal()
         executor.gates[1].signal()
         for task in runtime.pendingActionsForTesting { await task.value }
@@ -259,7 +259,7 @@ final class AppRuntimeTests: XCTestCase {
         for task in runtime.pendingActionsForTesting { await task.value }
 
         XCTAssertEqual(executor.commands.withLock { $0 }, [.activateWindow])
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-1"]?.action, .activate)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID["window-1"]?.action, .activate)
         XCTAssertNil(runtime.pendingMinimizations["window-1"])
     }
 
@@ -394,7 +394,7 @@ final class AppRuntimeTests: XCTestCase {
         let (runtime, _) = await start(executor)
         defer { runtime.stop() }
         var publishedFailure = false
-        let subscription = runtime.debugState.$feedbackEntriesByWindowID.sink { entries in
+        let subscription = runtime.feedbackTestProbe.$feedbackEntriesByWindowID.sink { entries in
             guard entries["window-1"]?.phase == .failure else { return }
             publishedFailure = true
             XCTAssertNil(runtime.effectiveActiveWindowID)
@@ -421,11 +421,11 @@ final class AppRuntimeTests: XCTestCase {
         executor.gates[0].signal()
         await waitUntil { executor.calls.withLock { $0 } == 2 }
         executor.gates[1].signal()
-        await waitUntil { runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase == .success }
+        await waitUntil { runtime.feedbackTestProbe.feedbackEntriesByWindowID["window-1"]?.phase == .success }
         executor.gates[0].signal()
         for task in older { await task.value }
         XCTAssertNil(runtime.effectiveActiveWindowID)
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase, .success)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID["window-1"]?.phase, .success)
     }
 
     func testAnotherCloseCanRunWhenThePreviousCloseWasNeverConfirmed() async {
@@ -441,7 +441,7 @@ final class AppRuntimeTests: XCTestCase {
         await waitUntil { executor.calls.withLock { $0 } == 1 }
         executor.gates[0].signal()
         for task in runtime.pendingActionsForTesting { await task.value }
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["window-1"]?.phase, .pending)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID["window-1"]?.phase, .pending)
 
         now += .seconds(5)
         runtime.close(windowID: "window-1")
@@ -458,14 +458,14 @@ final class AppRuntimeTests: XCTestCase {
         runtime.stop()
         XCTAssertTrue(runtime.snapshot.windows.isEmpty)
         XCTAssertTrue(runtime.pendingMinimizations.isEmpty)
-        XCTAssertTrue(runtime.debugState.feedbackEntriesByWindowID.isEmpty)
+        XCTAssertTrue(runtime.feedbackTestProbe.feedbackEntriesByWindowID.isEmpty)
         runtime.start()
         defer { runtime.stop() }
         await waitUntil { runtime.snapshot.windows.count == 2 }
         executor.gates[0].signal()
         for task in pending { await task.value }
         XCTAssertTrue(runtime.pendingMinimizations.isEmpty)
-        XCTAssertTrue(runtime.debugState.feedbackEntriesByWindowID.isEmpty)
+        XCTAssertTrue(runtime.feedbackTestProbe.feedbackEntriesByWindowID.isEmpty)
         XCTAssertEqual(inventory.starts, 2)
         XCTAssertEqual(inventory.stops, 1)
     }

@@ -9,8 +9,6 @@ final class BatteryWindowController: NSWindowController, NSToolbarDelegate {
     private let refreshIdentifier = NSToolbarItem.Identifier("RefreshBattery")
     private var compact = false
     private var expandedWidth: CGFloat = 520
-    private var refreshResult: String?
-    private var dismissRefreshResult: Task<Void, Never>?
 
     init(monitor: BatteryMonitor) {
         self.monitor = monitor
@@ -18,7 +16,7 @@ final class BatteryWindowController: NSWindowController, NSToolbarDelegate {
         dashboard = AppKitDashboard(frame: NSRect(x: 0, y: 0, width: 520, height: minimumSize.height))
         let window = NSWindow(contentRect: dashboard.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         super.init(window: window)
-        window.title = "Battery Run"
+        window.title = "Show Battery Runtime Estimates"
         window.contentView = dashboard
         window.contentMinSize = minimumSize
         window.isReleasedWhenClosed = false
@@ -64,11 +62,7 @@ final class BatteryWindowController: NSWindowController, NSToolbarDelegate {
     }
 
     @objc func refreshBatteryData(_ sender: Any?) {
-        let previous = monitor.sample
         monitor.refresh()
-        setRefreshResult(powerRefreshMessage(after: previous))
-        render()
-        monitor.recoverHistory()
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -91,49 +85,11 @@ final class BatteryWindowController: NSWindowController, NSToolbarDelegate {
     }
 
     private func render(opening: Bool = false) {
-        let model = DashboardModel(
-            sample: monitor.sample, session: monitor.tracker.session,
-            forecastStart: monitor.forecastStart, chargingSession: monitor.chargingSession
-        )
-        if !model.isCompact && refreshResult != nil { setRefreshResult(nil) }
-        dashboard.update(
-            model: model, notice: monitor.notice, isReadingHistory: monitor.isReadingHistory,
-            powerRefreshMessage: refreshResult
-        )
+        let model = DashboardModel(snapshot: monitor.snapshot)
+        dashboard.update(model: model, isReadingHistory: monitor.isReadingHistory)
         guard let window, opening || model.isCompact != compact else { return }
         if !compact && model.isCompact { expandedWidth = dashboard.bounds.width }
         compact = model.isCompact
         fitWindow(window, opening: opening)
-    }
-
-    private func powerRefreshMessage(after previous: BatterySample?) -> String? {
-        guard let sample = monitor.sample, sample.mode == .idle else { return nil }
-        guard sample.batteryWatts != nil || sample.inputWatts != nil else { return "Power readings unavailable." }
-        if sample.powerReadingSource == .direct { return "Power readings updated." }
-        if sample.powerReadingSource == .partial { return "One live power reading available." }
-        if previous?.powerReadingSource != nil { return "Showing cached power readings." }
-        let counterChanged = sample.powerSampleCount.map { $0 != previous?.powerSampleCount } == true
-        if counterChanged || sample.batteryWatts != previous?.batteryWatts || sample.inputWatts != previous?.inputWatts {
-            return "Power readings updated."
-        }
-        return "No new power reading."
-    }
-
-    private func setRefreshResult(_ message: String?) {
-        dismissRefreshResult?.cancel()
-        dismissRefreshResult = nil
-        refreshResult = message
-        guard message != nil else { return }
-        dismissRefreshResult = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(3))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            self?.refreshResult = nil
-            self?.dismissRefreshResult = nil
-            self?.render()
-        }
     }
 }

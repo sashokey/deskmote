@@ -34,7 +34,7 @@ final class AsyncWorkScope {
 
     @discardableResult
     func launch(after delay: TimeInterval = 0, priority: TaskPriority? = nil,
-                resourceOperation: StaticString = #function,
+
                 operation: @escaping @Sendable (UInt64) async -> Void) -> Task<Void, Never>? {
         guard isActive else { return nil }
         let id = UUID()
@@ -45,10 +45,6 @@ final class AsyncWorkScope {
                 catch { await self?.finish(id); return }
             }
             if !Task.isCancelled {
-                #if DEBUG
-                let resources = ActionResourceLog.begin("async.\(resourceOperation)")
-                defer { resources?.finish() }
-                #endif
                 await operation(generation)
             }
             await self?.finish(id)
@@ -57,7 +53,7 @@ final class AsyncWorkScope {
         return task
     }
 
-    #if DEBUG
+    #if DESKMOTE_TEST
     var pendingForTesting: [Task<Void, Never>] { Array(tasks.values) }
     #endif
 
@@ -66,7 +62,7 @@ final class AsyncWorkScope {
     nonisolated static func performBlocking<Value>(
         on queue: DispatchQueue = .global(qos: .userInitiated),
         cancellation: OperationCancellation = OperationCancellation(),
-        resourceOperation: StaticString = #function,
+
         operation: @escaping @Sendable () -> sending Value
     ) async -> sending Value? {
         return await withTaskCancellationHandler {
@@ -76,10 +72,6 @@ final class AsyncWorkScope {
                         continuation.resume(returning: nil)
                         return
                     }
-                    #if DEBUG
-                    let resources = ActionResourceLog.begin("worker.\(resourceOperation)")
-                    defer { resources?.finish() }
-                    #endif
                     continuation.resume(returning: operation())
                 }
             }

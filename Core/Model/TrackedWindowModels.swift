@@ -31,10 +31,9 @@ struct ApplicationOrigin: Hashable, Sendable {
 
 struct ApplicationIdentity: Hashable, Sendable {
     static let properWMIdentifier = "io.github.sashokey.deskmote"
-    static let properWMDevelopmentIdentifier = "\(properWMIdentifier).dev"
 
     static func isDeskMote(_ bundleIdentifier: String?) -> Bool {
-        bundleIdentifier == properWMIdentifier || bundleIdentifier == properWMDevelopmentIdentifier
+        bundleIdentifier == properWMIdentifier
     }
 
     let pid: Int32
@@ -85,6 +84,7 @@ struct WindowRecord: Hashable, Sendable {
     var groupID: String
     var displayUUID: String?
     var utilityDisplayID: CGDirectDisplayID?
+    var borderlessFullscreenFrame: CGRect?
 
     var actionIdentity: WindowActionIdentity {
         WindowActionIdentity(windowID: id, pid: pid, processGeneration: processGeneration,
@@ -108,7 +108,8 @@ struct WindowRecord: Hashable, Sendable {
         owningApplication: ApplicationIdentity? = nil,
         actionTarget: WindowActionTarget? = nil,
         source: Source = .external,
-        utilityDisplayID: CGDirectDisplayID? = nil
+        utilityDisplayID: CGDirectDisplayID? = nil,
+        borderlessFullscreenFrame: CGRect? = nil
     ) {
         self.id = id
         self.appID = appID
@@ -127,6 +128,7 @@ struct WindowRecord: Hashable, Sendable {
         self.groupID = groupID.isEmpty ? id.rawValue : groupID
         self.displayUUID = displayUUID
         self.utilityDisplayID = utilityDisplayID
+        self.borderlessFullscreenFrame = borderlessFullscreenFrame
     }
 }
 

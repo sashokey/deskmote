@@ -2,18 +2,16 @@ import AppKit
 import Combine
 import CoreGraphics
 import Foundation
-#if DEBUG || DESKMOTE_QA_JOURNAL
-import os
-#endif
 
 @MainActor
 protocol DisplayTopologyUpdating: AnyObject {
     func updateDisplayTopology(_ table: WindowDisplayAttribution.Table)
 }
 
-#if DEBUG
+
+#if DESKMOTE_TEST
 @MainActor
-final class DebugRuntimeState: ObservableObject {
+final class WindowFeedbackTestProbe: ObservableObject {
     @Published private(set) var feedbackEntriesByWindowID: [String: IntentFeedbackState.Entry] = [:]
 
     func setFeedbackEntries(_ entries: [String: IntentFeedbackState.Entry]) {
@@ -27,9 +25,6 @@ final class DebugRuntimeState: ObservableObject {
 
 @MainActor
 private final class UtilityWindowRegistry {
-    #if DESKMOTE_QA_JOURNAL
-    private static let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "QA")
-    #endif
 
     private final class Entry {
         let id = WindowID(rawValue: "utility-\(UUID().uuidString)")
@@ -43,6 +38,7 @@ private final class UtilityWindowRegistry {
     }
 
     private var entries: [Entry] = []
+    var hasLiveWindows: Bool { entries.contains { $0.window != nil } }
     private var observations = Set<AnyCancellable>()
     private let pid = ProcessInfo.processInfo.processIdentifier
     private let bundleIdentifier = Bundle.main.bundleIdentifier
@@ -64,9 +60,6 @@ private final class UtilityWindowRegistry {
             }
             entries.append(entry)
             if observations.isEmpty { observeLifecycle() }
-            #if DESKMOTE_QA_JOURNAL
-            Self.logger.notice("utility event=registered count=\(self.entries.count, privacy: .public)")
-            #endif
         }
         changed?()
     }
@@ -125,9 +118,6 @@ private final class UtilityWindowRegistry {
 
     func execute(_ kind: PlatformActionRequest.ActionKind, windowID: WindowID) -> Bool {
         let performed = perform(kind, windowID: windowID)
-        #if DESKMOTE_QA_JOURNAL
-        Self.logger.notice("utility event=action kind=\(kind.rawValue, privacy: .public) performed=\(performed, privacy: .public) count=\(self.entries.count, privacy: .public)")
-        #endif
         return performed
     }
 
@@ -166,9 +156,6 @@ private final class UtilityWindowRegistry {
                           let entry = self.entries.first(where: { $0.window === window }) else { return }
                     if name == NSWindow.willCloseNotification {
                         self.entries.removeAll { $0 === entry }
-                        #if DESKMOTE_QA_JOURNAL
-                        Self.logger.notice("utility event=removed count=\(self.entries.count, privacy: .public)")
-                        #endif
                     }
                     self.changed?()
                 }
@@ -189,9 +176,8 @@ private final class UtilityWindowRegistry {
 @MainActor
 final class AppRuntime: ObservableObject {
     @Published private(set) var snapshot: DockSnapshot = .empty
-    #if DEBUG
-    let debugState = DebugRuntimeState()
-    var clickLatencyTrace = ClickLatencyTrace.live
+    #if DESKMOTE_TEST
+    let feedbackTestProbe = WindowFeedbackTestProbe()
     #endif
     var effectiveActiveWindowID: WindowID? {
         snapshot.orderedWindowIDs.first { snapshot.windows[$0]?.status == .active }
@@ -205,6 +191,7 @@ final class AppRuntime: ObservableObject {
     private(set) var pendingMinimizations: [String: PendingMinimization] = [:]
 
     private let tracker: any WindowInventoryTracking
+    private let accessibilityAccess: RuntimeAccessibilityAccess
     private let work = WindowActionQueue()
     private var actionTokens: [String: UUID] = [:]
     private var activatingTargets: [String: WindowActionIdentity] = [:]
@@ -216,19 +203,9 @@ final class AppRuntime: ObservableObject {
     private var externalSnapshot: DockSnapshot = .empty
     private var snapshotSubscription: AnyCancellable?
 
-    #if DEBUG
-    private let chipProbeLogger = Logger(subsystem: "io.github.sashokey.deskmote", category: "ChipProbe")
-    private static let chipProbeEnabled = DebugSwitch.chipProbe.isEnabled(in: ProcessInfo.processInfo.environment)
-    private struct WindowRestoreInventoryState: Equatable {
-        let status: WindowStatus?
-        let isOnDesktop: Bool?
-        let windowNumber: CGWindowID?
-    }
-    private var windowRestore: (trace: WindowRestoreTrace, inventory: WindowRestoreInventoryState, onScreen: Bool?)?
-    #endif
     init(
-        inventoryLog: WindowInventoryAnomalyLog = WindowInventoryAnomalyLog(),
         tracker: (any WindowInventoryTracking)? = nil,
+        accessibilityAccess: RuntimeAccessibilityAccess = .shared,
         actionExecutor: any WindowActionExecuting = PlatformActionExecutor(),
         displayTableProvider: @escaping @MainActor () -> WindowDisplayAttribution.Table = {
             DisplayIdentity.attributionTable()
@@ -241,9 +218,11 @@ final class AppRuntime: ObservableObject {
         }
     ) {
         self.monotonicNow = monotonicNow
+        self.accessibilityAccess = accessibilityAccess
         self.intentPipeline = IntentPipeline(actionPlanning: LifecycleActionPlanner(isAppFrontmost: isAppFrontmost),
                                              monotonicNow: monotonicNow)
-        self.tracker = tracker ?? AppTracker(inventoryLog: inventoryLog, displayTableProvider: displayTableProvider)
+        self.tracker = tracker ?? AppTracker(accessibilityAccess: accessibilityAccess,
+                                            displayTableProvider: displayTableProvider)
         self.actionExecutor = actionExecutor
         self.utilityWindows = UtilityWindowRegistry(isAppFrontmost: isAppFrontmost, activateApplication: activateUtilityApplication)
         utilityWindows.changed = { [weak self] in self?.publishSnapshot() }
@@ -253,10 +232,16 @@ final class AppRuntime: ObservableObject {
         guard snapshotSubscription == nil else { return }
         work.restart()
         let generation = work.generation
+        let access = accessibilityAccess
+        let stampAXGeneration: @Sendable (DockSnapshot) -> (DockSnapshot, UInt64) = {
+            ($0, access.trustGeneration)
+        }
         snapshotSubscription = tracker.snapshots
+            .map(stampAXGeneration)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] newSnapshot in
-                guard let self, self.work.isCurrent(generation) else { return }
+            .sink { [weak self] result in
+                let (newSnapshot, axGeneration) = result
+                guard let self, self.work.isCurrent(generation), access.acceptsResult(for: axGeneration) else { return }
                 self.externalSnapshot = newSnapshot
                 self.publishSnapshot()
             }
@@ -267,9 +252,6 @@ final class AppRuntime: ObservableObject {
     private var isRunning: Bool { snapshotSubscription != nil }
 
     func stop() {
-        #if DEBUG
-        clearWindowRestore()
-        #endif
         work.stop()
         actionTokens.removeAll()
         activatingTargets.removeAll()
@@ -279,7 +261,9 @@ final class AppRuntime: ObservableObject {
         snapshotSubscription = nil
         pendingMinimizations.removeAll()
         intentPipeline.reset()
+        #if DESKMOTE_TEST
         publishFeedbackEntries()
+        #endif
         externalSnapshot = .empty
         snapshot = .empty
     }
@@ -292,25 +276,17 @@ final class AppRuntime: ObservableObject {
     }
 
     var windowSpaceInvalidations: AnyPublisher<CGWindowID, Never> { tracker.windowSpaceInvalidations }
-    var launchWindowFocus: AnyPublisher<WindowLaunchFocus, Never> { tracker.launchWindowFocus }
-
-    func isLaunchWindowFocusCurrent(_ focus: WindowLaunchFocus) -> Bool {
-        tracker.isLaunchWindowFocusCurrent(focus)
-    }
-
     func refreshFrontmostWindow() { tracker.refreshFrontmostWindow() }
 
     func registerUtilityWindow(_ window: NSWindow) { utilityWindows.register(window) }
+
+    var hasRegisteredUtilityWindows: Bool { utilityWindows.hasLiveWindows }
 
     func utilityWindowOnActiveSpace(_ id: WindowID) -> Bool? { utilityWindows.onActiveSpace(id) }
     func utilityWindowPhysicalDisplayID(_ id: WindowID) -> CGDirectDisplayID? { utilityWindows.physicalDisplayID(id) }
 
     private func publishSnapshot() {
         guard isRunning else { return }
-        #if DEBUG
-        let resources = ActionResourceLog.begin("runtime.publishSnapshot")
-        defer { resources?.finish() }
-        #endif
         var combined = externalSnapshot
         for record in utilityWindows.records() {
             combined.windows[record.id] = record
@@ -333,16 +309,8 @@ final class AppRuntime: ObservableObject {
     private func trigger(_ intent: UserIntent, projectionInvalidations: AnyPublisher<Void, Never>? = nil,
                          isProjectionCurrent: (@MainActor @Sendable () -> Bool)? = nil) {
         guard isRunning, let current = snapshot.windows[intent.windowID] else { return }
-        #if DEBUG
-        HoverTrace.action("\(intent.action)", phase: "begin")
-        defer { HoverTrace.action("\(intent.action)", phase: "dispatched") }
-        #endif
         let key = intent.windowID.rawValue
         let token = UUID()
-        #if DEBUG
-        let resources = ActionResourceLog.begin("window.\(intent.action.rawValue).dispatch", correlation: token.uuidString)
-        defer { resources?.finish() }
-        #endif
         let requestedAt = monotonicNow()
         if intent.action == .close {
             guard !work.contains(key: key, kind: .closeWindow) else { return }
@@ -359,39 +327,7 @@ final class AppRuntime: ObservableObject {
         retireAction(for: key)
         let request = intentPipeline.plan(intent: intent, snapshot: snapshot, pendingMinimize: pendingMinimize)
 
-        #if DEBUG
-        if Self.chipProbeEnabled,
-           case .toggle(let wid) = intent,
-           let record = snapshot.windows[wid] {
-            let runningApp = NSRunningApplication(processIdentifier: record.pid)
-            let freshActive = runningApp?.isActive == true
-            chipProbeLogger.info("toggle-planned windowID=\(wid.rawValue, privacy: .public) app=\(runningApp?.localizedName ?? "(unknown)", privacy: .public) bundleID=\(record.bundleIdentifier ?? "(none)", privacy: .public) recordStatus=\(record.status.rawValue, privacy: .public) pendingMinimize=\(pendingMinimize, privacy: .public) freshActive=\(freshActive, privacy: .public) plannedAction=\(request.kind.rawValue, privacy: .public)")
-        }
-        #endif
 
-        #if DEBUG
-        if windowRestore?.trace.identity.windowID == current.id { clearWindowRestore() }
-        if request.kind == .activateWindow, case .external = current.source,
-           current.status == .hidden || current.status == .minimized || pendingMinimize {
-            let trace = WindowRestoreTrace(token: token, identity: current.actionIdentity)
-            windowRestore = (trace, .init(status: current.status, isOnDesktop: current.isOnDesktop,
-                                          windowNumber: current.cgWindowID), nil)
-            (tracker as? AppTracker)?.onWindowRestoreOnScreenSample = { [weak self] onScreenIDs, source in
-                self?.observeWindowRestoreOnScreen(onScreenIDs, source: source)
-            }
-            trace.mark("click", detail: "intent=\(intent.action.rawValue) inventory=\(current.status.rawValue) pending-minimize=\(pendingMinimize) on-desktop=\(current.isOnDesktop)")
-        }
-        if let clickLatencyTrace, let wid = request.windowID?.rawValue {
-            let record = snapshot.windows[WindowID(rawValue: wid)]
-            clickLatencyTrace.begin(
-                windowID: wid,
-                token: token,
-                kind: request.kind.rawValue,
-                status: record?.status.rawValue ?? "unknown",
-                bundleID: record?.bundleIdentifier
-            )
-        }
-        #endif
         actionTokens[key] = token
         projectionInvalidationSubscriptions[key] = projectionInvalidations?.sink { [weak self] in
             guard let self, self.actionTokens[key] == token else { return }
@@ -403,7 +339,9 @@ final class AppRuntime: ObservableObject {
             pendingMinimizations.removeValue(forKey: key)
         }
         intentPipeline.registerPending(intent: intent, request: request, at: requestedAt)
+        #if DESKMOTE_TEST
         publishFeedbackEntries()
+        #endif
 
         dispatchToExecutor(intent: intent, request: request, forcedMinimizedPrior: pendingMinimize || current.status == .minimized,
                            isProjectionCurrent: isProjectionCurrent)
@@ -419,20 +357,10 @@ final class AppRuntime: ObservableObject {
         } else {
             utilityRecord = nil
         }
-        let generation = work.generation
         let key = intent.windowID.rawValue
         guard let token = actionTokens[key] else { return }
-        #if DEBUG
-        let clickLatencyTrace = clickLatencyTrace
-        let traceWindowID = request.windowID?.rawValue
-        let restoreTrace = windowRestore.flatMap { $0.trace.token == token ? $0.trace : nil }
-        #endif
         let accepted = work.submit(key: key, kind: request.kind,
             maximumPendingKeys: max(32, snapshot.windows.count)) { [weak self] generation, cancellation in
-            #if DEBUG
-            let resources = ActionResourceLog.begin("window.\(request.kind.rawValue).lifecycle", correlation: token.uuidString)
-            defer { resources?.finish() }
-            #endif
             let admitted = await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation), !cancellation.isCancelled,
                       self.actionTokens[key] == token else { return false }
@@ -447,12 +375,6 @@ final class AppRuntime: ObservableObject {
                 return true
             }
             guard admitted else { return }
-            #if DEBUG
-            restoreTrace?.mark("execution-admitted")
-            if let traceWindowID {
-                clickLatencyTrace?.mark(windowID: traceWindowID, token: token, stage: "execStart")
-            }
-            #endif
             let result: (request: PlatformActionRequest, outcome: WindowActionResult)?
             if let utilityRecord {
                 result = await MainActor.run { [weak self] in
@@ -476,20 +398,7 @@ final class AppRuntime: ObservableObject {
                         executor.executeWithFocusConfirmation(resolved, snapshot: capturedSnapshot,
                             forcedMinimizedPrior: forcedMinimizedPrior, cancellation: cancellation, onHandoffTarget: nil)
                     }
-                    #if DEBUG
-                    func executeWithClickTrace() -> WindowActionResult {
-                        if let clickLatencyTrace, let traceWindowID {
-                            return clickLatencyTrace.withOperation(windowID: traceWindowID, token: token, execute)
-                        }
-                        return execute()
-                    }
-                    if let restoreTrace {
-                        return (resolved, WindowRestoreTrace.$current.withValue(restoreTrace, operation: executeWithClickTrace))
-                    }
-                    return (resolved, executeWithClickTrace())
-                    #else
                     return (resolved, execute())
-                    #endif
                 }
             }
             guard let (resolved, outcome) = result else { return }
@@ -500,13 +409,6 @@ final class AppRuntime: ObservableObject {
                 if success, let focus = outcome.focus, let target = capturedSnapshot.windows[intent.windowID]?.actionIdentity {
                     self.tracker.acceptRestoredWindowFocus(focus, target: target)
                 }
-                #if DEBUG
-                if let traceWindowID {
-                    clickLatencyTrace?.end(windowID: traceWindowID, token: token, success: success)
-                }
-                restoreTrace?.mark("execution-finished", detail: "success=\(success)")
-                self.chipProbeLogger.notice("command-finished windowID=\(key, privacy: .public) planned=\(request.kind.rawValue, privacy: .public) executed=\(resolved.kind.rawValue, privacy: .public) success=\(success, privacy: .public)")
-                #endif
                 let focusChanged = resolved.kind != request.kind
                 self.retireAction(for: key, preservingEffects: success && !focusChanged)
                 if focusChanged {
@@ -514,16 +416,17 @@ final class AppRuntime: ObservableObject {
                     self.tracker.refreshFrontmostWindow()
                 }
                 self.intentPipeline.registerExecutionResult(intent: intent, request: resolved, success: success)
+                #if DESKMOTE_TEST
                 self.publishFeedbackEntries()
+                #endif
             }
         }
         if !accepted {
-            #if DEBUG
-            restoreTrace?.mark("queue-rejected")
-            #endif
             retireAction(for: key)
             intentPipeline.registerExecutionResult(intent: intent, request: request, success: false)
+            #if DESKMOTE_TEST
             publishFeedbackEntries()
+            #endif
         }
     }
 
@@ -535,15 +438,11 @@ final class AppRuntime: ObservableObject {
 
     private func cancelAction(for key: String) {
         work.cancel(key: key)
-        #if DEBUG
-        if let token = actionTokens[key] {
-            if windowRestore?.trace.token == token { windowRestore?.trace.mark("execution-cancelled") }
-            clickLatencyTrace?.end(windowID: key, token: token, success: false)
-        }
-        #endif
         retireAction(for: key)
         intentPipeline.discardFeedback(for: [key])
+        #if DESKMOTE_TEST
         publishFeedbackEntries()
+        #endif
     }
 
     private func retireAction(for key: String, preservingEffects: Bool = false) {
@@ -554,9 +453,6 @@ final class AppRuntime: ObservableObject {
     }
 
     private func handleSnapshotUpdate(_ newSnapshot: DockSnapshot) {
-        #if DEBUG
-        observeWindowRestoreInventory(newSnapshot)
-        #endif
         var retainedActionIDs = Set<String>()
         var replacedIDs = Set<String>()
         for (id, window) in newSnapshot.windows {
@@ -588,48 +484,20 @@ final class AppRuntime: ObservableObject {
         if snapshot != newSnapshot { snapshot = newSnapshot }
         let now = monotonicNow()
         intentPipeline.reconcile(with: newSnapshot, now: now)
+        #if DESKMOTE_TEST
         publishFeedbackEntries()
+        #endif
         reconcilePendingMinimizations(now: now)
     }
 
+    #if DESKMOTE_TEST
     private func publishFeedbackEntries() {
-        #if DEBUG
-        let next = intentPipeline.feedbackState.entriesByWindowID
-        debugState.setFeedbackEntries(next)
-        #endif
+        feedbackTestProbe.setFeedbackEntries(intentPipeline.feedbackState.entriesByWindowID)
     }
+    #endif
 
-    #if DEBUG
-    private func clearWindowRestore() {
-        windowRestore = nil
-        (tracker as? AppTracker)?.onWindowRestoreOnScreenSample = nil
-    }
 
-    private func observeWindowRestoreOnScreen(_ ids: Set<CGWindowID>, source: String) {
-        guard let observation = windowRestore else { return }
-        guard observation.trace.isRecent else { clearWindowRestore(); return }
-        guard let window = observation.inventory.windowNumber ?? observation.trace.identity.cgWindowID else { return }
-        let onScreen = ids.contains(window)
-        guard observation.onScreen != onScreen else { return }
-        windowRestore?.onScreen = onScreen
-        observation.trace.mark("windowserver-onscreen", detail: "source=\(source) resolved-window=\(window) on-screen=\(onScreen)")
-    }
-
-    private func observeWindowRestoreInventory(_ snapshot: DockSnapshot) {
-        guard let observation = windowRestore else { return }
-        guard observation.trace.isRecent else { clearWindowRestore(); return }
-        let identity = observation.trace.identity
-        let record = snapshot.windows[identity.windowID].flatMap {
-            $0.actionIdentity == identity || identity.representsSameTarget(as: $0.actionIdentity) ? $0 : nil
-        } ?? snapshot.windows.values.first { identity.representsSameTarget(as: $0.actionIdentity) }
-        let next = WindowRestoreInventoryState(status: record?.status, isOnDesktop: record?.isOnDesktop,
-                                                windowNumber: record?.cgWindowID)
-        guard next != observation.inventory else { return }
-        windowRestore?.inventory = next
-        if next.windowNumber != observation.inventory.windowNumber { windowRestore?.onScreen = nil }
-        observation.trace.mark("inventory-transition", detail: "from=\(observation.inventory.status?.rawValue ?? "missing") to=\(next.status?.rawValue ?? "missing") on-desktop=\(String(describing: next.isOnDesktop)) resolved-window=\(next.windowNumber ?? 0)")
-    }
-
+    #if DESKMOTE_TEST
     var pendingActionsForTesting: [Task<Void, Never>] { work.pendingForTesting }
     #endif
 

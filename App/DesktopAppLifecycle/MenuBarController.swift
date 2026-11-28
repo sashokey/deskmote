@@ -77,10 +77,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("statusMenu.open")
-        defer { resources?.finish() }
-        #endif
         updateStatusBarIconState()
         refreshSystemState()
     }
@@ -95,10 +91,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleStatusBarIcon() {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("statusMenu.toggleIcon")
-        defer { resources?.finish() }
-        #endif
         statusItem.isVisible.toggle()
         updateStatusBarIconState()
     }
@@ -126,10 +118,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         refreshTask?.cancel()
         refreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            #if DEBUG
-            let resources = ActionResourceLog.begin("statusMenu.readLoginItem")
-            defer { resources?.finish() }
-            #endif
             await settingsCoordinator.refreshLaunchAtLoginState()
         }
     }
@@ -140,13 +128,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         launchActionTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { launchActionTask = nil }
-            #if DEBUG
-            let resources = ActionResourceLog.begin("statusMenu.changeLoginItem")
-            #endif
             let result = await settingsCoordinator.selectLaunchAtLogin()
-            #if DEBUG
-            resources?.finish()
-            #endif
             if case let .failure(error) = result {
                 reportLaunchAtLoginFailure(error)
             }

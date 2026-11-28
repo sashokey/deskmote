@@ -3,6 +3,7 @@ import json, pathlib, re, sys, unicodedata
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CATALOG = ROOT / 'Resources/Localizable.xcstrings'
+APPS_CATALOG = ROOT / 'Modules/Apps/Resources/Apps.xcstrings'
 INFOPLIST_CATALOG = ROOT / 'Resources/InfoPlist.xcstrings'
 DIRS = ['App', 'Core', 'Platform', 'UI']
 LANGUAGES = ['en', 'zh-Hans', 'zh-Hant', 'ja', 'de', 'fr', 'es', 'es-419', 'pt-BR', 'pt-PT', 'it', 'ko', 'ru', 'tr', 'hi', 'vi']
@@ -71,9 +72,9 @@ def contains_non_latin_letters(value):
     return any(char.isalpha() and not unicodedata.name(char, '').startswith('LATIN ')
                for char in value)
 
-def scan():
+def scan(directories=DIRS):
     used, non_latin_literals = {}, []
-    for d in DIRS:
+    for d in directories:
         for f in sorted((ROOT / d).rglob('*.swift')):
             rel = str(f.relative_to(ROOT))
             if rel in SKIP_FILES:
@@ -111,15 +112,22 @@ def placeholder_mismatches(catalog):
     return out
 
 def main():
-    catalog = json.loads(CATALOG.read_text(encoding='utf-8'))['strings']
-    used, non_latin_literals = scan()
+    core_catalog = json.loads(CATALOG.read_text(encoding='utf-8'))['strings']
+    apps_catalog = json.loads(APPS_CATALOG.read_text(encoding='utf-8'))['strings']
+    core_used, core_literals = scan()
+    apps_used, apps_literals = scan(['Modules/Apps'])
+    used = core_used | apps_used
+    non_latin_literals = core_literals + apps_literals
+    catalog = core_catalog | apps_catalog
 
-    missing = {k: v for k, v in used.items() if k not in catalog}
-    unused = [k for k in catalog if k not in used]
-    untranslated = {lang: [k for k, v in catalog.items() if not value_of(v, lang)] for lang in LANGUAGES}
+    tables = ((core_catalog, core_used), (apps_catalog, apps_used))
+    missing = {k: v for entries, uses in tables for k, v in uses.items() if k not in entries}
+    unused = [k for entries, uses in tables for k in entries if k not in uses]
+    untranslated = {lang: [k for entries, _ in tables for k, v in entries.items() if not value_of(v, lang)]
+                    for lang in LANGUAGES}
     infoplist = json.loads(INFOPLIST_CATALOG.read_text(encoding='utf-8'))['strings']
     infoplist_untranslated = {lang: [k for k, v in infoplist.items() if not value_of(v, lang)] for lang in LANGUAGES}
-    placeholder_drift = placeholder_mismatches(catalog)
+    placeholder_drift = placeholder_mismatches(core_catalog) + placeholder_mismatches(apps_catalog)
     non_latin_keys = [key for key in used if contains_non_latin_letters(key)]
 
     print(f'{len(used)} source keys, {len(catalog)} catalog entries across {len(LANGUAGES)} locales, '

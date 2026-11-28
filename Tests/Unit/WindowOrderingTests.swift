@@ -183,7 +183,7 @@ final class WindowOrderingTests: XCTestCase {
             windowIDsByPID: [-51000: [51001, 51002], -52000: [52001]], alphaByWindowID: [:])
         func reconcile(_ tracker: AppTracker, pid: Int32, snapshots: [AXWindowSnapshot]) {
             tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: cg, now: clock, eligible: snapshots,
-                readOutcome: .success(count: snapshots.count))
+                readOutcome: .success)
             tracker.rebuildSnapshotForTesting(onScreenCGIDs: [51001, 51002, 52001])
         }
         reconcile(firstTracker, pid: -51000, snapshots: [editorA])

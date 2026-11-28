@@ -1,13 +1,19 @@
 import AppKit
 import XCTest
+@testable import DeskMoteApps
 
 @MainActor
 final class AppsMenuStoreTests: XCTestCase {
+    func testAppOpenIntentSetsWorkspaceActivation() {
+        XCTAssertFalse(AppsMenuStore.openConfiguration(for: .background).activates)
+        XCTAssertTrue(AppsMenuStore.openConfiguration(for: .foreground).activates)
+    }
+
     func testPinnedOrderFolderNameAndCatalogPreferencesSurviveRestart() async throws {
         let suite = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let store = AppsMenuStore(defaults: defaults)
+        let store = makeAppsFixtureStore(defaults: defaults)
         XCTAssertTrue(store.pins.isEmpty)
         XCTAssertEqual(store.catalogMode, .list)
         XCTAssertFalse(store.expanded)
@@ -26,7 +32,7 @@ final class AppsMenuStoreTests: XCTestCase {
         store.expanded = true
         store.catalogMode = .grid
 
-        let restored = AppsMenuStore(defaults: try XCTUnwrap(UserDefaults(suiteName: suite)))
+        let restored = makeAppsFixtureStore(defaults: try XCTUnwrap(UserDefaults(suiteName: suite)))
         XCTAssertEqual(restored.pins.map(\.applicationIDs), [["safari"], ["notes", "terminal"]])
         XCTAssertEqual(restored.pins.last?.id, folder)
         XCTAssertEqual(restored.pins.last?.name, "  Work tools  ")
@@ -38,7 +44,7 @@ final class AppsMenuStoreTests: XCTestCase {
         let suite = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let store = AppsMenuStore(defaults: defaults)
+        let store = makeAppsFixtureStore(defaults: defaults)
         for id in ["notes", "terminal", "safari", "mail"] { store.pin(application(id)) }
 
         let folder = try XCTUnwrap(store.createFolder(from: store.pins[0].id))
@@ -62,7 +68,7 @@ final class AppsMenuStoreTests: XCTestCase {
         let suite = UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let store = AppsMenuStore(defaults: defaults)
+        let store = makeAppsFixtureStore(defaults: defaults)
         for id in ["notes", "terminal", "safari", "mail"] { store.pin(application(id)) }
         let first = try XCTUnwrap(store.createFolder(from: store.pins[0].id))
         let second = try XCTUnwrap(store.createFolder(from: store.pins[2].id))
@@ -96,7 +102,7 @@ final class AppsMenuStoreTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: localApplications.appendingPathComponent("Alias.app"),
                                                    withDestinationURL: preferred)
 
-        let store = AppsMenuStore(applicationDirectories: [userApplications, localApplications])
+        let store = makeAppsFixtureStore(applicationDirectories: [userApplications, localApplications])
         let catalog = await store.loadCatalog().installed
         XCTAssertEqual(catalog.map(\.name), ["Development Tool", "Fallback"])
         XCTAssertEqual(catalog.map(\.id), ["test.tools", fallback.resolvingSymlinksInPath().path])
@@ -104,10 +110,12 @@ final class AppsMenuStoreTests: XCTestCase {
         XCTAssertEqual(catalog.map(\.category), ["developer-tools", "other"])
     }
 
-    func testDefaultInstalledCatalogIncludesSystemFinderOnce() async {
-        let catalog = await AppsMenuStore(readIndex: { _ in [] }).loadCatalog().installed
-        let finderURLs = catalog.filter { $0.id == "com.apple.finder" }.map(\.url.path)
-        XCTAssertEqual(finderURLs, ["/System/Library/CoreServices/Finder.app"])
+    func testConfiguredFinderAppearsExactlyOnce() async {
+        let finder = AppsMenuApplication(id: "com.apple.finder", name: "Finder",
+                                        url: URL(fileURLWithPath: "/Fixture/Finder.app"),
+                                        category: "utilities")
+        let catalog = await makeAppsFixtureStore(systemFileManager: finder).loadCatalog().installed
+        XCTAssertEqual(catalog.filter { $0.id == finder.id }.map(\.url), [finder.url])
     }
 
     func testAllUsesIndexedApplicationsAndTheirDisplayNames() async throws {
@@ -132,13 +140,13 @@ final class AppsMenuStoreTests: XCTestCase {
         try createApplication(at: embedded, identifier: "test.helper")
         try createApplication(at: hidden, identifier: "test.hidden")
         try createApplication(at: launcher, identifier: "com.apple.apps.launcher")
-        try createApplication(at: own, identifier: ApplicationIdentity.properWMDevelopmentIdentifier)
+        try createApplication(at: own, identifier: ApplicationIdentity.properWMIdentifier)
 
         let entries = [passwords, browser, errorReporter, game, embedded, hidden, launcher, own].map {
             AppsMenuIndexedApplication(url: $0, displayName: $0 == game ? "Game Display Name.app" : $0.lastPathComponent,
                                        hiddenBySystem: $0 == hidden)
         }
-        let store = AppsMenuStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in entries })
+        let store = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in entries })
         let catalog = await store.loadCatalog()
         let all = try XCTUnwrap(catalog.all)
         XCTAssertEqual(all.map(\.id), ["test.browser", "test.game", "test.passwords"])
@@ -158,22 +166,22 @@ final class AppsMenuStoreTests: XCTestCase {
         try createApplication(at: indexed, identifier: "test.indexed")
         try createApplication(at: directory.appendingPathComponent("Folder Only.app"), identifier: "test.folder")
 
-        let original = AppsMenuStore(defaults: defaults, applicationDirectories: [directory])
+        let original = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory])
         _ = await original.loadCatalog()
-        let failing = AppsMenuStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in nil })
+        let failing = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in nil })
         XCTAssertNil(failing.catalogSnapshot?.all)
         let firstFailure = await failing.loadCatalog()
         XCTAssertNil(firstFailure.all)
         XCTAssertTrue(firstFailure.allUnavailable)
         XCTAssertEqual(Set(firstFailure.installed.map(\.id)), ["test.indexed", "test.folder"])
 
-        let successful = AppsMenuStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in
+        let successful = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in
             [.init(url: indexed, displayName: "Indexed.app", hiddenBySystem: false)]
         })
         let successfulCatalog = await successful.loadCatalog()
         let recovered = try XCTUnwrap(successfulCatalog.all)
         XCTAssertEqual(recovered.map(\.id), ["test.indexed"])
-        let restarted = AppsMenuStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in nil })
+        let restarted = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory], readIndex: { _ in nil })
         XCTAssertEqual(restarted.catalogSnapshot?.all, recovered)
         let laterFailure = await restarted.loadCatalog()
         XCTAssertEqual(laterFailure.all, recovered)
@@ -194,7 +202,6 @@ final class AppsMenuStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let installed = [
             (id: "io.github.sashokey.deskmote", name: "DeskMote", file: "DeskMote"),
-            (id: "io.github.sashokey.deskmote.dev", name: "DeskMote", file: "DeskMote Dev"),
             (id: "com.apple.siri.launcher", name: "Siri", file: "Siri"),
             (id: "com.apple.campo", name: "Siri", file: "Siri AI"),
             (id: "test.localized", name: "Localized Name", file: "Internal Name"),
@@ -207,10 +214,9 @@ final class AppsMenuStoreTests: XCTestCase {
         let oldCache = LegacyCatalog(directories: [directory], applications: oldApplications)
         defaults.set(try JSONEncoder().encode(oldCache), forKey: "deskmote.appsMenu.catalog.v1")
 
-        let store = AppsMenuStore(defaults: defaults, applicationDirectories: [directory])
+        let store = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory])
         let expected = [
             "io.github.sashokey.deskmote": "DeskMote",
-            "io.github.sashokey.deskmote.dev": "DeskMote Dev",
             "com.apple.siri.launcher": "Siri",
             "com.apple.campo": "Siri AI",
             "test.localized": "Localized Name",
@@ -231,17 +237,17 @@ final class AppsMenuStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let first = directory.appendingPathComponent("First.app")
         try createApplication(at: first, identifier: "test.first")
-        let original = AppsMenuStore(defaults: defaults, applicationDirectories: [directory])
+        let original = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory])
         let firstScan = await original.loadCatalog().installed
         XCTAssertEqual(firstScan.map(\.id), ["test.first"])
 
         try FileManager.default.removeItem(at: first)
         try createApplication(at: directory.appendingPathComponent("Second.app"), identifier: "test.second")
-        let restarted = AppsMenuStore(defaults: defaults, applicationDirectories: [directory])
+        let restarted = makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory])
         XCTAssertEqual(restarted.catalogSnapshot?.installed, firstScan)
         let refreshed = await restarted.loadCatalog().installed
         XCTAssertEqual(refreshed.map(\.id), ["test.second"])
-        XCTAssertEqual(AppsMenuStore(defaults: defaults, applicationDirectories: [directory]).catalogSnapshot?.installed, refreshed)
+        XCTAssertEqual(makeAppsFixtureStore(defaults: defaults, applicationDirectories: [directory]).catalogSnapshot?.installed, refreshed)
     }
 
     func testRunningCatalogIncludesWindowlessRegularAppsOnceAndExcludesTerminatedAndAccessoryApps() async {
@@ -278,5 +284,40 @@ final class AppsMenuStoreTests: XCTestCase {
         metadata.merge(attributes) { _, supplied in supplied }
         try PropertyListSerialization.data(fromPropertyList: metadata, format: .xml, options: 0)
             .write(to: contents.appendingPathComponent("Info.plist"))
+    }
+}
+
+
+extension XCTestCase {
+    @MainActor
+    func makeAppsFixtureStore(
+        defaults: UserDefaults? = nil,
+        applicationDirectories: [URL] = [],
+        runningApplicationSnapshot: @escaping () -> [NSRunningApplication] = { [] },
+        readIcon: (@MainActor (URL) async -> NSImage)? = nil,
+        readIndex: AppsMenuStore.ReadIndex? = nil,
+        systemFileManager: AppsMenuApplication? = nil,
+        catalogNow: @escaping () -> ContinuousClock.Instant = { .now },
+        openApplication: (@MainActor (URL, AppsMenuStore.OpenIntent) -> Void)? = nil
+    ) -> AppsMenuStore {
+        let fixtureDefaults: UserDefaults
+        if let defaults {
+            fixtureDefaults = defaults
+        } else {
+            let suite = "DeskMote.Tests.Apps.\(UUID())"
+            fixtureDefaults = UserDefaults(suiteName: suite)!
+            addTeardownBlock { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+        }
+        return AppsMenuStore(isDeskMote: ApplicationIdentity.isDeskMote, defaults: fixtureDefaults, applicationDirectories: applicationDirectories,
+                             runningApplicationSnapshot: runningApplicationSnapshot,
+                             readIcon: readIcon ?? { _ in
+                                 NSImage(size: NSSize(width: 64, height: 64), flipped: false) { rect in
+                                     NSColor.systemGreen.setFill()
+                                     rect.fill()
+                                     return true
+                                 }
+                             },
+                             readIndex: readIndex, systemFileManager: systemFileManager,
+                             catalogNow: catalogNow, openApplication: openApplication ?? { _, _ in })
     }
 }

@@ -164,28 +164,26 @@ final class WindowSpaceVisibilityTests: XCTestCase {
         XCTAssertEqual(snapshot?.memberships, [sticky: [1, 2], regular: [1], parked: [2]])
     }
 
-    func testBatchVerificationAndMissingSpaceResultKeepAuthoritativeValues() {
+    func testMissingBatchResultKeepsAuthoritativeScalarValues() {
         let third = identity("third", pid: 43, windowID: 102)
         let requests = [window, other, third].map {
             WindowSpaceRequest(identity: $0, isParked: false, isOnDesktop: true)
         }
-        for mode in [WindowSpaceObservation.Mode.verify, .batch] {
-            var scalarReads: [Int] = []
-            let result = WindowSpaceObservation.capture(
-                requests, cancellation: OperationCancellation(),
-                layouts: { ["left": layout(1, spaces: [1, 2], fullscreen: [])] },
-                membership: { number in
-                    scalarReads.append(number)
-                    return [2]
-                },
-                mode: mode,
-                windowsInSpace: { space in
-                    mode == .batch && space == 2 ? nil : (space == 1 ? [100, 101, 102] : [])
-                }
-            )
-            XCTAssertEqual(scalarReads, [100, 101, 102])
-            XCTAssertEqual(result?.memberships, [window: [2], other: [2], third: [2]])
-        }
+        var scalarReads: [Int] = []
+        let result = WindowSpaceObservation.capture(
+            requests, cancellation: OperationCancellation(),
+            layouts: { ["left": layout(1, spaces: [1, 2], fullscreen: [])] },
+            membership: { number in
+                scalarReads.append(number)
+                return [2]
+            },
+            mode: .batch,
+            windowsInSpace: { space in
+                space == 2 ? nil : (space == 1 ? [100, 101, 102] : [])
+            }
+        )
+        XCTAssertEqual(scalarReads, [100, 101, 102])
+        XCTAssertEqual(result?.memberships, [window: [2], other: [2], third: [2]])
     }
 
     func testBatchReadsOnlyRequestedDisplayAndUsesScalarForNonDesktopWindows() {
@@ -225,6 +223,7 @@ final class WindowSpaceVisibilityTests: XCTestCase {
         let result = try WindowSpaceObservation.readMemberships(
             requests, layouts: ["left": layout(1, spaces: [1], fullscreen: [])],
             cancellation: OperationCancellation(),
+            mode: .batch,
             membership: { $0 == 100 ? .success([1]) : .failure(scalarFailure) },
             windowsInSpace: { _ in .failure(batchFailure) }
         ).get()
@@ -232,7 +231,7 @@ final class WindowSpaceVisibilityTests: XCTestCase {
         XCTAssertEqual(result.failures, [batchFailure, scalarFailure])
     }
 
-    func testVerificationDiscardsTheSnapshotIfSpacesChangeDuringComparison() {
+    func testBatchDiscardsTheSnapshotIfSpacesChangeDuringRead() {
         let third = identity("third", pid: 43, windowID: 102)
         let requests = [window, other, third].map {
             WindowSpaceRequest(identity: $0, isParked: false, isOnDesktop: true)
@@ -241,7 +240,7 @@ final class WindowSpaceVisibilityTests: XCTestCase {
         let result = WindowSpaceObservation.capture(
             requests, cancellation: OperationCancellation(),
             layouts: { ["left": layout(current, spaces: [1, 2], fullscreen: [])] },
-            membership: { _ in [1] }, mode: .verify, windowsInSpace: { _ in
+            membership: { _ in [1] }, mode: .batch, windowsInSpace: { _ in
                 current = 2
                 return [100, 101, 102]
             }

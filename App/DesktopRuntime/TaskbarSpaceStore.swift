@@ -1,8 +1,5 @@
 import AppKit
 import Combine
-#if DEBUG
-import os
-#endif
 
 @MainActor
 final class TaskbarSpaceStore: ObservableObject {
@@ -50,9 +47,6 @@ final class TaskbarSpaceStore: ObservableObject {
     private let notifications: NotificationCenter
     private let layoutQueue = DispatchQueue(label: "io.github.sashokey.deskmote.space-layout", qos: .userInitiated)
     private let membershipQueue = DispatchQueue(label: "io.github.sashokey.deskmote.window-spaces", qos: .utility)
-    #if DEBUG
-    private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "taskbar-spaces")
-    #endif
     private let work = AsyncWorkScope()
     private var subscriptions = Set<AnyCancellable>()
     private var spaceObserver: NSObjectProtocol?
@@ -61,6 +55,7 @@ final class TaskbarSpaceStore: ObservableObject {
     private var spaceRevision: UInt64 = 0
     private var minimumProjectionRevision: UInt64 = 0
     private var layoutRevision: UInt64 = 0
+    private var verifiedHeightFallbackLayout: UInt64?
     private var membershipRevision: UInt64 = 0
     private var transferRevision: UInt64 = 0
     private var transferReads: [UInt64: Task<Void, Never>] = [:]
@@ -91,7 +86,7 @@ final class TaskbarSpaceStore: ObservableObject {
         if let readMemberships { self.readMemberships = readMemberships }
         else if read == nil {
             self.readMemberships = { requests, layouts, cancellation in
-                WindowSpaceObservation.readMemberships(requests, layouts: layouts, cancellation: cancellation, mode: .live)
+                WindowSpaceObservation.readMemberships(requests, cancellation: cancellation)
             }
         } else { self.readMemberships = nil }
         self.notifications = notifications
@@ -137,6 +132,7 @@ final class TaskbarSpaceStore: ObservableObject {
             minimumProjectionRevision = spaceRevision
         }
         isRunning = false
+        verifiedHeightFallbackLayout = nil
         work.stop()
         if let spaceObserver { notifications.removeObserver(spaceObserver) }
         spaceObserver = nil
@@ -145,6 +141,7 @@ final class TaskbarSpaceStore: ObservableObject {
         nextLayoutSource = nil
         cancelTransfers()
         windowRevisions.removeAll()
+        revokeHeightMemberships()
         membershipInFlight = false
         pendingMemberships.removeAll()
         needsMembershipRead = false
@@ -158,6 +155,47 @@ final class TaskbarSpaceStore: ObservableObject {
         membershipRevision &+= 1
         requestLayout(source: .explicitRefresh)
         if readLayouts != nil { requestMembership(Set(requests.map(\.identity))) }
+    }
+
+    func heightMembership(for identity: WindowSpaceIdentity, on displayUUID: String) -> HeightFallbackMembership {
+        HeightFallbackMembership(confirmed: confirmedDesktopMembership(for: identity, on: displayUUID),
+                                 revision: windowRevisions[identity])
+    }
+
+    func confirmedDesktopMembership(for identity: WindowSpaceIdentity, on displayUUID: String) -> Bool? {
+        confirmedDesktopMembership(for: identity, on: displayUUID, sample: snapshot,
+                                   confirmedRevision: confirmedSpaceRevision)
+    }
+
+    func confirmedDesktopMembership(for identity: WindowSpaceIdentity, on displayUUID: String,
+                                    sample: WindowSpaceSnapshot, confirmedRevision: UInt64) -> Bool? {
+        guard confirmedRevision == spaceRevision, confirmedRevision >= minimumProjectionRevision,
+              let stamp = sample.heightMembershipStamps[identity], stamp.spaceRevision == spaceRevision,
+              stamp.layoutRevision == layoutRevision, stamp.windowRevision == windowRevisions[identity],
+              let layout = activeLayouts[displayUUID] ?? (activeLayouts.count == 1 ? activeLayouts["Main"] : nil),
+              sample.permitsProjection(on: displayUUID) else { return nil }
+        return sample.confirmedMembership(for: identity, on: displayUUID, active: layout)
+    }
+
+    private func revokeHeightMemberships() {
+        var next = snapshot
+        next.heightMembershipStamps.removeAll()
+        publish(next)
+    }
+
+    private func recordHeightMemberships(
+        _ relevant: WindowSpaceSnapshot, requested: [WindowSpaceRequest], windowRevision: UInt64,
+        layoutRevision: UInt64, into next: inout WindowSpaceSnapshot
+    ) {
+        for request in requested where windowRevisions[request.identity] == windowRevision {
+            next.heightMembershipStamps[request.identity] = nil
+            guard !request.isParked, !request.isUtility, request.isOnDesktop, let display = request.displayUUID,
+                  let layout = Self.effectiveLayout(for: request, in: relevant.layouts),
+                  let row = relevant.memberships[request.identity], !row.isEmpty else { continue }
+            next.heightMembershipStamps[request.identity] = HeightMembershipStamp(displayUUID: display,
+                spaceRevision: spaceRevision, layoutRevision: layoutRevision, windowRevision: windowRevision,
+                spaceID: layout.currentSpaceID, isMember: row.contains(layout.currentSpaceID))
+        }
     }
 
     func canUseProjection(on displayUUID: String?, renderedSpaceRevision: UInt64) -> Bool {
@@ -177,17 +215,27 @@ final class TaskbarSpaceStore: ObservableObject {
         return !invalidatedDisplays.contains(displayUUID) && !invalidatedDisplays.contains("Main")
     }
 
+    var heightFallbackLayoutEpoch: UInt64? {
+        guard isRunning, verifiedHeightFallbackLayout == layoutRevision else { return nil }
+        return verifiedHeightFallbackLayout
+    }
+
+    func heightFallbackDesktop(on display: String) -> Int? {
+        guard heightFallbackLayoutEpoch != nil, attachedDisplays?.contains(display) != false,
+              let layout = activeLayouts[display] ?? (activeLayouts.count == 1 ? activeLayouts["Main"] : nil),
+              layout.orderedSpaceIDs.contains(layout.currentSpaceID),
+              !layout.fullscreenSpaceIDs.contains(layout.currentSpaceID) else { return nil }
+        return layout.currentSpaceID
+    }
+
     private func activeSpaceChanged() {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("spaces.activeSpaceChanged")
-        defer { resources?.finish() }
-        #endif
         invalidatedDisplays = Set(snapshot.layouts.keys)
         spaceRevision &+= 1
         layoutRevision &+= 1
         membershipRevision &+= 1
         cancelTransfers()
         activeSpaceChange.send()
+        revokeHeightMemberships()
         publish(snapshot.recordingSpaceChange(requests: liveUtilityRequests(requests)))
         requestLayout(source: .activeSpace)
     }
@@ -198,6 +246,7 @@ final class TaskbarSpaceStore: ObservableObject {
         layoutRevision &+= 1
         membershipRevision &+= 1
         cancelTransfers()
+        revokeHeightMemberships()
         publish(self.snapshot.clearingConfirmedTransfers())
         let identifiers = Set(snapshot.identifiedDisplayUUIDs)
         attachedDisplays = snapshot.physicalDisplayCount > 0 &&
@@ -250,7 +299,12 @@ final class TaskbarSpaceStore: ObservableObject {
     private func windowChanged(_ id: CGWindowID) {
         if confirmedSpaceRevision != spaceRevision || activeLayouts.isEmpty { requestLayout(source: .windowEvent) }
         let matching = requests.filter { $0.identity.windowID == id }
+        var next = snapshot
+        for request in matching {
+            next.heightMembershipStamps[request.identity] = nil
+        }
         revise(matching.map(\.identity))
+        publish(next)
         refreshExactMemberships(matching)
     }
 
@@ -271,6 +325,9 @@ final class TaskbarSpaceStore: ObservableObject {
 
     private func beginWindowRead(_ requested: [WindowSpaceRequest]) -> UInt64 {
         revise(requested.map(\.identity))
+        var next = snapshot
+        for request in requested { next.heightMembershipStamps[request.identity] = nil }
+        publish(next)
         return nextWindowRevision
     }
 
@@ -341,12 +398,12 @@ final class TaskbarSpaceStore: ObservableObject {
         for request in transfers { activeTransfers[request.identity] = .init(request: request, batch: batch) }
         let windowRevision = beginWindowRead(transfers)
         let layouts = activeLayouts
+        let requestedLayout = layoutRevision
         let readMemberships = readMemberships
         let readSnapshot = readSnapshot
         let cancellation = OperationCancellation()
         transferReads[batch] = work.launch(priority: .userInitiated) { [weak self] generation in
-            let sample = await AsyncWorkScope.performBlocking(cancellation: cancellation,
-                                                               resourceOperation: "spaces.store.transfer-read") {
+            let sample = await AsyncWorkScope.performBlocking(cancellation: cancellation) {
                 Self.sampleMemberships(transfers, layouts: layouts, cancellation: cancellation,
                                        readMemberships: readMemberships, readSnapshot: readSnapshot)
             }
@@ -369,22 +426,19 @@ final class TaskbarSpaceStore: ObservableObject {
                     current.contains($0.identity) &&
                         Self.effectiveLayout(for: $0, in: liveLayouts) == Self.effectiveLayout(for: $0, in: observation.layouts)
                 }, attachedDisplays: self.attachedDisplays)
-                #if DEBUG
-                if eligible.count != transfers.count {
-                    self.logger.debug("transfer-discarded batch=\(batch) requested=\(transfers.count) current=\(eligible.count)")
-                }
-                #endif
                 guard !eligible.isEmpty else { return }
                 let accepted = Set(eligible.map(\.identity))
                 let relevant = WindowSpaceSnapshot(layouts: liveLayouts,
                     memberships: observation.memberships.filter { accepted.contains($0.key) })
                 if self.readLayouts == nil { self.acceptLayouts(liveLayouts) }
-                self.publish(self.snapshot.updating(with: relevant, requests: self.liveUtilityRequests(self.requests),
+                var updated = self.snapshot.updating(with: relevant, requests: self.liveUtilityRequests(self.requests),
                     afterSpaceChange: self.readLayouts != nil && self.snapshot.layouts.isEmpty,
-                    attachedDisplays: self.attachedDisplays, targetedTransferRead: true))
-                #if DEBUG
-                self.logger.notice("transfer-membership batch=\(batch) requested=\(eligible.count) matched=\(relevant.memberships.count)")
-                #endif
+                    attachedDisplays: self.attachedDisplays, targetedTransferRead: true)
+                if self.layoutRevision == requestedLayout {
+                    self.recordHeightMemberships(relevant, requested: eligible, windowRevision: windowRevision,
+                                                 layoutRevision: requestedLayout, into: &updated)
+                }
+                self.publish(updated)
             }
         }
     }
@@ -409,7 +463,7 @@ final class TaskbarSpaceStore: ObservableObject {
         let requestedRevision = layoutRevision
         let queue = layoutQueue
         work.launch(priority: .userInitiated) { [weak self] generation in
-            let result = await AsyncWorkScope.performBlocking(on: queue, resourceOperation: "spaces.store.layout-read") {
+            let result = await AsyncWorkScope.performBlocking(on: queue) {
                 readLayouts()
             }
             await MainActor.run { [weak self] in
@@ -417,10 +471,6 @@ final class TaskbarSpaceStore: ObservableObject {
                 self.layoutInFlight = false
                 if requestedRevision == self.layoutRevision, let result {
                     self.applyLayoutResult(result, source: source)
-                } else {
-                    #if DEBUG
-                    self.logger.debug("layout-superseded event=\(source.rawValue, privacy: .public) requested=\(requestedRevision) current=\(self.layoutRevision)")
-                    #endif
                 }
                 if let pending = self.nextLayoutSource {
                     self.nextLayoutSource = nil
@@ -433,6 +483,7 @@ final class TaskbarSpaceStore: ObservableObject {
     private func applyLayoutResult(_ result: Result<Layouts, SpaceReadFailure>, source: LayoutTrigger) {
         switch result {
         case let .failure(failure):
+            verifiedHeightFallbackLayout = nil
             if !activeLayouts.isEmpty {
                 spaceRevision &+= 1
                 minimumProjectionRevision = spaceRevision
@@ -440,6 +491,7 @@ final class TaskbarSpaceStore: ObservableObject {
                 invalidatedDisplays = Set(snapshot.layouts.keys)
                 cancelTransfers()
                 activeSpaceChange.send()
+                revokeHeightMemberships()
                 activeLayouts = [:]
             }
             report(failure, source: source.rawValue, reportToUser: true)
@@ -449,6 +501,9 @@ final class TaskbarSpaceStore: ObservableObject {
                 corroboratedSpaceRevision = spaceRevision
             }
             let changed = Set(prior.keys).union(layouts.keys).filter { prior[$0] != layouts[$0] }
+            if !layouts.isEmpty && (!changed.isEmpty || source.corroboratesLayout) {
+                verifiedHeightFallbackLayout = layoutRevision
+            }
             if !changed.isEmpty {
                 membershipRevision &+= 1
                 if !prior.isEmpty {
@@ -459,9 +514,6 @@ final class TaskbarSpaceStore: ObservableObject {
                 }
                 acceptLayouts(layouts)
             }
-            #if DEBUG
-            logger.debug("layout event=\(source.rawValue, privacy: .public) revision=\(self.spaceRevision) displays=\(layouts.count) changed=\(changed.count)")
-            #endif
             if !changed.isEmpty || confirmedSpaceRevision != spaceRevision {
                 let relevant = requests.filter { request in
                     request.displayUUID.map { changed.isEmpty || changed.contains($0) || changed.contains("Main") } ?? true
@@ -476,11 +528,13 @@ final class TaskbarSpaceStore: ObservableObject {
     private func acceptLayouts(_ layouts: Layouts) {
         let prior = activeLayouts
         guard prior != layouts else { return }
+        var next = snapshot
+        for request in requests where Self.effectiveLayout(for: request, in: prior)
+            != Self.effectiveLayout(for: request, in: layouts) {
+            next.heightMembershipStamps[request.identity] = nil
+        }
+        publish(next)
         activeLayouts = layouts
-        #if DEBUG
-        let values = layouts.values.map { "\($0.currentSpaceID):\($0.fullscreenSpaceIDs.contains($0.currentSpaceID) ? "fullscreen" : "desktop")" }.sorted().joined(separator: ",")
-        logger.notice("space-layout-confirmed revision=\(self.spaceRevision) current=\(values, privacy: .public)")
-        #endif
         let returned = Set(layouts.compactMap { display, current in
             guard let previous = prior[display], previous.fullscreenSpaceIDs.contains(previous.currentSpaceID),
                   !current.fullscreenSpaceIDs.contains(current.currentSpaceID) else { return nil as String? }
@@ -505,6 +559,7 @@ final class TaskbarSpaceStore: ObservableObject {
         let windowRevision = beginWindowRead(requested)
         let expectedLayouts = activeLayouts
         let requestedRevision = membershipRevision
+        let requestedLayout = layoutRevision
         let eventRevision = spaceRevision
         let readMemberships = readMemberships
         let readSnapshot = readSnapshot
@@ -512,8 +567,7 @@ final class TaskbarSpaceStore: ObservableObject {
         pendingMemberships.removeAll()
         let cancellation = OperationCancellation()
         work.launch { [weak self] generation in
-            let sampled = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation,
-                                                                resourceOperation: "spaces.store.membership-read") {
+            let sampled = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
                 Self.sampleMemberships(requested, layouts: expectedLayouts, cancellation: cancellation,
                                        readMemberships: readMemberships, readSnapshot: readSnapshot)
             }
@@ -523,13 +577,10 @@ final class TaskbarSpaceStore: ObservableObject {
                 if self.membershipRevision == requestedRevision {
                     let observation = self.acceptSample(sampled, source: "window-membership")
                     self.applyMembership(observation, requested: requested, windowRevision: windowRevision,
-                                         eventRevision: eventRevision)
+                                         eventRevision: eventRevision, requestedLayout: requestedLayout)
                 } else {
                     self.pendingMemberships.formUnion(requested.lazy.map(\.identity))
                     self.needsMembershipRead = true
-                    #if DEBUG
-                    self.logger.debug("membership-superseded requested=\(requestedRevision) current=\(self.membershipRevision)")
-                    #endif
                 }
                 self.beginMembership()
             }
@@ -537,53 +588,38 @@ final class TaskbarSpaceStore: ObservableObject {
     }
 
     private func applyMembership(_ observation: WindowSpaceSnapshot?, requested: [WindowSpaceRequest], windowRevision: UInt64,
-                                 eventRevision: UInt64) {
+                                 eventRevision: UInt64, requestedLayout: UInt64) {
         guard let observation, !observation.layouts.isEmpty else { return }
         let changed = confirmedSpaceRevision != eventRevision
         let priorLayouts = snapshot.layouts
         if changed, invalidatedDisplays.isEmpty { invalidatedDisplays = Set(observation.layouts.keys) }
         let unchangedWithoutEvidence = changed && observation.layouts == priorLayouts &&
             confirmedSpaceRevision >= minimumProjectionRevision && corroboratedSpaceRevision != eventRevision
-        #if DEBUG
-        if unchangedWithoutEvidence {
-            logger.debug("space-unconfirmed unchanged-layout revision=\(eventRevision)")
-        }
-        #endif
         let stillCurrent = currentIdentities(requested, windowRevision: windowRevision).subtracting(pendingMemberships)
-        #if DEBUG
-        if stillCurrent.count != requested.count {
-            logger.debug("membership-discarded revision=\(windowRevision) requested=\(requested.count) current=\(stillCurrent.count)")
-        }
-        #endif
         let relevant = WindowSpaceSnapshot(layouts: observation.layouts,
             memberships: observation.memberships.filter { stillCurrent.contains($0.key) })
-        if readLayouts == nil { acceptLayouts(observation.layouts) }
-        let updated = snapshot.updating(with: relevant, requests: liveUtilityRequests(requests),
-            afterSpaceChange: changed || (readLayouts != nil && priorLayouts.isEmpty), attachedDisplays: attachedDisplays)
-        #if DEBUG
-        if snapshot != updated {
-            logger.notice("window-membership-changed revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count)")
+        if readLayouts == nil {
+            if !unchangedWithoutEvidence, requestedLayout == layoutRevision, eventRevision == spaceRevision {
+                verifiedHeightFallbackLayout = requestedLayout
+            }
+            acceptLayouts(observation.layouts)
         }
-        #endif
+        var updated = snapshot.updating(with: relevant, requests: liveUtilityRequests(requests),
+            afterSpaceChange: changed || (readLayouts != nil && priorLayouts.isEmpty), attachedDisplays: attachedDisplays)
+        if requestedLayout == layoutRevision && eventRevision == spaceRevision {
+            recordHeightMemberships(relevant, requested: requested.filter { stillCurrent.contains($0.identity) },
+                                    windowRevision: windowRevision, layoutRevision: requestedLayout, into: &updated)
+        }
         publish(updated)
         if changed && !unchangedWithoutEvidence { confirmedSpaceRevision = eventRevision }
-        #if DEBUG
-        logger.debug("membership revision=\(eventRevision) requested=\(requested.count) confirmed=\(relevant.memberships.count)")
-        #endif
     }
 
     private func report(_ failure: SpaceReadFailure, source: String, reportToUser: Bool) {
         guard !failure.isInterruption else {
-            #if DEBUG
-            logger.debug("space-read-interrupted event=\(source, privacy: .public) reason=\(failure.reason.rawValue, privacy: .public)")
-            #endif
             return
         }
         let detail = failure.description
         let code = failure.diagnosticCode
-        #if DEBUG
-        logger.error("compatibility code=\(code, privacy: .public) event=\(source, privacy: .public) revision=\(self.spaceRevision) detail=\(detail, privacy: .public)")
-        #endif
         if reportToUser, reportedFailures.insert(code).inserted {
             onCompatibilityFailure?(code, "\(detail) [\(source), revision=\(spaceRevision)]")
         }
@@ -600,14 +636,10 @@ final class TaskbarSpaceStore: ObservableObject {
 
     private func publish(_ next: WindowSpaceSnapshot) {
         guard snapshot != next else { return }
-        #if DEBUG
-        let resources = ActionResourceLog.begin("spaces.publish")
-        defer { resources?.finish() }
-        #endif
         snapshot = next
     }
 
-    #if DEBUG
+    #if DESKMOTE_TEST
     var pendingWorkForTesting: [Task<Void, Never>] { work.pendingForTesting }
     #endif
 

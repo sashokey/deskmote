@@ -27,6 +27,7 @@ final class AppWindowObserver {
         }
     }
     private var cleanupSession: CleanupSession?
+    private let accessibilityAccess: RuntimeAccessibilityAccess
     private let makeSession: Factory
     private let queue = DispatchQueue(label: "io.github.sashokey.deskmote.window-subscriptions", qos: .utility)
     private let work = AsyncWorkScope()
@@ -61,9 +62,8 @@ final class AppWindowObserver {
     var onFocusedWindowChanged: ((pid_t) -> Void)?
     var onTitleChanged: ((pid_t, CGWindowID) -> Void)?
     var onWindowMoved: ((pid_t, CGWindowID, AXElementKey) -> Void)?
-    #if DEBUG
-    var onSubscriptionDestroyNotified: ((pid_t, CGWindowID, UInt64?) -> Void)?
-    var onSubscriptionAttempt: ((WindowSubscriptionAttemptReport) -> Void)?
+    #if DESKMOTE_TEST
+    var onSubscriptionAttempt: ((CGWindowID, Bool) -> Void)?
     #endif
 
     enum Registration {
@@ -77,13 +77,12 @@ final class AppWindowObserver {
         kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification
     ]
     private static let geometryNotifications = [kAXWindowMovedNotification, kAXWindowResizedNotification]
-    #if DEBUG
-    private static let dropsDestroyNotifications = DebugSwitch.simulateNoDestroy.isEnabled()
-    #endif
 
-    init(pid: pid_t, clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+    init(pid: pid_t, accessibilityAccess: RuntimeAccessibilityAccess = .shared,
+         clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          makeSession: @escaping Factory = { AXWindowObservationSession(pid: $0, receive: $1) }) {
         self.pid = pid
+        self.accessibilityAccess = accessibilityAccess
         self.clock = clock
         self.makeSession = makeSession
     }
@@ -102,6 +101,9 @@ final class AppWindowObserver {
     }
 
     func start() {
+        let access = accessibilityAccess
+        let axGeneration = access.trustGeneration
+        guard access.acceptsResult(for: axGeneration) else { return }
         if !isRunning {
             isRunning = true
             work.restart()
@@ -120,7 +122,7 @@ final class AppWindowObserver {
         let generation = work.generation
         let receive: @Sendable (AXElementKey, String) -> Void = { [weak self] element, name in
             Task { @MainActor [weak self] in
-                guard let self, self.work.isCurrent(generation) else { return }
+                guard let self, self.work.isCurrent(generation), access.acceptsResult(for: axGeneration) else { return }
                 self.handleNotification(element: element.e, notification: name)
             }
         }
@@ -130,13 +132,14 @@ final class AppWindowObserver {
                 let session = currentSession ?? makeSession(pid, receive)
                 var results: [String: AXError] = [:]
                 for notification in required {
-                    guard !cancellation.isCancelled else { break }
+                    guard !cancellation.isCancelled, access.acceptsResult(for: axGeneration) else { break }
                     if let session { results[notification] = session.add(notification, element: nil) }
                 }
                 return ApplicationAttemptResult(session: session, results: results)
             }
             let pendingRegistrations = await MainActor.run { [weak self] () -> [Task<Void, Never>] in
-                guard let self, self.work.isCurrent(generation), let created else { return [] }
+                guard let self, self.work.isCurrent(generation), access.acceptsResult(for: axGeneration),
+                      let created else { return [] }
                 let wasReady = self.canReceiveWindowCreated
                 for (notification, result) in created.results {
                     self.recordApplicationRegistration(notification, result: result)
@@ -145,6 +148,10 @@ final class AppWindowObserver {
                     self.session = session
                     self.cleanupSession = CleanupSession(session: session)
                     session.attach()
+                    guard access.acceptsResult(for: axGeneration) else {
+                        self.stop()
+                        return []
+                    }
                     let windows = self.waitingWindows
                     self.waitingWindows.removeAll()
                     for (id, key) in windows { _ = self.registerWindow(key.e, cgWindowID: id) }
@@ -162,7 +169,7 @@ final class AppWindowObserver {
                 geometryResults = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
                     var results: [String: AXError] = [:]
                     for notification in geometry {
-                        guard !cancellation.isCancelled else { break }
+                        guard !cancellation.isCancelled, access.acceptsResult(for: axGeneration) else { break }
                         results[notification] = session.add(notification, element: nil)
                     }
                     return results
@@ -173,6 +180,7 @@ final class AppWindowObserver {
             await MainActor.run { [weak self] in
                 guard let self, self.work.isCurrent(generation) else { return }
                 self.isStarting = false
+                guard access.acceptsResult(for: axGeneration) else { return }
                 if !geometryResults.isEmpty {
                     self.movementAttempts += 1
                     for (notification, result) in geometryResults {
@@ -219,6 +227,7 @@ final class AppWindowObserver {
     }
 
     func registerWindow(_ element: AXUIElement, cgWindowID: CGWindowID) -> Registration {
+        guard accessibilityAccess.allowsCalls else { return .none }
         let key = AXElementKey(e: element)
         guard session != nil else {
             if isRunning {
@@ -242,14 +251,14 @@ final class AppWindowObserver {
     }
 
     func isRetryValid(_ candidate: WindowSubscriptionRetryCandidate<AXElementKey>) -> Bool {
-        guard session != nil, inFlight[candidate.element] == nil, candidate.pid == pid else { return false }
+        guard accessibilityAccess.allowsCalls, session != nil, inFlight[candidate.element] == nil,
+              candidate.pid == pid else { return false }
         return subscriptions.attemptKind(cgWindowID: candidate.cgWindowID, element: candidate.element, now: clock()) == .retry
     }
 
-    func performRetry(_ candidate: WindowSubscriptionRetryCandidate<AXElementKey>,
-                      completion: (@MainActor @Sendable (WindowSubscriptionAttemptReport) -> Void)? = nil) {
+    func performRetry(_ candidate: WindowSubscriptionRetryCandidate<AXElementKey>) {
         guard isRetryValid(candidate) else { return }
-        schedule(key: candidate.element, cgWindowID: candidate.cgWindowID, kind: .retry, completion: completion)
+        schedule(key: candidate.element, cgWindowID: candidate.cgWindowID, kind: .retry)
     }
 
     func isCovered(cgWindowID: CGWindowID) -> Bool { subscriptions.isCovered(cgWindowID: cgWindowID) }
@@ -315,14 +324,9 @@ final class AppWindowObserver {
     private struct AttemptResult: Sendable {
         let results: [WindowSubscriptionItem: AXError]
         let sawFailure: Bool
-        #if DEBUG
-        let stop: WindowSubscriptionStop
-        let duration: TimeInterval
-        #endif
     }
 
-    private func schedule(key: AXElementKey, cgWindowID: CGWindowID, kind: WindowSubscriptionAttemptKind,
-                          completion: (@MainActor @Sendable (WindowSubscriptionAttemptReport) -> Void)? = nil) {
+    private func schedule(key: AXElementKey, cgWindowID: CGWindowID, kind: WindowSubscriptionAttemptKind) {
         guard let session else { return }
         if let old = subscriptions.record(for: cgWindowID), old.element != key { retire(old.element) }
         cleanupSession?.pending.withLock { $0 = $0.filter { $0.value.element != key } }
@@ -332,39 +336,26 @@ final class AppWindowObserver {
         inFlight[key] = registration
         let queue = queue
         let clock = clock
-        #if DEBUG
-        let finish: @MainActor @Sendable (WindowSubscriptionAttemptReport) -> Void = completion ?? { [weak self] in self?.onSubscriptionAttempt?($0) }
-        #endif
         let cancellation = registration.cancellation
+        let access = accessibilityAccess
+        let axGeneration = access.trustGeneration
         let task = work.launch { [weak self] generation in
             let result = await AsyncWorkScope.performBlocking(on: queue, cancellation: cancellation) {
                 let start = clock()
                 var results: [WindowSubscriptionItem: AXError] = [:]
                 var sawTimeout = false
                 var sawFailure = false
-                #if DEBUG
-                var stop: WindowSubscriptionStop = .completed
-                #endif
                 attempt: for (index, item) in begun.items.enumerated() {
-                    guard !cancellation.isCancelled else { break }
+                    guard !cancellation.isCancelled, access.acceptsResult(for: axGeneration) else { break }
                     switch WindowSubscriptionAttemptPolicy.step(item: item, index: index, sawTimeout: sawTimeout,
                         elapsed: clock() - start, timeLimit: kind == .retry ? Self.retryTimeLimit : nil) {
                     case .send: break
                     case .skip: continue attempt
-                    #if DEBUG
-                    case .stop(let reason):
-                        if let reason { stop = reason }
-                        break attempt
-                    #else
                     case .stop: break attempt
-                    #endif
                     }
                     let result = session.add(item.notificationName, element: key)
                     results[item] = result
                     if result == .invalidUIElement {
-                        #if DEBUG
-                        stop = .dead
-                        #endif
                         break
                     }
                     if result == .cannotComplete { sawTimeout = true }
@@ -373,12 +364,7 @@ final class AppWindowObserver {
                     default: sawFailure = true
                     }
                 }
-                #if DEBUG
-                if stop == .completed, sawTimeout { stop = .timeoutSkippedRest }
-                return AttemptResult(results: results, sawFailure: sawFailure, stop: stop, duration: clock() - start)
-                #else
                 return AttemptResult(results: results, sawFailure: sawFailure)
-                #endif
             }
             guard let result else { return }
             await MainActor.run { [weak self] in
@@ -386,19 +372,18 @@ final class AppWindowObserver {
                       let cgWindowID = self.subscriptions.cgWindowID(forElement: key),
                       self.subscriptions.record(for: cgWindowID)?.instanceID == begun.instanceID else { return }
                 self.inFlight[key] = nil
+                guard access.acceptsResult(for: axGeneration) else { return }
                 for (item, error) in result.results { self.subscriptions.record(cgWindowID: cgWindowID, item: item, result: error) }
                 self.subscriptions.finishAttempt(cgWindowID: cgWindowID, now: clock(), sawFailure: result.sawFailure)
-                #if DEBUG
-                finish(WindowSubscriptionAttemptReport(pid: self.pid, cgWindowID: cgWindowID, kind: kind,
-                    instanceID: begun.instanceID, previousInstanceID: begun.previousInstanceID, results: result.results,
-                    stop: result.stop, covered: self.subscriptions.isCovered(cgWindowID: cgWindowID), durationMs: result.duration * 1_000))
+                #if DESKMOTE_TEST
+                self.onSubscriptionAttempt?(cgWindowID, self.subscriptions.isCovered(cgWindowID: cgWindowID))
                 #endif
             }
         }
         inFlight[key]?.task = task
     }
 
-    #if DEBUG
+    #if DESKMOTE_TEST
     var pendingWorkForTesting: [Task<Void, Never>] { work.pendingForTesting }
     #endif
 
@@ -409,17 +394,11 @@ final class AppWindowObserver {
                     || notifStr == (kAXMainWindowChangedNotification as String) {
             onFocusedWindowChanged?(pid)
         } else if notifStr == (kAXUIElementDestroyedNotification as String) {
-            #if DEBUG
-            if Self.dropsDestroyNotifications { return }
-            #endif
             let key = AXElementKey(e: element)
             if let hit = subscriptions.noteDestroyed(element: key) {
                 if hit.removedInstanceID != nil {
                     inFlight.removeValue(forKey: key)?.cancellation.cancel()
                 }
-                #if DEBUG
-                onSubscriptionDestroyNotified?(pid, hit.cgWindowID, hit.removedInstanceID)
-                #endif
                 if hit.removedInstanceID != nil { onWindowDestroyed?(pid, hit.cgWindowID, element) }
             }
         } else if notifStr == (kAXWindowMiniaturizedNotification as String) {
@@ -442,22 +421,6 @@ final class AppWindowObserver {
         }
     }
 }
-
-#if DEBUG
-struct WindowSubscriptionAttemptReport {
-    let pid: pid_t
-    let cgWindowID: CGWindowID
-    let kind: WindowSubscriptionAttemptKind
-    let instanceID: UInt64
-    let previousInstanceID: UInt64?
-    let results: [WindowSubscriptionItem: AXError]
-    let stop: WindowSubscriptionStop
-    let covered: Bool
-    let durationMs: Double
-}
-#else
-struct WindowSubscriptionAttemptReport {}
-#endif
 
 extension WindowSubscriptionItem {
     var notificationName: String {

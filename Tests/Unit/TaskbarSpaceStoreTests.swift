@@ -47,8 +47,276 @@ private final class VisibleUtilitySpaceWindow: NSWindow {
     override var windowNumber: Int { 749 }
 }
 
+private final class HeldStampMembership: Sendable {
+    let window: CGWindowID
+    let membership: Set<Int>
+    let entered = Mutex(false)
+    let timedOut = Mutex(false)
+    let release = DispatchSemaphore(value: 0)
+
+    init(window: CGWindowID, membership: Set<Int>) {
+        self.window = window
+        self.membership = membership
+    }
+
+    func wait() {
+        entered.withLock { $0 = true }
+        if release.wait(timeout: .now() + 4) == .timedOut {
+            timedOut.withLock { $0 = true }
+        }
+    }
+}
+
+private final class StampMembershipReader: Sendable {
+    let next = Mutex<HeldStampMembership?>(nil)
+
+    func sample(_ requests: [WindowSpaceRequest]) -> SpaceMembershipRead {
+        let reading = next.withLock { pending -> HeldStampMembership? in
+            guard let read = pending, requests.contains(where: { $0.identity.windowID == read.window }) else {
+                return nil
+            }
+            pending = nil
+            return read
+        }
+        reading?.wait()
+        let memberships = requests.map { request in
+            let spaces: Set<Int>
+            if let reading, request.identity.windowID == reading.window { spaces = reading.membership }
+            else { spaces = request.displayUUID == "right" ? [10] : [1] }
+            return (request.identity, spaces)
+        }
+        return SpaceMembershipRead(memberships: Dictionary(uniqueKeysWithValues: memberships), failures: [])
+    }
+}
+
+@MainActor
+private final class StampPanelFixture {
+    final class Clock {
+        var reads = 0
+        var now: TimeInterval = 1
+    }
+
+    let clock: Clock
+    let ordering: StripOrderStore
+    let view = TaskbarView(frame: CGRect(x: 0, y: 0, width: 800, height: 32))
+    private let presenter: TaskbarPresenter
+    private let domain: String
+    private let defaults: UserDefaults
+
+    init(runtime: AppRuntime, store: TaskbarSpaceStore, topology: DisplayTopologyStore, display: String?,
+         applicationName: @escaping @MainActor (StripItem) -> String) throws {
+        let domain = "DeskMote.StampPanelTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        self.domain = domain
+        self.defaults = defaults
+        let clock = Clock()
+        self.clock = clock
+        ordering = StripOrderStore(defaults: defaults, elapsed: {
+            clock.reads += 1
+            return clock.now
+        })
+        presenter = TaskbarPresenter(view: view, runtime: runtime, ordering: ordering, topology: topology, spaces: store,
+                                     displayUUID: display, backgroundMenu: { _, _ in },
+                                     contextMenuVisibilityChanged: { _ in }, applicationName: applicationName)
+    }
+
+    var windows: [TaskbarWindowPresentation] { view.taskbarContent.groups.flatMap(\.windows) }
+
+    func removeDefaults() { defaults.removePersistentDomain(forName: domain) }
+}
+
+@MainActor
+private final class StampRefreshFixture {
+    let inventory: SpaceInventory
+    let runtime: AppRuntime
+    let store: TaskbarSpaceStore
+    let panels: [StampPanelFixture]
+    private let invalidations = PassthroughSubject<CGWindowID, Never>()
+    private let membershipReader = StampMembershipReader()
+    private var outstandingRead: HeldStampMembership?
+    private(set) var snapshotBeforeInvalidation = WindowSpaceSnapshot()
+
+    init(snapshot: DockSnapshot, twoDisplays: Bool = false,
+         applicationName: @escaping @MainActor (StripItem) -> String = { _ in "Resolved fixture" }) throws {
+        inventory = SpaceInventory(snapshot)
+        runtime = AppRuntime(tracker: inventory, actionExecutor: SpaceActionRecorder())
+        let left = SpaceLayoutSnapshot(orderedSpaceIDs: [1, 2], fullscreenSpaceIDs: [], currentSpaceID: 1)
+        let right = SpaceLayoutSnapshot(orderedSpaceIDs: [10, 11], fullscreenSpaceIDs: [], currentSpaceID: 10)
+        let layouts = twoDisplays ? ["left": left, "right": right] : ["left": left]
+        let reader = membershipReader
+        store = TaskbarSpaceStore(notifications: NotificationCenter(), readLayouts: { .success(layouts) },
+                                 readMemberships: { requests, _, _ in .success(reader.sample(requests)) })
+        let leftDisplay = WindowDisplayAttribution.Display(uuid: "left",
+            cgFrame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        let rightDisplay = WindowDisplayAttribution.Display(uuid: "right",
+            cgFrame: CGRect(x: 800, y: 0, width: 800, height: 600))
+        let topology = DisplayTopologyStore(initialSnapshot: .init(physicalDisplayCount: layouts.count,
+            identifiedDisplayUUIDs: layouts.keys.sorted(), attributionTable: .init(
+                displays: twoDisplays ? [leftDisplay, rightDisplay] : [leftDisplay], primaryUUID: "left")))
+        let displays: [String?] = twoDisplays ? ["left", "right"] : [nil]
+        let runtime = self.runtime
+        let store = self.store
+        panels = try displays.map {
+            try StampPanelFixture(runtime: runtime, store: store, topology: topology, display: $0,
+                                  applicationName: applicationName)
+        }
+        runtime.start()
+        store.start(snapshots: runtime.$snapshot.eraseToAnyPublisher(),
+                    utilityOnActiveSpace: { [weak runtime] id in runtime?.utilityWindowOnActiveSpace(id) },
+                    windowInvalidations: invalidations.eraseToAnyPublisher())
+    }
+
+    func invalidate(_ identity: WindowSpaceIdentity, membership: Set<Int> = [1]) -> HeldStampMembership {
+        let read = HeldStampMembership(window: identity.windowID, membership: membership)
+        snapshotBeforeInvalidation = store.snapshot
+        outstandingRead = read
+        membershipReader.next.withLock { $0 = read }
+        invalidations.send(identity.windowID)
+        return read
+    }
+
+    func stop() {
+        outstandingRead?.release.signal()
+        store.stop()
+        runtime.stop()
+        for panel in panels { panel.removeDefaults() }
+    }
+}
+
 @MainActor
 final class TaskbarSpaceStoreTests: XCTestCase {
+    func testHeightStampChangesDoNotPrepareEitherTaskbar() async throws {
+        let (snapshot, identity) = try stampInventory()
+        let fixture = try StampRefreshFixture(snapshot: snapshot, twoDisplays: true)
+        defer { fixture.stop() }
+        await settleStampFixture(fixture, identity: identity)
+        let id = identity.itemID
+        XCTAssertTrue(fixture.panels[0].windows.contains { $0.id == id })
+        XCTAssertFalse(fixture.panels[1].windows.contains { $0.id == id })
+        let initialReads = fixture.panels.map { $0.clock.reads }
+        let same = fixture.invalidate(identity)
+        await assertOnlyStampRemoved(fixture, identity: identity, read: same)
+        XCTAssertEqual(fixture.panels.map { $0.clock.reads }, initialReads, "Removing a stamp prepared the panels")
+        await finishStampRead(fixture, read: same)
+        XCTAssertEqual(fixture.store.confirmedDesktopMembership(for: identity, on: "left"), true)
+        XCTAssertEqual(fixture.panels.map { $0.clock.reads }, initialReads, "Renewing a stamp prepared the panels")
+
+        let changed = fixture.invalidate(identity, membership: [2])
+        await assertOnlyStampRemoved(fixture, identity: identity, read: changed)
+        await finishStampRead(fixture, read: changed)
+        XCTAssertEqual(fixture.store.confirmedDesktopMembership(for: identity, on: "left"), false)
+        for (panel, initial) in zip(fixture.panels, initialReads) {
+            XCTAssertGreaterThan(panel.clock.reads, initial)
+            XCTAssertFalse(panel.windows.contains { $0.id == id })
+        }
+    }
+
+    func testLateUtilityVisibilityRefreshesOnAnExternalHeightStampChange() async throws {
+        let (snapshot, identity) = try stampInventory()
+        let fixture = try StampRefreshFixture(snapshot: snapshot)
+        defer { fixture.stop() }
+        let window = VisibleUtilitySpaceWindow(contentRect: CGRect(x: 10, y: 10, width: 200, height: 120),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "Utility"
+        fixture.runtime.registerUtilityWindow(window)
+        await waitUntil { fixture.panels[0].windows.contains { $0.title == "Utility" } }
+        await settleStampFixture(fixture, identity: identity)
+
+        window.activeSpace = false
+        let read = fixture.invalidate(identity)
+        await assertOnlyStampRemoved(fixture, identity: identity, read: read)
+        XCTAssertFalse(fixture.panels[0].windows.contains { $0.title == "Utility" })
+        await finishStampRead(fixture, read: read)
+    }
+
+    func testExternalNameRecoveryRefreshesOnAnExternalHeightStampChange() async throws {
+        var (snapshot, identity) = try stampInventory()
+        let target = identity.actionIdentity.windowID
+        snapshot.windows[target]?.title = ""
+        let bundleID = try XCTUnwrap(snapshot.windows[target]?.bundleIdentifier)
+        let name = Mutex(bundleID)
+        let fixture = try StampRefreshFixture(snapshot: snapshot, applicationName: { item in
+            item.id == identity.itemID ? name.withLock { $0 } : "Resolved other fixture"
+        })
+        defer { fixture.stop() }
+        await settleStampFixture(fixture, identity: identity)
+        func title() -> String? { fixture.panels[0].windows.first { $0.id == identity.itemID }?.title }
+        XCTAssertEqual(title(), bundleID)
+
+        name.withLock { $0 = "Recovered" }
+        let recovery = fixture.invalidate(identity)
+        await assertOnlyStampRemoved(fixture, identity: identity, read: recovery)
+        XCTAssertEqual(title(), "Recovered")
+        await finishStampRead(fixture, read: recovery)
+        XCTAssertEqual(fixture.store.confirmedDesktopMembership(for: identity, on: "left"), true)
+
+        name.withLock { $0 = "Renamed" }
+        AppDisplayNameResolver.invalidateDisplayName(for: bundleID)
+        let rename = fixture.invalidate(identity)
+        await assertOnlyStampRemoved(fixture, identity: identity, read: rename)
+        XCTAssertEqual(title(), "Renamed")
+        await finishStampRead(fixture, read: rename)
+    }
+
+    func testExpiredOrderRankIsRemovedOnAnExternalHeightStampChange() async throws {
+        var (snapshot, identity) = try stampInventory()
+        let retired = try XCTUnwrap(snapshot.orderedWindowIDs.last)
+        let fixture = try StampRefreshFixture(snapshot: snapshot)
+        defer { fixture.stop() }
+        let panel = fixture.panels[0]
+        await settleStampFixture(fixture, identity: identity)
+        XCTAssertTrue(panel.windows.contains { $0.id == retired.rawValue })
+        snapshot.windows.removeValue(forKey: retired)
+        snapshot.orderedWindowIDs.removeAll { $0 == retired }
+        fixture.inventory.values.send(snapshot)
+        await waitUntil { !panel.windows.contains { $0.id == retired.rawValue } }
+        await settleStampFixture(fixture, identity: identity)
+        XCTAssertTrue(panel.ordering.liveOrder.contains(retired.rawValue))
+
+        panel.clock.now += 6
+        let read = fixture.invalidate(identity)
+        await assertOnlyStampRemoved(fixture, identity: identity, read: read)
+        XCTAssertFalse(panel.ordering.liveOrder.contains(retired.rawValue))
+        await finishStampRead(fixture, read: read)
+    }
+
+    private func stampInventory() throws -> (DockSnapshot, WindowSpaceIdentity) {
+        var snapshot = inventory()
+        let first = try XCTUnwrap(snapshot.orderedWindowIDs.first)
+        snapshot.windows[first]?.isOnDesktop = true
+        let record = try XCTUnwrap(snapshot.windows[first])
+        return (snapshot, try XCTUnwrap(WindowSpaceIdentity(record.actionIdentity)))
+    }
+
+    private func settleStampFixture(_ fixture: StampRefreshFixture, identity: WindowSpaceIdentity) async {
+        await waitUntil { fixture.store.confirmedDesktopMembership(for: identity, on: "left") == true }
+        for task in fixture.store.pendingWorkForTesting { await task.value }
+        await flushSnapshotDelivery()
+        await flushSnapshotDelivery()
+    }
+
+    private func assertOnlyStampRemoved(_ fixture: StampRefreshFixture, identity: WindowSpaceIdentity,
+                                        read: HeldStampMembership) async {
+        var before = fixture.snapshotBeforeInvalidation
+        XCTAssertNotNil(before.heightMembershipStamps[identity])
+        await waitUntil { read.entered.withLock { $0 } }
+        await flushSnapshotDelivery()
+        var invalidated = fixture.store.snapshot
+        XCTAssertNil(invalidated.heightMembershipStamps[identity])
+        XCTAssertNil(fixture.store.confirmedDesktopMembership(for: identity, on: "left"))
+        before.heightMembershipStamps = [:]
+        invalidated.heightMembershipStamps = [:]
+        XCTAssertEqual(before, invalidated)
+    }
+
+    private func finishStampRead(_ fixture: StampRefreshFixture, read: HeldStampMembership) async {
+        read.release.signal()
+        for task in fixture.store.pendingWorkForTesting { await task.value }
+        await flushSnapshotDelivery()
+        await flushSnapshotDelivery()
+        XCTAssertFalse(read.timedOut.withLock { $0 })
+    }
+
     func testCompatibilityNoticeIncludesAPIEventAndRevisionAndRecoversOnNextEvent() async {
         let center = NotificationCenter()
         let future = Mutex(true)
@@ -676,6 +944,36 @@ final class TaskbarSpaceStoreTests: XCTestCase {
         XCTAssertTrue(store.canUseProjection(on: "left", renderedSpaceRevision: store.confirmedSpaceRevision))
     }
 
+    func testFallbackDesktopDoesNotRequireInventoryMembership() async {
+        let center = NotificationCenter()
+        let desktop = Mutex(1)
+        let membershipRequests = Mutex(0)
+        let store = TaskbarSpaceStore(notifications: center, readLayouts: {
+            .success(["left": .init(orderedSpaceIDs: [1, 2], fullscreenSpaceIDs: [],
+                                    currentSpaceID: desktop.withLock { $0 })])
+        }, readMemberships: { requests, _, _ in
+            membershipRequests.withLock { $0 += requests.count }
+            return .success(.init(memberships: [:], failures: []))
+        })
+        defer { store.stop() }
+        store.start(snapshots: Just(inventory()).eraseToAnyPublisher())
+        await waitUntil { store.activeLayouts["left"]?.currentSpaceID == 1 && membershipRequests.withLock { $0 } > 0 }
+        for task in store.pendingWorkForTesting { await task.value }
+        XCTAssertTrue(store.snapshot.memberships.isEmpty)
+        XCTAssertFalse(store.canUseProjection(on: "left", renderedSpaceRevision: store.confirmedSpaceRevision))
+        XCTAssertEqual(store.heightFallbackDesktop(on: "left"), 1)
+
+        center.post(name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        XCTAssertNil(store.heightFallbackDesktop(on: "left"))
+        for task in store.pendingWorkForTesting { await task.value }
+        XCTAssertNil(store.heightFallbackDesktop(on: "left"))
+        desktop.withLock { $0 = 2 }
+        store.refresh()
+        await waitUntil { store.activeLayouts["left"]?.currentSpaceID == 2 }
+        for task in store.pendingWorkForTesting { await task.value }
+        XCTAssertEqual(store.heightFallbackDesktop(on: "left"), 2)
+    }
+
     func testPartialReadAfterSpaceChangeCannotProjectOrActOnStaleMembership() async throws {
         let source = inventory()
         let first = WindowID(rawValue: "window-1")
@@ -1069,6 +1367,42 @@ final class TaskbarSpaceStoreTests: XCTestCase {
         XCTAssertEqual(store.snapshot.memberships[identity], [1])
         XCTAssertTrue(store.snapshot.shows(identity, on: "left"))
         XCTAssertFalse(store.snapshot.shows(identity, on: "right"))
+    }
+
+    func testHeightUsesRawMembershipAfterAConfirmedDisplayTransfer() async throws {
+        var initial = inventory()
+        let id = try XCTUnwrap(initial.orderedWindowIDs.first)
+        initial.windows[id]?.isOnDesktop = true
+        let record = try XCTUnwrap(initial.windows[id])
+        let identity = try XCTUnwrap(WindowSpaceIdentity(record.actionIdentity))
+        let snapshots = CurrentValueSubject<DockSnapshot, Never>(initial)
+        let invalidations = PassthroughSubject<CGWindowID, Never>()
+        let rightMembership = Mutex(10)
+        let ordinaryReads = Mutex(0)
+        let layouts = twoDisplayLayouts
+        let store = TaskbarSpaceStore(notifications: NotificationCenter(), readLayouts: { .success(layouts) },
+            readMemberships: { requests, _, _ in
+                let right = rightMembership.withLock { $0 }
+                if right == 1 && requests.contains(where: { $0.identity == identity }) {
+                    ordinaryReads.withLock { $0 += 1 }
+                }
+                return .success(.init(memberships: Dictionary(uniqueKeysWithValues: requests.map {
+                    ($0.identity, [$0.displayUUID == "right" ? right : 1])
+                }), failures: []))
+            })
+        store.start(snapshots: snapshots.eraseToAnyPublisher(), windowInvalidations: invalidations.eraseToAnyPublisher())
+        defer { store.stop() }
+        await waitUntil { store.confirmedDesktopMembership(for: identity, on: "left") == true }
+
+        initial.windows[id]?.displayUUID = "right"
+        snapshots.send(initial)
+        await waitUntil { store.confirmedDesktopMembership(for: identity, on: "right") == true }
+        rightMembership.withLock { $0 = 1 }
+        invalidations.send(identity.windowID)
+        await waitUntil { ordinaryReads.withLock { $0 } == 1 }
+        for task in store.pendingWorkForTesting { await task.value }
+        XCTAssertEqual(store.snapshot.memberships[identity], [10])
+        XCTAssertEqual(store.confirmedDesktopMembership(for: identity, on: "right"), false)
     }
 
     func testOrdinaryReadCannotOverwriteMembershipAfterARoundTripTransfer() async throws {

@@ -39,12 +39,12 @@ final class DiagnosticEligibilityTests: XCTestCase {
         }
     }
 
-    func testDevelopmentAppIsExcludedFromTrackingAndHelperOwnership() {
-        let identifier = "io.github.sashokey.deskmote.dev"
+    func testDeskMoteIsExcludedFromTrackingAndHelperOwnership() {
+        let identifier = ApplicationIdentity.properWMIdentifier
         XCTAssertEqual(policy.decisionFromEvidence(candidate(bid: identifier)), .selfApp)
         let app = AppTrackerWindowEligibility.Application(
-            bundleIdentifier: identifier, appName: "DeskMote Dev", activationPolicy: .accessory,
-            executablePath: nil, bundleURL: URL(fileURLWithPath: "/Applications/DeskMote Dev.app")
+            bundleIdentifier: identifier, appName: "DeskMote", activationPolicy: .accessory,
+            executablePath: nil, bundleURL: URL(fileURLWithPath: "/Applications/DeskMote.app")
         )
         XCTAssertFalse(app.canOwnTaskbarWindows)
         XCTAssertFalse(app.isEmbeddedHelper)
@@ -128,32 +128,10 @@ final class DiagnosticAdmissionTests: XCTestCase {
         }
         _ = tracker.reconcileFixtureForTesting(pid: 4242,
             cgSnapshot: .init(allWindowIDs: [7, 9], onScreenWindowIDs: [7, 9], windowIDsByPID: [4242: [7, 9]],
-                              alphaByWindowID: [7: 1, 9: 1]), now: now, eligible: snapshots, readOutcome: .success(count: 2))
+                              alphaByWindowID: [7: 1, 9: 1]), now: now, eligible: snapshots, readOutcome: .success)
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: 4242)?.windowsByID[7]?.createdAt, oldTime)
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: 4242)?.windowsByID[9]?.createdAt, now)
         tracker.stop()
     }
 
-    func testRealSeedScanAndLaunchRetryEntrancesRecordWithInventoryLogOff() async {
-        for source in ["seed", "scan", "launchRetry"] {
-            for unread in [false, true] {
-                let log = WindowInventoryAnomalyLog(configuration: .init(enabled: false,
-                    directoryURL: URL(fileURLWithPath: "/unused"), maxFileSize: 1024, archiveCount: 0))
-                XCTAssertFalse(log.isEnabled)
-                let tracker = AppTracker(inventoryLog: log, reader: DiagnosticFixtureReader(unread: unread),
-                    processProvider: DiagnosticFixtureProcess(), cgSnapshotProvider: { .failed }, onScreenWindowIDsProvider: { [] })
-                tracker.runAdmissionForTesting(source: source)
-                let pid = NSRunningApplication.current.processIdentifier
-                for _ in 0..<1_000 {
-                    if tracker.lastAdmissionVerdictByPID[pid] != nil { break }
-                    try? await Task.sleep(nanoseconds: 1_000_000)
-                }
-                XCTAssertEqual(tracker.lastAdmissionVerdictByPID[pid]?.source, source)
-                XCTAssertEqual(tracker.lastAdmissionVerdictByPID[pid]?.verdict, unread ? "skipUnread" : "skipNoEligible")
-                XCTAssertTrue(tracker.diagnosticApps().isEmpty)
-                tracker.stop()
-                XCTAssertTrue(tracker.lastAdmissionVerdictByPID.isEmpty)
-            }
-        }
-    }
 }

@@ -11,6 +11,17 @@ final class KeyboardMonitor {
         case unavailable
     }
 
+    @MainActor
+    private final class TapCallback {
+        weak var monitor: KeyboardMonitor?
+        let lifetime: Int
+
+        init(monitor: KeyboardMonitor, lifetime: Int) {
+            self.monitor = monitor
+            self.lifetime = lifetime
+        }
+    }
+
     typealias TapFactory = (
         CGEventTapLocation, CGEventTapPlacement, CGEventTapOptions,
         CGEventMask, CGEventTapCallBack, UnsafeMutableRawPointer?
@@ -25,13 +36,14 @@ final class KeyboardMonitor {
     private let onShortcut: () -> Void
     var onInterruption: ((State) -> Void)?
     private var tap: CFMachPort?
+    private var callbackContext: TapCallback?
     private var source: CFRunLoopSource?
     private var shortcut = ShortcutRecognizer()
     private var generation = 0
     private var tapLifetime = 0
 
     init(
-        hasPermission: @escaping () -> Bool = AXIsProcessTrusted,
+        hasPermission: @escaping () -> Bool,
         makeTap: @escaping TapFactory = CGEvent.tapCreate,
         enableTap: @escaping (CFMachPort, Bool) -> Void = CGEvent.tapEnable,
         isTapEnabled: @escaping (CFMachPort) -> Bool = CGEvent.tapIsEnabled,
@@ -67,25 +79,34 @@ final class KeyboardMonitor {
             .scrollWheel, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged
         ]
         let mask = events.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
-        guard let tap = makeTap(
-            .cgSessionEventTap, .tailAppendEventTap, .defaultTap, mask,
+        let context = TapCallback(monitor: self, lifetime: tapLifetime)
+        let created = makeTap(
+            .cgSessionEventTap, .tailAppendEventTap, .listenOnly, mask,
             { _, type, event, context in
                 if let context {
                     MainActor.assumeIsolated {
-                        let monitor = Unmanaged<KeyboardMonitor>.fromOpaque(context).takeUnretainedValue()
+                        let callback = Unmanaged<TapCallback>.fromOpaque(context).takeUnretainedValue()
+                        guard let monitor = callback.monitor, monitor.tapLifetime == callback.lifetime else { return }
                         monitor.receive(type, event: event)
                     }
                 }
                 return Unmanaged.passUnretained(event)
             },
-            Unmanaged.passUnretained(self).toOpaque()
-        ) else { return .unavailable }
-        guard let installedMask = installedMask(of: tap, excluding: existingIDs), installedMask & mask == mask,
+            Unmanaged.passUnretained(context).toOpaque()
+        )
+        guard let tap = created else { return hasPermission() ? .unavailable : .permissionRequired }
+        self.tap = tap
+        callbackContext = context
+        let installedMask = installedMask(of: tap, excluding: existingIDs)
+        guard hasPermission() else {
+            stop()
+            return .permissionRequired
+        }
+        guard let installedMask, installedMask & mask == mask,
               let source = CFMachPortCreateRunLoopSource(nil, tap, 0) else {
-            CFMachPortInvalidate(tap)
+            stop()
             return .unavailable
         }
-        self.tap = tap
         self.source = source
         let lifetime = tapLifetime
         guard TapInvalidation.observe(tap, notify: { [weak self] in
@@ -97,8 +118,12 @@ final class KeyboardMonitor {
             stop()
             return .unavailable
         }
-        sampleCurrentInput()
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        guard hasPermission() else {
+            stop()
+            return .permissionRequired
+        }
+        sampleCurrentInput()
         return .running
     }
 
@@ -110,15 +135,16 @@ final class KeyboardMonitor {
         if let source { CFRunLoopSourceInvalidate(source) }
         source = nil
         tap = nil
+        callbackContext = nil
     }
 
     private func receive(_ type: CGEventType, event: CGEvent) {
-        let receivedAt = DispatchTime.now().uptimeNanoseconds
+        guard let tap, checkPermission() else { return }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            guard let tap, checkPermission() else { return }
             recover(tap)
             return
         }
+        let receivedAt = DispatchTime.now().uptimeNanoseconds
         if shortcut.handle(
             type, flags: event.flags, keyCode: event.getIntegerValueField(.keyboardEventKeycode),
             mouseButton: event.getIntegerValueField(.mouseEventButtonNumber), eventTime: event.timestamp,
@@ -146,8 +172,16 @@ final class KeyboardMonitor {
     }
 
     private func recover(_ tap: CFMachPort) {
+        guard CFMachPortIsValid(tap) else {
+            stopForInterruption(.unavailable)
+            return
+        }
+        guard !isTapEnabled(tap) else { return }
         generation &+= 1
-        guard reenable(tap) else {
+        shortcut = ShortcutRecognizer()
+        enableTap(tap, true)
+        guard checkPermission() else { return }
+        guard CFMachPortIsValid(tap), isTapEnabled(tap) else {
             stopForInterruption(.unavailable)
             return
         }
@@ -160,17 +194,14 @@ final class KeyboardMonitor {
         shortcut.markInputSample(startedAt: startedAt, completedAt: DispatchTime.now().uptimeNanoseconds)
     }
 
-    private func reenable(_ tap: CFMachPort) -> Bool {
-        guard CFMachPortIsValid(tap) else { return false }
-        enableTap(tap, true)
-        return isTapEnabled(tap)
-    }
-
     private func installedMask(of tap: CFMachPort, excluding existingIDs: Set<UInt32>) -> CGEventMask? {
         guard CFMachPortIsValid(tap) else { return nil }
         if isTapEnabled(tap) { enableTap(tap, false) }
         guard !isTapEnabled(tap), let disabled = matchingTaps(excluding: existingIDs),
-              reenable(tap), let enabled = matchingTaps(excluding: existingIDs) else { return nil }
+              hasPermission(), CFMachPortIsValid(tap) else { return nil }
+        enableTap(tap, true)
+        guard CFMachPortIsValid(tap), isTapEnabled(tap),
+              let enabled = matchingTaps(excluding: existingIDs) else { return nil }
 
         let previouslyDisabled = Set(disabled.filter { !$0.enabled }.map(\.eventTapID))
         let activated = enabled.filter { $0.enabled && previouslyDisabled.contains($0.eventTapID) }
@@ -182,7 +213,7 @@ final class KeyboardMonitor {
         let process = getpid()
         return readTaps()?.filter {
             $0.tappingProcess == process && $0.processBeingTapped == 0 &&
-                $0.tapPoint == .cgSessionEventTap && $0.options == .defaultTap &&
+                $0.tapPoint == .cgSessionEventTap && $0.options == .listenOnly &&
                 !existingIDs.contains($0.eventTapID)
         }
     }

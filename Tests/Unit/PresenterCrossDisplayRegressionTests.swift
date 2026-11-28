@@ -45,11 +45,8 @@ private final class CrossDisplayContextMenu: TaskbarContextMenuPresenting {
 final class PresenterCrossDisplayRegressionTests: XCTestCase {
     func testHiddenPresenterDoesNotReloadButtonsForAnotherDisplaysTitleChanges() async {
         let inventory = CrossDisplayInventory(makeSnapshot(remoteTitleVersion: 0))
-        let log = WindowInventoryAnomalyLog(configuration: .init(enabled: false,
-            directoryURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
-            maxFileSize: 1_048_576, archiveCount: 0))
-        let runtime = AppRuntime(inventoryLog: log, tracker: inventory)
-        let ordering = StripOrderStore(defaults: CrossDisplayMemoryDefaults(), bootTimeProvider: { 1 }, inventoryLog: log)
+        let runtime = AppRuntime(tracker: inventory)
+        let ordering = StripOrderStore(defaults: CrossDisplayMemoryDefaults(), bootTimeProvider: { 1 })
         let topology = DisplayTopologyStore(initialSnapshot: .init(physicalDisplayCount: 2,
             identifiedDisplayUUIDs: ["fixture", "remote"], attributionTable: .init(displays: [
                 .init(uuid: "fixture", cgFrame: CGRect(x: 0, y: 0, width: 1920, height: 1080)),

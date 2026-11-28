@@ -1,16 +1,10 @@
 import Foundation
-#if DEBUG
-import os
-#endif
 
 @MainActor
 final class IntentPipeline {
     private let actionPlanning: LifecycleActionPlanner
     private let monotonicNow: () -> ContinuousClock.Instant
     private(set) var feedbackState = IntentFeedbackState()
-    #if DEBUG
-    private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "intent-pipeline")
-    #endif
 
     init(actionPlanning: LifecycleActionPlanner, monotonicNow: @escaping () -> ContinuousClock.Instant = { .now }) {
         self.actionPlanning = actionPlanning
@@ -58,15 +52,7 @@ final class IntentPipeline {
     }
 
     func reconcile(with snapshot: DockSnapshot, now: ContinuousClock.Instant? = nil) {
-        let before = feedbackState.entriesByWindowID
         feedbackState.reconcile(snapshot: snapshot, now: now ?? monotonicNow())
-        for (windowID, entry) in feedbackState.entriesByWindowID {
-            if let old = before[windowID], old.phase == .pending, entry.phase != .pending {
-                #if DEBUG
-                logger.info("[B-pending-cleared] t=\(CFAbsoluteTimeGetCurrent(), privacy: .public) windowID=\(windowID, privacy: .public) action=\(entry.action.rawValue, privacy: .public) → \(entry.phase.rawValue, privacy: .public)")
-                #endif
-            }
-        }
     }
 
     private func feedbackAction(for request: PlatformActionRequest) -> UserIntentAction {

@@ -328,7 +328,7 @@ final class WindowCommandLifecycleTests: XCTestCase {
         let finder = try XCTUnwrap(snapshot.windows[.init(rawValue: "editor-a")])
         let browser = try XCTUnwrap(snapshot.windows[.init(rawValue: "browser-c")])
         let executor = PlatformActionExecutor(
-            switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0", "DOCK_FAST_WINDOW_HANDLE": "0"]),
+            switches: .init(fastWindowHandleEnabled: false, axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
         let queue = WindowActionQueue()
         defer { gate.release.signal(); queue.stop() }
@@ -425,12 +425,12 @@ extension WindowCommandLifecycleTests {
         await publishReplacement(of: id, inventory: inventory, runtime: runtime)
         XCTAssertEqual(executor.cancellations.withLock { $0.first?.isCancelled }, true)
         XCTAssertNil(runtime.pendingMinimizations[id.rawValue])
-        XCTAssertNil(runtime.debugState.feedbackEntriesByWindowID[id.rawValue])
+        XCTAssertNil(runtime.feedbackTestProbe.feedbackEntriesByWindowID[id.rawValue])
         let pending = runtime.pendingActionsForTesting
         for gate in executor.gates { gate.signal() }
         for task in pending { await task.value }
 
-        XCTAssertNil(runtime.debugState.feedbackEntriesByWindowID[id.rawValue])
+        XCTAssertNil(runtime.feedbackTestProbe.feedbackEntriesByWindowID[id.rawValue])
         XCTAssertEqual(executor.effects.withLock { $0 }, ["cgw-2:closeWindow"])
     }
 
@@ -480,12 +480,12 @@ extension WindowCommandLifecycleTests {
         await waitUntil { executor.calls.withLock { $0 } == 1 }
         runtime.close(windowID: "review-2")
         runtime.close(windowID: "review-1")
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID["review-2"]?.phase, .pending)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID["review-2"]?.phase, .pending)
         now += .seconds(5)
         var update = inventory.values.value
         update.windows[WindowID(rawValue: "review-1")]?.title = "Updated Title"
         inventory.values.send(update)
-        await waitUntil { runtime.debugState.feedbackEntriesByWindowID["review-2"]?.phase == .failure }
+        await waitUntil { runtime.feedbackTestProbe.feedbackEntriesByWindowID["review-2"]?.phase == .failure }
 
         runtime.close(windowID: "review-2")
         let pending = runtime.pendingActionsForTesting

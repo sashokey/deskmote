@@ -5,7 +5,6 @@ import Foundation
 final class AXElementCache: @unchecked Sendable {
     static let shared = AXElementCache()
 
-    static let isEnabled = DebugSwitch.axElementCache.isEnabled(in: ProcessInfo.processInfo.environment)
 
     struct Key: Hashable {
         let pid: pid_t
@@ -51,7 +50,7 @@ final class AXElementCache: @unchecked Sendable {
         lock.unlock()
     }
 
-    #if DEBUG
+    #if DESKMOTE_TEST
     var countForTesting: Int {
         lock.lock()
         defer { lock.unlock() }

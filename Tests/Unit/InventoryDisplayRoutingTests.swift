@@ -179,7 +179,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
             element: AXElementKey(e: handle.element), instanceID: handle.instanceID, probeCount: 0),
             element: .alive(minimized: false), windowSpaceIDs: [], currentSpaceIDs: [1])
         fixture.tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: snapshot, now: Date(),
-            eligible: [candidate], readOutcome: .success(count: 1), rawAXCgIDs: [replacement], absenceEvidence: [cgWindow: evidence])
+            eligible: [candidate], readOutcome: .success, rawAXCgIDs: [replacement], absenceEvidence: [cgWindow: evidence])
 
         let app = try XCTUnwrap(fixture.tracker.fixtureAppForTesting(pid: pid))
         XCTAssertEqual(app.windowOrder, [replacement])
@@ -233,7 +233,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         }
 
         _ = fixture.tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: stale, now: Date(), eligible: [],
-            readOutcome: .unread(errorCode: AXError.cannotComplete.rawValue))
+            readOutcome: .unread)
         XCTAssertEqual(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowOrder, [cgWindow])
     }
 
@@ -250,7 +250,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         }
 
         _ = fixture.tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: stale, now: Date(), eligible: [],
-            readOutcome: .success(count: 0), rawAXCgIDs: [])
+            readOutcome: .success, rawAXCgIDs: [])
         XCTAssertEqual(fixture.tracker.fixtureAppForTesting(pid: pid)?.windowOrder, [cgWindow])
     }
 
@@ -746,7 +746,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let changed = tracker.reconcileFixtureForTesting(
             pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
             eligible: [makeSnapshot(bounds: frameOnB, isMinimized: false)],
-            readOutcome: .success(count: 1)
+            readOutcome: .success
         )
 
         XCTAssertTrue(changed, "A cross-display move must publish the new seat location")
@@ -763,7 +763,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let changed = tracker.reconcileFixtureForTesting(
             pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
             eligible: [makeSnapshot(bounds: frameOnAMoved, isMinimized: false)],
-            readOutcome: .success(count: 1)
+            readOutcome: .success
         )
 
         XCTAssertFalse(changed, "Movement within a display must avoid an inventory rebuild")
@@ -823,7 +823,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let changed = tracker.reconcileFixtureForTesting(
             pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
             eligible: [makeSnapshot(bounds: frameOnB, isMinimized: true)],
-            readOutcome: .success(count: 1)
+            readOutcome: .success
         )
         XCTAssertFalse(changed)
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.displayUUID, "A")
@@ -842,7 +842,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let changed = tracker.reconcileFixtureForTesting(
             pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
             eligible: [makeSnapshot(bounds: frameOnB, isMinimized: false)],
-            readOutcome: .success(count: 1)
+            readOutcome: .success
         )
         XCTAssertFalse(changed)
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.displayUUID, "A")
@@ -866,6 +866,36 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.bounds, frameOnA)
     }
 
+    func testPeriodicWoWFullscreenEvidenceChangesOnTheSameDisplay() throws {
+        let tracker = makeTracker()
+        var game = makeApp(displayUUID: "A", bundleIdentifier: "com.blizzard.worldofwarcraft")
+        game.windowsByID[cgWindow]?.confirmedCGDisplayBounds = frameOnA
+        tracker.installFixtureForTesting(game)
+        let fullFrame = try XCTUnwrap(tableAB.displays.first?.cgFrame)
+        func sample(_ frame: CGRect, onScreen: Bool = true) -> AppTrackerCGWindowSnapshot {
+            .init(allWindowIDs: [cgWindow], onScreenWindowIDs: onScreen ? [cgWindow] : [],
+                  windowIDsByPID: [pid: [cgWindow]], alphaByWindowID: [cgWindow: 1],
+                  boundsByWindowID: [cgWindow: frame], parentWindowIDs: [cgWindow: 0])
+        }
+
+        XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: sample(fullFrame)))
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [cgWindow])
+        let id = WindowID(rawValue: "cgw-\(cgWindow)")
+        XCTAssertEqual(tracker.snapshot.windows[id]?.borderlessFullscreenFrame, fullFrame)
+        XCTAssertEqual(tracker.snapshot.windows[id]?.bounds, frameOnA)
+        XCTAssertFalse(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: sample(fullFrame)))
+        XCTAssertFalse(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: .failed))
+
+        XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: sample(frameOnA)))
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [cgWindow])
+        XCTAssertNil(tracker.snapshot.windows[id]?.borderlessFullscreenFrame)
+
+        XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: sample(fullFrame)))
+        XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: sample(fullFrame, onScreen: false)))
+        tracker.rebuildSnapshotForTesting(onScreenCGIDs: [])
+        XCTAssertNil(tracker.snapshot.windows[id]?.borderlessFullscreenFrame)
+    }
+
     func testATickDuringTheMinimizeAnimationDoesNotMoveTheSeat() {
         let tracker = makeTracker()
         tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
@@ -877,14 +907,14 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         _ = tracker.reconcileFixtureForTesting(
             pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
             eligible: [makeSnapshot(bounds: frameOnA, isMinimized: true)],
-            readOutcome: .success(count: 1)
+            readOutcome: .success
         )
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.displayUUID, "A")
 
         _ = tracker.reconcileFixtureForTesting(
             pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
             eligible: [makeSnapshot(bounds: frameOnA, isMinimized: false)],
-            readOutcome: .success(count: 1)
+            readOutcome: .success
         )
         XCTAssertFalse(tracker.refreshDisplayAttributionFromCGForTesting(
             cgSnapshot: cgSnapshot(bounds: [cgWindow: midAnimation])
@@ -964,14 +994,14 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
         let oldAX = makeSnapshot(bounds: frameOnA, isMinimized: false)
         tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
-            eligible: [oldAX], readOutcome: .success(count: 1))
+            eligible: [oldAX], readOutcome: .success)
         let moved = cgSnapshot(bounds: [cgWindow: frameOnB])
         XCTAssertFalse(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: moved))
         XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: moved))
         tracker.rebuildSnapshotForTesting()
 
         tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: moved, now: Date(),
-            eligible: [oldAX], readOutcome: .success(count: 1))
+            eligible: [oldAX], readOutcome: .success)
         tracker.updateDisplayTopology(.init(displays: [
             tableAB.displays[0],
             .init(uuid: "B-Reidentified", cgFrame: tableAB.displays[1].cgFrame)
@@ -1009,13 +1039,13 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         defer { tracker.stop() }
         tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
         tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
-            eligible: [makeSnapshot(bounds: frameOnA, isMinimized: false)], readOutcome: .success(count: 1))
+            eligible: [makeSnapshot(bounds: frameOnA, isMinimized: false)], readOutcome: .success)
         let confirmed = cgSnapshot(bounds: [cgWindow: CGRect(x: 1750, y: 100, width: 200, height: 400)])
         XCTAssertFalse(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: confirmed))
         XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: confirmed))
         tracker.rebuildSnapshotForTesting()
         tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: confirmed, now: Date(),
-            eligible: [makeSnapshot(bounds: frameOnB, isMinimized: false)], readOutcome: .success(count: 1))
+            eligible: [makeSnapshot(bounds: frameOnB, isMinimized: false)], readOutcome: .success)
 
         tracker.updateDisplayTopology(.init(displays: [
             tableAB.displays[0],
@@ -1037,18 +1067,18 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         tracker.installFixtureForTesting(makeApp(displayUUID: "A"))
         let oldAX = makeSnapshot(bounds: frameOnA, isMinimized: false)
         tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
-            eligible: [oldAX], readOutcome: .success(count: 1))
+            eligible: [oldAX], readOutcome: .success)
         let moved = cgSnapshot(bounds: [cgWindow: frameOnB])
         XCTAssertFalse(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: moved))
         XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: moved))
 
         XCTAssertFalse(tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: .failed, now: Date(),
-            eligible: [oldAX], readOutcome: .success(count: 1)))
+            eligible: [oldAX], readOutcome: .success))
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.displayUUID, "B")
 
         let newAX = makeSnapshot(bounds: CGRect(x: 2200, y: 100, width: 500, height: 400), isMinimized: false)
         XCTAssertTrue(tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: .failed, now: Date(),
-            eligible: [newAX], readOutcome: .success(count: 1)))
+            eligible: [newAX], readOutcome: .success))
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.displayUUID, "C")
     }
 
@@ -1060,14 +1090,14 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let newBounds = oldBounds.offsetBy(dx: 16, dy: 0)
         let oldAX = makeSnapshot(bounds: oldBounds, isMinimized: false)
         tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
-            eligible: [oldAX], readOutcome: .success(count: 1))
+            eligible: [oldAX], readOutcome: .success)
         let moved = cgSnapshot(bounds: [cgWindow: newBounds])
         XCTAssertFalse(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: moved))
         XCTAssertTrue(tracker.refreshDisplayAttributionFromCGForTesting(cgSnapshot: moved))
         tracker.rebuildSnapshotForTesting()
 
         XCTAssertFalse(tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: moved, now: Date(),
-            eligible: [oldAX], readOutcome: .success(count: 1)))
+            eligible: [oldAX], readOutcome: .success))
         tracker.rebuildSnapshotForTesting()
 
         let windowID = WindowID(rawValue: "cgw-\(cgWindow)")
@@ -1094,7 +1124,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
             topologyRetryScheduler: { _, action in
                 retryCallbacks.append(action)
                 return DispatchWorkItem(block: action)
-            }, makeGeometryObserver: { nil })
+            })
         defer { orchestrator.suspendAndRelease() }
         orchestrator.start()
         XCTAssertNil(tracker.snapshot.windows[windowID]?.displayUUID)
@@ -1122,7 +1152,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         let changed = tracker.reconcileFixtureForTesting(
             pid: pid, cgSnapshot: cgSnapshot(), now: Date(),
             eligible: [makeSnapshot(bounds: frameOnB, isMinimized: false)],
-            readOutcome: .success(count: 1)
+            readOutcome: .success
         )
         XCTAssertTrue(changed)
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowsByID[cgWindow]?.displayUUID, "B")
@@ -1135,7 +1165,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
 
         let empty = AppTrackerCGWindowSnapshot(allWindowIDs: [], onScreenWindowIDs: [], windowIDsByPID: [:], alphaByWindowID: [:])
         XCTAssertTrue(tracker.reconcileFixtureForTesting(
-            pid: pid, cgSnapshot: empty, now: Date(), eligible: [], readOutcome: .success(count: 0)
+            pid: pid, cgSnapshot: empty, now: Date(), eligible: [], readOutcome: .success
         ))
         tracker.rebuildSnapshotForTesting()
         XCTAssertTrue(tracker.snapshot.windows.isEmpty)
@@ -1177,7 +1207,8 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         displayUUID: String?,
         isMinimized: Bool = false,
         isHidden: Bool = false,
-        token: String? = nil
+        token: String? = nil,
+        bundleIdentifier: String = "com.example.fixture"
     ) -> AppEntry {
         let seat = WindowEntry(
             cgWindowID: cgWindow,
@@ -1191,7 +1222,7 @@ final class AppTrackerDisplayAttributionTests: XCTestCase {
         )
         return AppEntry(
             pid: pid,
-            bundleIdentifier: "com.example.fixture",
+            bundleIdentifier: bundleIdentifier,
             appName: "Fixture",
             activationPolicy: .regular,
             executablePath: "/Applications/Fixture.app",

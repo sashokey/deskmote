@@ -122,24 +122,9 @@ struct StripItem: Hashable {
 }
 
 enum StripOrdering {
-    #if DEBUG
-    enum PlacementReason: String, Codable, Equatable {
-        case sameAppSibling
-        case tail
-    }
-
-    struct Placement: Equatable {
-        let chipID: String
-        let index: Int
-        let reason: PlacementReason
-    }
-    #endif
 
     struct ReconcileResult: Equatable {
         let order: [String]
-        #if DEBUG
-        let placements: [Placement]
-        #endif
     }
 
     static func reconcile(remembered: [String], current: [String], appKeyOf: [String: String] = [:]) -> [String] {
@@ -150,13 +135,6 @@ enum StripOrdering {
         ).order
     }
 
-    #if DEBUG
-    static func reconcileWithTrace(
-        remembered: [String], current: [String], appKeyOf: [String: String] = [:]
-    ) -> ReconcileResult {
-        reconcileOrder(remembered: remembered, current: current, appKeyOf: appKeyOf)
-    }
-    #endif
 
     static func reconcileOrder(
         remembered: [String],
@@ -166,28 +144,15 @@ enum StripOrdering {
         let currentSet = Set(current)
         let rememberedSet = Set(remembered)
         var result = remembered.filter { currentSet.contains($0) }
-        #if DEBUG
-        var placements: [Placement] = []
-        #endif
         for id in current where !rememberedSet.contains(id) {
             let app = appKeyOf[id]
             if let app, let pos = result.lastIndex(where: { appKeyOf[$0] == app }) {
                 result.insert(id, at: pos + 1)
-                #if DEBUG
-                placements.append(Placement(chipID: id, index: pos + 1, reason: .sameAppSibling))
-                #endif
             } else {
                 result.append(id)
-                #if DEBUG
-                placements.append(Placement(chipID: id, index: result.count - 1, reason: .tail))
-                #endif
             }
         }
-        #if DEBUG
-        return ReconcileResult(order: result, placements: placements)
-        #else
         return ReconcileResult(order: result)
-        #endif
     }
 
     static func persistableLiveOrder(_ order: [String]) -> [String] {

@@ -19,33 +19,19 @@ struct WindowActionResult: Sendable {
     }
 }
 
-struct WindowLaunchFocus: Sendable {
-    let pid: pid_t
-    let processGeneration: ProcessGeneration
-    let windowID: CGWindowID
-    let element: AXElementKey
-    let observedAt: TimeInterval
-    let focusRevision: UInt64
-    let foregroundRevision: UInt64
-}
-
 @MainActor
 protocol WindowInventoryTracking: AnyObject {
     var snapshots: AnyPublisher<DockSnapshot, Never> { get }
     var windowSpaceInvalidations: AnyPublisher<CGWindowID, Never> { get }
-    var launchWindowFocus: AnyPublisher<WindowLaunchFocus, Never> { get }
     func start()
     func stop()
     func refreshFrontmostWindow()
-    func isLaunchWindowFocusCurrent(_ focus: WindowLaunchFocus) -> Bool
     func acceptRestoredWindowFocus(_ focus: WindowFocusConfirmation, target: WindowActionIdentity)
 }
 
 extension WindowInventoryTracking {
     var windowSpaceInvalidations: AnyPublisher<CGWindowID, Never> { Empty().eraseToAnyPublisher() }
-    var launchWindowFocus: AnyPublisher<WindowLaunchFocus, Never> { Empty().eraseToAnyPublisher() }
     func refreshFrontmostWindow() {}
-    func isLaunchWindowFocusCurrent(_ focus: WindowLaunchFocus) -> Bool { false }
     func acceptRestoredWindowFocus(_ focus: WindowFocusConfirmation, target: WindowActionIdentity) {}
 }
 

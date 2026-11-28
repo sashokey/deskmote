@@ -5,13 +5,6 @@ import SwiftUI
 struct DeskMoteApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
-    init() {
-        #if DESKMOTE_WIDGET
-        let location = AppInstallLocation(bundleURL: Bundle.main.bundleURL, isReadOnlyVolume: PermissionService().isReadOnlyVolume)
-        if !location.isTransient { DispatchQueue.global(qos: .utility).async { WidgetRecovery.run() } }
-        #endif
-    }
-
     var body: some Scene {
         Settings {
             EmptyView()

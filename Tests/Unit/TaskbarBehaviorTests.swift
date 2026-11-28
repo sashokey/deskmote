@@ -16,6 +16,11 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
         var fullscreenWindows = Set<CGWindowID>()
         var missingFullscreenFlag = Set<CGWindowID>()
         var sizeWriteAttempts = 0
+        var requestedSizes: [CGSize] = []
+        var requestedPositions: [CGPoint] = []
+        var rejectSizeAsUnsupported = false
+        var rejectPositions = false
+        var beforePositionWrite: (@Sendable () -> Void)?
         var ignoreWrites = false
         var denyFocus = false
         var missingWindows = Set<CGWindowID>()
@@ -236,6 +241,17 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
             }
     }
 
+    func heightCommitFrame(_ element: AXElementKey, replacingFrame: CGRect? = nil) -> CGRect? {
+        guard let id = number(element.e) else { return nil }
+        return state.withLock { storage in
+            guard let window = storage.windows[id], window.status != .minimized,
+                  !storage.fullscreenWindows.contains(id), !storage.missingWindows.contains(id),
+                  !storage.unreadPositions.contains(id) else { return nil }
+            if let replacingFrame { storage.windows[id]?.bounds = replacingFrame }
+            return storage.windows[id]?.bounds
+        }
+    }
+
     func set(_ element: AXUIElement, _ attribute: CFString, _ value: CFTypeRef) -> AXError {
         guard let id = number(element) else { return .invalidUIElement }
         let size: CGSize?
@@ -246,9 +262,27 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
         } else {
             size = nil
         }
+        let position: CGPoint?
+        if attribute as String == kAXPositionAttribute as String {
+            var point = CGPoint.zero
+            guard CFGetTypeID(value) == AXValueGetTypeID(),
+                  AXValueGetValue(unsafeDowncast(value, to: AXValue.self), .cgPoint, &point) else { return .illegalArgument }
+            position = point
+            state.withLock { $0.beforePositionWrite }?()
+        } else {
+            position = nil
+        }
         let result = state.withLock { storage -> AXError in
             guard var window = storage.windows[id] else { return .invalidUIElement }
-            if size != nil { storage.sizeWriteAttempts += 1 }
+            if let size {
+                storage.sizeWriteAttempts += 1
+                storage.requestedSizes.append(size)
+                if storage.rejectSizeAsUnsupported { return .attributeUnsupported }
+            }
+            if let position {
+                storage.requestedPositions.append(position)
+                if storage.rejectPositions { return .cannotComplete }
+            }
             if storage.rejectWrites || (storage.rejectMinimizedAttribute && attribute as String == kAXMinimizedAttribute as String) { return .failure }
             storage.writes.append("\(id):\(attribute)")
             guard !storage.ignoreWrites else { return .success }
@@ -257,10 +291,8 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
                 if window.status == .minimized, storage.focused == id { storage.focused = nil }
             } else if let size {
                 window.bounds?.size = size
-            } else if attribute as String == kAXPositionAttribute as String {
-                var point = CGPoint.zero
-                guard CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetValue(unsafeDowncast(value, to: AXValue.self), .cgPoint, &point) else { return .illegalArgument }
-                window.bounds?.origin = point
+            } else if let position {
+                window.bounds?.origin = position
             }
             storage.windows[id] = window
             return .success
@@ -356,9 +388,15 @@ final class BehaviorDesktop: AccessibilityOperations, WindowSystemAccess, Window
 @MainActor
 final class BehaviorInventory: WindowInventoryTracking {
     let desktop: BehaviorDesktop
+    let invalidations = PassthroughSubject<CGWindowID, Never>()
     var snapshots: AnyPublisher<DockSnapshot, Never> { desktop.values.eraseToAnyPublisher() }
-    init(_ desktop: BehaviorDesktop) { self.desktop = desktop }
-    func start() {}
+    var windowSpaceInvalidations: AnyPublisher<CGWindowID, Never> { invalidations.eraseToAnyPublisher() }
+    private let onStart: @MainActor () -> Void
+    init(_ desktop: BehaviorDesktop, onStart: @escaping @MainActor () -> Void = {}) {
+        self.desktop = desktop
+        self.onStart = onStart
+    }
+    func start() { onStart() }
     func stop() {}
 }
 
@@ -714,7 +752,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         await wait { fixture.runtime.snapshot.windows[WindowID(rawValue: "editor-a")]?.status == .minimized }
         let button = try XCTUnwrap(fixture.view.taskbarContent.buttonViews["window:tabgrp-editor-a"])
         var publishedFailure = false
-        let feedback = fixture.runtime.debugState.$feedbackEntriesByWindowID.sink {
+        let feedback = fixture.runtime.feedbackTestProbe.$feedbackEntriesByWindowID.sink {
             if $0["editor-a"]?.phase == .failure { publishedFailure = true }
         }
         defer { feedback.cancel() }
@@ -733,7 +771,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         await drainTaskbarUpdates()
         XCTAssertFalse(publishedFailure)
         XCTAssertTrue(button.isActiveWindow)
-        XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"]?.phase, .success)
+        XCTAssertEqual(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-a"]?.phase, .success)
         XCTAssertEqual(fixture.desktop.state.withLock { $0.focused }, 1001)
         XCTAssertEqual(fixture.desktop.state.withLock { $0.windows[1002]?.status }, .inactive)
     }
@@ -815,7 +853,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         let menu = try XCTUnwrap(fixture.menu.menu)
         await replaceEditorWindowBeforePresenterRefresh(fixture) {
             menu.performActionForItem(at: 0)
-            XCTAssertNil(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"])
+            XCTAssertNil(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"])
             XCTAssertTrue(fixture.runtime.pendingActionsForTesting.isEmpty)
         }
         for task in fixture.runtime.pendingActionsForTesting { await task.value }
@@ -846,7 +884,7 @@ final class TaskbarBehaviorTests: XCTestCase {
                 XCTAssertEqual(fixture.runtime.snapshot.windows[id]?.displayUUID, "right")
                 XCTAssertTrue(content.buttonViews[buttonID] === previous)
                 menu.performActionForItem(at: 0)
-                XCTAssertNil(fixture.runtime.debugState.feedbackEntriesByWindowID[id.rawValue])
+                XCTAssertNil(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID[id.rawValue])
                 previous.clickForTesting()
                 XCTAssertNil(fixture.runtime.pendingMinimizations[id.rawValue])
                 XCTAssertTrue(fixture.runtime.pendingActionsForTesting.isEmpty)
@@ -933,11 +971,11 @@ final class TaskbarBehaviorTests: XCTestCase {
         button.onContextMenu?(event(.rightMouseDown, .zero))
         try XCTUnwrap(fixture.menu.menu).performActionForItem(at: 0)
         await wait { gate.entered.withLock { $0 } }
-        XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"]?.phase, .pending)
+        XCTAssertEqual(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-a"]?.phase, .pending)
 
         currentSpace.withLock { $0 = 2 }
         notifications.post(name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
-        XCTAssertNil(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"])
+        XCTAssertNil(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-a"])
         gate.release.signal()
         for task in fixture.runtime.pendingActionsForTesting { await task.value }
 
@@ -971,7 +1009,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         let second = try XCTUnwrap(content.buttonViews["window:tabgrp-editor-b"])
         second.onContextMenu?(event(.rightMouseDown, .zero))
         try XCTUnwrap(fixture.menu.menu).performActionForItem(at: 0)
-        XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"]?.phase, .pending)
+        XCTAssertEqual(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"]?.phase, .pending)
 
         currentSpace.withLock { $0 = 2 }
         notifications.post(name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
@@ -982,7 +1020,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         XCTAssertFalse(gate.timedOut.withLock { $0 })
         XCTAssertEqual(fixture.desktop.state.withLock { $0.writes.filter { $0.hasSuffix(":close") } }, ["1001:close"])
         XCTAssertNotNil(fixture.desktop.state.withLock { $0.windows[1002] })
-        XCTAssertNil(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"])
+        XCTAssertNil(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"])
     }
 
     func testQueuedTaskbarCloseIsCancelledWhenItsPanelHidesWithoutASpaceChange() async throws {
@@ -996,10 +1034,10 @@ final class TaskbarBehaviorTests: XCTestCase {
         let button = try XCTUnwrap(fixture.view.taskbarContent.buttonViews["window:tabgrp-editor-b"])
         button.onContextMenu?(event(.rightMouseDown, .zero))
         try XCTUnwrap(fixture.menu.menu).performActionForItem(at: 0)
-        XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"]?.phase, .pending)
+        XCTAssertEqual(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"]?.phase, .pending)
 
         fixture.presenter.setPanelVisible(false)
-        XCTAssertNil(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"])
+        XCTAssertNil(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"])
         gate.release.signal()
         for task in fixture.runtime.pendingActionsForTesting { await task.value }
         XCTAssertFalse(gate.timedOut.withLock { $0 })
@@ -1101,7 +1139,7 @@ final class TaskbarBehaviorTests: XCTestCase {
                     TaskbarView(frame: frame, popup: popup, contextMenu: BehaviorMenu(),
                                 delay: { _ in completedDelays += 1 })
                 }
-            }, makeGeometryObserver: { nil })
+            })
         defer { orchestrator.suspendAndRelease() }
         orchestrator.start()
         await wait { spaces.activeLayouts.count == 2 }
@@ -1308,7 +1346,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         let pending = fixture.runtime.pendingActionsForTesting
         XCTAssertEqual(pending.count, 1)
         for task in pending { await task.value }
-        XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"]?.phase, .failure)
+        XCTAssertEqual(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-a"]?.phase, .failure)
         XCTAssertTrue(fixture.desktop.state.withLock { $0.writes.isEmpty })
         XCTAssertEqual(fixture.desktop.state.withLock { $0.windows[1001]?.status }, .active)
     }
@@ -1325,7 +1363,7 @@ final class TaskbarBehaviorTests: XCTestCase {
             }
         }
         defer { desktop.state.withLock { $0.beforeWindowIDRead = nil } }
-        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+        let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
 
         let success = executor.execute(.init(kind: .closeWindow, windowID: .init(rawValue: "editor-b")),
@@ -1338,8 +1376,8 @@ final class TaskbarBehaviorTests: XCTestCase {
     }
 
     func testCloseFindsRetainedAXWindowAfterSameCGIDFocusedAlias() throws {
-        for (fastCapture, mainWindow, expectedInventoryReads): (String, CGWindowID, Int) in
-            [("1", 1001, 1), ("1", 1002, 0), ("0", 1001, 1)] {
+        for (fastCapture, mainWindow, expectedInventoryReads): (Bool, CGWindowID, Int) in
+            [(true, 1001, 1), (true, 1002, 0), (false, 1001, 1)] {
             let desktop = BehaviorDesktop()
             let record = try XCTUnwrap(desktop.state.withLock { $0.windows[1002] })
             let element = try XCTUnwrap(desktop.elements[1002])
@@ -1354,9 +1392,7 @@ final class TaskbarBehaviorTests: XCTestCase {
                 status: record.status, cgWindowID: record.cgWindowID, processGeneration: record.processGeneration,
                 actionTarget: WindowActionTarget(element: AXElementKey(e: element)))
             let snapshot = DockSnapshot(windows: [target.id: target], orderedWindowIDs: [target.id])
-            let executor = PlatformActionExecutor(switches: .init(environment: [
-                "DOCK_AX_ELEMENT_CACHE": "0", "DOCK_FAST_WINDOW_HANDLE": fastCapture,
-            ]), reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
+            let executor = PlatformActionExecutor(switches: .init(fastWindowHandleEnabled: fastCapture, axElementCacheEnabled: false), reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
 
             XCTAssertTrue(executor.execute(.init(kind: .closeWindow, windowID: target.id),
                 snapshot: snapshot, forcedMinimizedPrior: false,
@@ -1384,13 +1420,13 @@ final class TaskbarBehaviorTests: XCTestCase {
                 bounds: previousRecord.bounds, role: kAXWindowRole as String, subrole: kAXStandardWindowSubrole as String,
                 isMinimized: false, isFocusedWindow: false, element: element, isMinimizedRead: false)
             tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: cgSnapshot, now: Date(), eligible: [window],
-                                               readOutcome: .success(count: 1))
+                                               readOutcome: .success)
             tracker.rebuildSnapshotForTesting(onScreenCGIDs: [cgID])
         }
         observe(AXUIElementCreateApplication(-89999))
         let previousSnapshot = tracker.snapshot
         let id = try XCTUnwrap(previousSnapshot.orderedWindowIDs.first)
-        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+        let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
         let request = PlatformActionRequest(kind: .closeWindow, windowID: id)
 
@@ -1416,7 +1452,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         desktop.state.withLock { _ = $0.hiddenApplications.insert(source.pid) }
         desktop.replaceElement(for: 1002)
         let reader = AXWindowReader(accessibility: desktop)
-        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+        let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
                                                reader: reader, system: desktop, focusBackend: desktop)
         let snapshot = DockSnapshot(windows: [record.id: record], orderedWindowIDs: [record.id])
         XCTAssertFalse(executor.execute(.init(kind: .activateWindow, windowID: record.id), snapshot: snapshot,
@@ -1448,7 +1484,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         await ready(fixture)
         fixture.desktop.state.withLock { _ = $0.missingWindows.insert(1002) }
         try press("editor-b", fixture)
-        await wait { fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"]?.phase == .failure }
+        await wait { fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"]?.phase == .failure }
         XCTAssertEqual(fixture.desktop.state.withLock { $0.focused }, 1001)
         XCTAssertTrue(fixture.desktop.state.withLock { $0.writes.isEmpty })
     }
@@ -1461,7 +1497,7 @@ final class TaskbarBehaviorTests: XCTestCase {
             status: replacement.status, cgWindowID: replacement.cgWindowID, processGeneration: replacement.processGeneration,
             actionTarget: WindowActionTarget(element: AXElementKey(e: AXUIElementCreateApplication(-89999))))
         let snapshot = DockSnapshot(windows: [original.id: original], orderedWindowIDs: [original.id])
-        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+        let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
 
         XCTAssertFalse(executor.execute(.init(kind: .activateWindow, windowID: original.id),
@@ -1488,21 +1524,14 @@ final class TaskbarBehaviorTests: XCTestCase {
         XCTAssertTrue(fixture.runtime.pendingMinimizations.isEmpty)
     }
 
-    func testCancelledNativeCaptureKeepsItsStagesOutOfTheReplacementClickTrace() async throws {
+    func testCancelledNativeCaptureAndStaleReplacementNeverWrite() async throws {
         let desktop = BehaviorDesktop()
         let reader = AXWindowReader(accessibility: desktop)
-        let switches = ActionExecutionSwitches(environment: [
-            DebugSwitch.clickTrace.rawValue: "1",
-            DebugSwitch.axElementCache.rawValue: "0",
-            DebugSwitch.fastWindowHandle.rawValue: "0"
-        ])
+        let switches = ActionExecutionSwitches(fastWindowHandleEnabled: false, axElementCacheEnabled: false)
         let runtime = AppRuntime(tracker: BehaviorInventory(desktop),
             actionExecutor: PlatformActionExecutor(switches: switches, reader: reader,
                                                   system: desktop, focusBackend: desktop),
             isAppFrontmost: { desktop.app($0)?.isActive == true })
-        let lines = Mutex<[Data]>([])
-        let trace = ClickLatencyTrace.Runtime(writeLine: { line in lines.withLock { $0.append(line) } })
-        runtime.clickLatencyTrace = trace
         runtime.start()
         let gate = BehaviorReadGate(attribute: kAXWindowsAttribute as String)
         defer { gate.release.signal(); runtime.stop() }
@@ -1522,34 +1551,11 @@ final class TaskbarBehaviorTests: XCTestCase {
         for action in runtime.pendingActionsForTesting { await action.value }
         XCTAssertFalse(gate.timedOut.withLock { $0 })
 
-        func records() throws -> [[String: Any]] {
-            trace.flush()
-            return try lines.withLock { $0 }.map { line in
-                try XCTUnwrap(JSONSerialization.jsonObject(with: line) as? [String: Any])
-            }
-        }
-        let interrupted = try records()
-        XCTAssertEqual(interrupted.count, 2)
-        let cancelled = try XCTUnwrap(interrupted.first)
-        let replacement = try XCTUnwrap(interrupted.dropFirst().first)
-        XCTAssertEqual(cancelled["kind"] as? String, "activateWindow")
-        XCTAssertEqual(cancelled["success"] as? Bool, false)
-        XCTAssertEqual(replacement["kind"] as? String, "closeWindow")
-        XCTAssertEqual(replacement["success"] as? Bool, false)
-        XCTAssertNotNil(replacement["execStartMs"])
-        XCTAssertNil(replacement["handleMs"])
-        XCTAssertNil(replacement["handleDetail"])
-        XCTAssertNil(replacement["earlyFocusMs"])
+        XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
 
         desktop.state.withLock { _ = $0.generationsByPID.removeValue(forKey: record.pid) }
         runtime.activate(windowID: id.rawValue)
         for action in runtime.pendingActionsForTesting { await action.value }
-        let finished = try records()
-        XCTAssertEqual(finished.count, 3)
-        let completed = try XCTUnwrap(finished.last)
-        XCTAssertEqual(completed["kind"] as? String, "activateWindow")
-        XCTAssertEqual(completed["success"] as? Bool, true)
-        XCTAssertEqual(completed["handleDetail"] as? String, "fallback")
         XCTAssertEqual(desktop.state.withLock { $0.focused }, 1002)
     }
 
@@ -1568,7 +1574,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         }
         let record = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
         let executor = PlatformActionExecutor(
-            switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0", "DOCK_FAST_WINDOW_HANDLE": "0"]),
+            switches: .init(fastWindowHandleEnabled: false, axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
         XCTAssertFalse(executor.execute(.init(kind: .activateWindow, windowID: record.id),
             snapshot: DockSnapshot(windows: [record.id: record], orderedWindowIDs: [record.id]),
@@ -1610,7 +1616,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         records[original.id] = original
         let snapshot = DockSnapshot(windows: records, orderedWindowIDs: desktop.values.value.orderedWindowIDs)
         let predictions = Mutex<[WindowID]>([])
-        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+        let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
 
         XCTAssertTrue(executor.execute(.init(kind: .minimizeWindow, windowID: clicked.id),
@@ -1643,7 +1649,7 @@ final class TaskbarBehaviorTests: XCTestCase {
                     if pid == candidate.pid { gate.read(kAXWindowsAttribute as String) }
                 }
             }
-            let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+            let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
                 reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
             let action = Task.detached {
                 executor.execute(.init(kind: .closeWindow, windowID: original.id), snapshot: snapshot,
@@ -1687,7 +1693,7 @@ final class TaskbarBehaviorTests: XCTestCase {
                 if id == 1001 { gate.read("original-window-id") }
             }
         }
-        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+        let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
         let action = Task.detached {
             executor.execute(.init(kind: .closeWindow, windowID: original.id), snapshot: snapshot,
@@ -1732,7 +1738,7 @@ final class TaskbarBehaviorTests: XCTestCase {
                 if read == 2 { gate.read("final-source-window-id") }
             }
         }
-        let executor = PlatformActionExecutor(switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0"]),
+        let executor = PlatformActionExecutor(switches: .init(axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
         let action = Task.detached {
             executor.execute(.init(kind: .closeWindow, windowID: original.id), snapshot: snapshot,
@@ -1803,7 +1809,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         }
         let record = try XCTUnwrap(desktop.state.withLock { $0.windows[1001] })
         let executor = PlatformActionExecutor(
-            switches: .init(environment: ["DOCK_AX_ELEMENT_CACHE": "0", "DOCK_FAST_WINDOW_HANDLE": "1"]),
+            switches: .init(fastWindowHandleEnabled: true, axElementCacheEnabled: false),
             reader: AXWindowReader(accessibility: desktop), system: desktop, focusBackend: desktop)
         XCTAssertFalse(executor.execute(.init(kind: .activateWindow, windowID: record.id),
             snapshot: DockSnapshot(windows: [record.id: record], orderedWindowIDs: [record.id]),
@@ -1887,7 +1893,7 @@ final class TaskbarBehaviorTests: XCTestCase {
             await wait { fixture.runtime.snapshot.windows[WindowID(rawValue: "editor-a")]?.status == .minimized }
             try press("editor-a", fixture)
             for task in fixture.runtime.pendingActionsForTesting { await task.value }
-            await wait { fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"]?.phase == .failure }
+            await wait { fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-a"]?.phase == .failure }
             XCTAssertNil(fixture.runtime.pendingMinimizations["editor-a"])
             await wait { fixture.view.taskbarContent.buttonViews["window:tabgrp-editor-a"]?.isActiveWindow == false }
             XCTAssertEqual(fixture.desktop.state.withLock { $0.windows[1001]?.status }, .minimized)
@@ -1907,7 +1913,7 @@ final class TaskbarBehaviorTests: XCTestCase {
         await wait { fixture.runtime.snapshot.windows[WindowID(rawValue: "editor-a")]?.status == .minimized }
         try press("editor-a", fixture)
         for task in fixture.runtime.pendingActionsForTesting { await task.value }
-        await wait { fixture.runtime.debugState.feedbackEntriesByWindowID["editor-a"]?.phase == .failure }
+        await wait { fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-a"]?.phase == .failure }
         XCTAssertNil(fixture.runtime.pendingMinimizations["editor-a"])
         XCTAssertEqual(fixture.desktop.state.withLock { $0.windows[1001]?.status }, .minimized)
     }
@@ -1945,533 +1951,6 @@ final class TaskbarBehaviorTests: XCTestCase {
     }
 }
 
-private final class HeightObservationSession: WindowObservationSession {
-    let callbacks = Mutex<(@Sendable (AXElementKey, String) -> Void)?>(nil)
-    let subscribed = Mutex<Set<AXElementKey>>([])
-    let reads = Mutex(0)
-    @MainActor var geometryEvents = 0
-    @MainActor var displays: [WindowAdjustmentDisplay] = []
-
-    func add(_ notification: String, element: AXElementKey?) -> AXError {
-        if notification == kAXWindowResizedNotification, let element {
-            subscribed.withLock { _ = $0.insert(element) }
-        }
-        return .success
-    }
-
-    func remove(_ notification: String, element: AXElementKey) -> AXError {
-        if notification == kAXWindowResizedNotification {
-            subscribed.withLock { _ = $0.remove(element) }
-        }
-        return .success
-    }
-
-    @MainActor func attach() {}
-    @MainActor func detach() {}
-
-    func send(_ notification: String, for element: AXElementKey) {
-        callbacks.withLock { $0 }?(element, notification)
-    }
-}
-
-private final class HeightRunningApplication: NSRunningApplication, @unchecked Sendable {
-    override var processIdentifier: pid_t { -41000 }
-}
-
-@MainActor
-final class WindowHeightAdjustmentTests: XCTestCase {
-    private static let fullHeight = CGRect(x: 200, y: 30, width: 700, height: 1050)
-    private static let floating = CGRect(x: 200, y: 100, width: 700, height: 700)
-
-    @MainActor
-    fileprivate final class Fixture {
-        static let primary = WindowAdjustmentDisplay(
-            frame: CGRect(x: 0, y: 0, width: 1920, height: 1080),
-            visibleFrame: CGRect(x: 0, y: 30, width: 1920, height: 1050),
-            panelFrame: CGRect(x: 0, y: 1048, width: 1920, height: 32)
-        )
-        static let secondary = WindowAdjustmentDisplay(
-            frame: CGRect(x: -1440, y: 100, width: 1440, height: 900),
-            visibleFrame: CGRect(x: -1440, y: 125, width: 1440, height: 875),
-            panelFrame: CGRect(x: -1440, y: 968, width: 1440, height: 32)
-        )
-
-        let desktop = BehaviorDesktop()
-        let session: HeightObservationSession
-        let workspaceNotifications = NotificationCenter()
-        let orchestrator: TaskbarScreenOrchestrator
-        var writes: [String] { desktop.state.withLock { $0.writes } }
-        var reads: Int { session.reads.withLock { $0 } }
-
-        init(displays: [WindowAdjustmentDisplay] = [primary], enabled: Bool = true) {
-            let session = HeightObservationSession()
-            session.displays = displays
-            self.session = session
-            desktop.state.withLock {
-                $0.windows[1001]?.bounds = floating
-                $0.afterFrameBatchRead = { session.reads.withLock { $0 += 1 } }
-            }
-            let observer = FrontmostWindowGeometryObserver(makeSession: { [session] _, receive in
-                session.callbacks.withLock { $0 = receive }
-                return session
-            }, readFocused: { [desktop] pid in
-                FrontmostWindowGeometryObserver.readFocusedWindow(pid: pid, accessibility: desktop)
-            })
-            let topology = ScreenTopologySnapshot(physicalDisplayCount: 0, identifiedDisplayUUIDs: [],
-                                                  attributionTable: .empty)
-            orchestrator = TaskbarScreenOrchestrator(
-                runtime: AppRuntime(tracker: BehaviorInventory(desktop)), stripOrderStore: StripOrderStore(),
-                displayTopologyStore: DisplayTopologyStore(initialSnapshot: topology),
-                spaceStore: TaskbarSpaceStore(read: { _ in nil }, notifications: NotificationCenter(), pollInterval: 0),
-                topologySnapshotProvider: { topology }, workspaceNotifications: workspaceNotifications,
-                frontmostApplicationPID: { -41000 }, makeGeometryObserver: { observer },
-                windowAdjustmentAccessibility: desktop,
-                windowAdjustmentDisplays: {
-                    session.geometryEvents += 1
-                    return session.displays
-                },
-                windowAdjustmentEnabled: enabled
-            )
-        }
-
-        func element(_ id: CGWindowID) -> AXElementKey { AXElementKey(e: desktop.elements[id]!) }
-
-        func start(expectedReads: Int = 1) async {
-            orchestrator.start()
-            await wait {
-                self.session.subscribed.withLock { $0.contains(self.element(1001)) } && self.reads == expectedReads
-            }
-        }
-
-        func frame(_ id: CGWindowID = 1001) -> CGRect? { desktop.state.withLock { $0.windows[id]?.bounds } }
-
-        func notifyWorkspace(_ name: Notification.Name) {
-            workspaceNotifications.post(name: name, object: nil, userInfo: [
-                NSWorkspace.applicationUserInfoKey: HeightRunningApplication(),
-            ])
-        }
-
-        func report(_ frame: CGRect, id: CGWindowID = 1001,
-                    notification: String = kAXWindowResizedNotification) async {
-            let expectedReads = reads + 1
-            desktop.state.withLock { $0.windows[id]?.bounds = frame }
-            session.send(notification, for: element(id))
-            await wait { self.reads == expectedReads }
-        }
-
-        func wait(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
-            let deadline = ContinuousClock.now + .seconds(2)
-            while !condition() && ContinuousClock.now < deadline {
-                try? await Task.sleep(for: .milliseconds(2))
-            }
-            XCTAssertTrue(condition(), file: file, line: line)
-        }
-    }
-
-    func testResizeToFullWorkingHeightWritesOnlyTheShorterSizeToTheFocusedWindow() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        XCTAssertTrue(fixture.writes.isEmpty)
-
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-
-        XCTAssertEqual(fixture.frame(), CGRect(x: 200, y: 30, width: 700, height: 1018))
-        XCTAssertEqual(fixture.reads, 2)
-    }
-
-    func testCreatedFocusedWindowAdjustsFromItsFirstFrameRead() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        fixture.desktop.state.withLock {
-            $0.windows[1002]?.bounds = Self.fullHeight
-            $0.focused = 1002
-        }
-
-        fixture.session.send(kAXWindowCreatedNotification, for: fixture.element(1002))
-
-        await fixture.wait { fixture.writes == ["1002:AXSize"] }
-        XCTAssertEqual(fixture.frame(1002), CGRect(x: 200, y: 30, width: 700, height: 1018))
-        XCTAssertEqual(fixture.reads, 2)
-        XCTAssertEqual(fixture.frame(), Self.floating)
-    }
-
-    func testLateCreationUsesTheAlreadyReadFrameOnce() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        let focusReads = Mutex(0)
-        fixture.desktop.state.withLock {
-            $0.windows[1001]?.bounds = Self.fullHeight
-            $0.beforeRead = { attribute in
-                if attribute == kAXFocusedWindowAttribute as String { focusReads.withLock { $0 += 1 } }
-            }
-        }
-        await fixture.start()
-        XCTAssertTrue(fixture.writes.isEmpty)
-
-        fixture.session.send(kAXWindowCreatedNotification, for: fixture.element(1001))
-        fixture.session.send(kAXWindowCreatedNotification, for: fixture.element(1001))
-
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-        XCTAssertEqual(fixture.reads, 1)
-        await fixture.report(Self.fullHeight)
-        XCTAssertEqual(focusReads.withLock { $0 }, 1)
-        XCTAssertEqual(fixture.writes, ["1001:AXSize"])
-    }
-
-    func testLateCreationCannotUseAnInterveningGeometryFrame() async {
-        let withoutPanel = WindowAdjustmentDisplay(frame: Fixture.primary.frame,
-                                                   visibleFrame: Fixture.primary.visibleFrame, panelFrame: nil)
-        let fixture = Fixture(displays: [withoutPanel])
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        await fixture.report(Self.fullHeight)
-        XCTAssertTrue(fixture.writes.isEmpty)
-
-        fixture.session.displays = [Fixture.primary]
-        fixture.session.send(kAXWindowCreatedNotification, for: fixture.element(1001))
-        await fixture.wait { fixture.session.geometryEvents >= 2 }
-        await fixture.report(Self.fullHeight)
-
-        XCTAssertEqual(fixture.writes, [])
-        XCTAssertEqual(fixture.frame(), Self.fullHeight)
-    }
-
-    func testCreationWaitsForQueuedGeometryBeforeUsingItsFirstFrame() async {
-        let narrower = CGRect(x: 200, y: 30, width: 600, height: 1050)
-        for (frame, expectedWrites) in [(narrower, []), (Self.fullHeight, ["1001:AXSize"])] {
-            let fixture = Fixture()
-            let baselineRead = BehaviorReadGate(attribute: "baseline")
-            let geometryRead = BehaviorReadGate(attribute: "geometry")
-            defer {
-                baselineRead.release.signal()
-                geometryRead.release.signal()
-                fixture.orchestrator.suspendAndRelease()
-            }
-            fixture.desktop.state.withLock {
-                $0.windows[1001]?.bounds = Self.fullHeight
-                $0.afterFrameBatchRead = { [session = fixture.session] in
-                    let count = session.reads.withLock { reads in
-                        reads += 1
-                        return reads
-                    }
-                    if count == 1 { baselineRead.read("baseline") }
-                    if count == 2 { geometryRead.read("geometry") }
-                }
-            }
-            fixture.orchestrator.start()
-            await fixture.wait { baselineRead.entered.withLock { $0 } &&
-                fixture.session.subscribed.withLock { $0.contains(fixture.element(1001)) } }
-            fixture.session.send(kAXWindowCreatedNotification, for: fixture.element(1001))
-            await fixture.wait { fixture.session.geometryEvents == 1 }
-            fixture.desktop.state.withLock { $0.windows[1001]?.bounds = frame }
-            fixture.session.send(kAXWindowResizedNotification, for: fixture.element(1001))
-            await fixture.wait { fixture.session.geometryEvents == 2 }
-
-            baselineRead.release.signal()
-            await fixture.wait { geometryRead.entered.withLock { $0 } }
-            XCTAssertEqual(fixture.writes, [])
-            geometryRead.release.signal()
-            fixture.session.send(kAXWindowResizedNotification, for: fixture.element(1001))
-            await fixture.wait { fixture.reads == 3 }
-            if !expectedWrites.isEmpty { await fixture.wait { fixture.writes == expectedWrites } }
-
-            XCTAssertEqual(fixture.writes, expectedWrites)
-            let expectedFrame = expectedWrites.isEmpty ? frame : CGRect(x: 200, y: 30, width: 700, height: 1018)
-            XCTAssertEqual(fixture.frame(), expectedFrame)
-            XCTAssertFalse(baselineRead.timedOut.withLock { $0 })
-            XCTAssertFalse(geometryRead.timedOut.withLock { $0 })
-        }
-    }
-
-    func testApplicationLaunchUsesOnlyItsFirstConfirmedFocus() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        fixture.desktop.state.withLock { $0.windows[1001]?.bounds = Self.fullHeight }
-        await fixture.start()
-        XCTAssertTrue(fixture.writes.isEmpty)
-
-        fixture.notifyWorkspace(NSWorkspace.didLaunchApplicationNotification)
-
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-        XCTAssertEqual(fixture.reads, 1)
-        fixture.desktop.state.withLock {
-            $0.windows[1002]?.bounds = Self.fullHeight
-            $0.focused = 1002
-        }
-        fixture.session.send(kAXFocusedWindowChangedNotification, for: AXElementKey(e: fixture.desktop.application(-41000)))
-        await fixture.wait {
-            fixture.session.subscribed.withLock { $0.contains(fixture.element(1002)) } && fixture.reads == 2
-        }
-        XCTAssertEqual(fixture.frame(1002), Self.fullHeight)
-        XCTAssertEqual(fixture.writes, ["1001:AXSize"])
-    }
-
-    func testCreationEvidenceCannotAdjustADifferentFocusedWindow() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        fixture.desktop.state.withLock {
-            $0.windows[1002]?.bounds = Self.fullHeight
-            $0.focused = 1002
-        }
-
-        fixture.session.send(kAXWindowCreatedNotification, for: fixture.element(2001))
-
-        await fixture.wait {
-            fixture.session.subscribed.withLock { $0.contains(fixture.element(1002)) } && fixture.reads == 2
-        }
-        await fixture.report(Self.fullHeight, id: 1002)
-        XCTAssertEqual(fixture.frame(1002), Self.fullHeight)
-        XCTAssertTrue(fixture.writes.isEmpty)
-    }
-
-    func testTerminationClearsUnconsumedLaunchEvidence() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        fixture.desktop.state.withLock { $0.focused = nil }
-        fixture.orchestrator.start()
-        fixture.notifyWorkspace(NSWorkspace.didLaunchApplicationNotification)
-        fixture.notifyWorkspace(NSWorkspace.didTerminateApplicationNotification)
-        fixture.desktop.state.withLock {
-            $0.windows[1001]?.bounds = Self.fullHeight
-            $0.focused = 1001
-        }
-        fixture.notifyWorkspace(NSWorkspace.didActivateApplicationNotification)
-
-        await fixture.start()
-        await fixture.report(Self.fullHeight)
-        XCTAssertEqual(fixture.frame(), Self.fullHeight)
-        XCTAssertTrue(fixture.writes.isEmpty)
-    }
-
-    func testMovingOnTheSecondDisplayUsesThatDisplaysVisibleFrameAndPanel() async {
-        let fixture = Fixture(displays: [Fixture.primary, Fixture.secondary])
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-
-        await fixture.report(CGRect(x: -1200, y: 125, width: 650, height: 875), notification: kAXWindowMovedNotification)
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-
-        XCTAssertEqual(fixture.frame(), CGRect(x: -1200, y: 125, width: 650, height: 843))
-    }
-
-    func testOnlyAnExactVerticalMatchCanStartAnAdjustment() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-
-        await fixture.report(CGRect(x: 200, y: 31, width: 700, height: 1049))
-        await fixture.report(CGRect(x: 200, y: 30, width: 700, height: 1049))
-        await fixture.report(Self.floating)
-        XCTAssertTrue(fixture.writes.isEmpty)
-
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-    }
-
-    func testAWindowOnTheDisplayWithNoVisiblePanelStaysFullHeight() async {
-        let hidden = WindowAdjustmentDisplay(frame: Fixture.secondary.frame, visibleFrame: Fixture.secondary.visibleFrame,
-                                             panelFrame: nil)
-        let fixture = Fixture(displays: [Fixture.primary, hidden])
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-
-        let frame = CGRect(x: -1200, y: 125, width: 650, height: 875)
-        await fixture.report(frame)
-        await fixture.report(frame)
-        XCTAssertTrue(fixture.writes.isEmpty)
-        XCTAssertEqual(fixture.frame(), frame)
-    }
-
-    func testOwnResizeAndReturnToTheSameFillFrameDoNotRepeatTheWrite() async throws {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes.count == 1 }
-        await fixture.report(try XCTUnwrap(fixture.frame()))
-        await fixture.report(Self.fullHeight)
-        await fixture.report(Self.fullHeight)
-        await fixture.report(Self.floating)
-        XCTAssertEqual(fixture.writes, ["1001:AXSize"])
-
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes.count == 2 }
-        XCTAssertEqual(fixture.writes, ["1001:AXSize", "1001:AXSize"])
-    }
-
-    func testFocusSeedsWithoutWritingAndAnOldWindowCannotTriggerAdjustment() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        fixture.desktop.state.withLock { $0.windows[1001]?.bounds = Self.fullHeight }
-        await fixture.start()
-        await fixture.report(Self.fullHeight)
-
-        fixture.desktop.state.withLock {
-            $0.windows[1002]?.bounds = Self.fullHeight
-            $0.focused = 1002
-        }
-        fixture.session.send(kAXFocusedWindowChangedNotification, for: AXElementKey(e: fixture.desktop.application(-41000)))
-        await fixture.wait {
-            fixture.session.subscribed.withLock { $0.contains(fixture.element(1002)) } && fixture.reads == 3
-        }
-        fixture.session.send(kAXWindowResizedNotification, for: fixture.element(1001))
-        await fixture.report(Self.fullHeight, id: 1002)
-        await fixture.report(Self.floating, id: 1002)
-        XCTAssertTrue(fixture.writes.isEmpty)
-
-        await fixture.report(Self.fullHeight, id: 1002)
-        await fixture.wait { fixture.writes == ["1002:AXSize"] }
-        XCTAssertEqual(fixture.frame(), Self.fullHeight)
-    }
-
-    func testOldWindowCannotBeResizedWhileNewFocusIsBeingRead() async {
-        let fixture = Fixture()
-        let focusRead = BehaviorReadGate()
-        defer { focusRead.release.signal(); fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        fixture.desktop.state.withLock {
-            $0.focused = 1002
-            $0.beforeRead = { focusRead.read($0) }
-        }
-
-        fixture.session.send(kAXFocusedWindowChangedNotification, for: AXElementKey(e: fixture.desktop.application(-41000)))
-        await fixture.wait { focusRead.entered.withLock { $0 } }
-        fixture.desktop.state.withLock { $0.windows[1001]?.bounds = Self.fullHeight }
-        fixture.session.send(kAXWindowResizedNotification, for: fixture.element(1001))
-        await fixture.wait { fixture.session.geometryEvents == 1 }
-
-        focusRead.release.signal()
-        await fixture.wait {
-            fixture.session.subscribed.withLock { $0.contains(fixture.element(1002)) } && fixture.reads >= 2
-        }
-        XCTAssertFalse(focusRead.timedOut.withLock { $0 })
-        XCTAssertTrue(fixture.writes.isEmpty)
-        XCTAssertEqual(fixture.frame(), Self.fullHeight)
-    }
-
-    func testTopologyChangeRejectsInFlightGeometryWithoutReplacingTheBaseline() async {
-        let fixture = Fixture()
-        let oldFrameRead = BehaviorReadGate(attribute: "old-frame")
-        let currentFrameRead = BehaviorReadGate(attribute: "current-frame")
-        defer {
-            oldFrameRead.release.signal()
-            currentFrameRead.release.signal()
-            fixture.orchestrator.suspendAndRelease()
-        }
-        await fixture.start()
-        fixture.desktop.state.withLock {
-            $0.windows[1001]?.bounds = Self.fullHeight
-            $0.afterFrameBatchRead = { [session = fixture.session] in
-                let count = session.reads.withLock { reads in
-                    reads += 1
-                    return reads
-                }
-                if count == 2 { oldFrameRead.read("old-frame") }
-                if count == 3 { currentFrameRead.read("current-frame") }
-            }
-        }
-        fixture.session.send(kAXWindowResizedNotification, for: fixture.element(1001))
-        await fixture.wait { oldFrameRead.entered.withLock { $0 } }
-
-        NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        fixture.session.send(kAXWindowResizedNotification, for: fixture.element(1001))
-        oldFrameRead.release.signal()
-        await fixture.wait { currentFrameRead.entered.withLock { $0 } }
-        XCTAssertEqual(fixture.writes, [])
-
-        currentFrameRead.release.signal()
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-        XCTAssertEqual(fixture.frame(), CGRect(x: 200, y: 30, width: 700, height: 1018))
-        XCTAssertFalse(oldFrameRead.timedOut.withLock { $0 })
-        XCTAssertFalse(currentFrameRead.timedOut.withLock { $0 })
-    }
-
-    func testUnsupportedFullscreenFlagDoesNotDiscardAValidGeometrySample() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        fixture.desktop.state.withLock { _ = $0.missingFullscreenFlag.insert(1001) }
-        await fixture.start()
-
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-        XCTAssertEqual(fixture.frame(), CGRect(x: 200, y: 30, width: 700, height: 1018))
-    }
-
-    func testMissingNotificationDoesNotAdjustAnOtherwiseEligibleFrame() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        fixture.desktop.state.withLock { $0.windows[1001]?.bounds = Self.fullHeight }
-
-        await Task.yield()
-
-        XCTAssertEqual(fixture.reads, 1)
-        XCTAssertTrue(fixture.writes.isEmpty)
-        XCTAssertEqual(fixture.frame(), Self.fullHeight)
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-    }
-
-    func testFullscreenAndMinimizedWindowsAreSkipped() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        fixture.desktop.state.withLock { _ = $0.fullscreenWindows.insert(1001) }
-        await fixture.report(Self.fullHeight)
-        fixture.desktop.state.withLock {
-            $0.fullscreenWindows.remove(1001)
-            $0.windows[1001]?.status = .minimized
-        }
-        await fixture.report(Self.fullHeight)
-        fixture.desktop.state.withLock { $0.windows[1001]?.status = .active }
-        await fixture.report(Self.floating)
-
-        XCTAssertTrue(fixture.writes.isEmpty)
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-    }
-
-    func testRejectedWriteDoesNotRetryOnDuplicateNotification() async {
-        let fixture = Fixture()
-        defer { fixture.orchestrator.suspendAndRelease() }
-        await fixture.start()
-        fixture.desktop.state.withLock { $0.rejectWrites = true }
-        await fixture.report(Self.fullHeight)
-        await fixture.report(Self.fullHeight)
-        fixture.desktop.state.withLock { $0.rejectWrites = false }
-
-        await fixture.report(Self.fullHeight)
-        await fixture.report(Self.floating)
-        XCTAssertEqual(fixture.desktop.state.withLock { $0.sizeWriteAttempts }, 1)
-        XCTAssertTrue(fixture.writes.isEmpty)
-
-        await fixture.report(Self.fullHeight)
-        await fixture.wait { fixture.writes == ["1001:AXSize"] }
-        XCTAssertEqual(fixture.desktop.state.withLock { $0.sizeWriteAttempts }, 2)
-    }
-
-    func testDisabledAdjustmentStartsNoGeometryObserver() async {
-        let fixture = Fixture(enabled: false)
-        defer { fixture.orchestrator.suspendAndRelease() }
-        fixture.orchestrator.start()
-        fixture.desktop.state.withLock { $0.windows[1001]?.bounds = Self.fullHeight }
-        fixture.session.send(kAXWindowResizedNotification, for: fixture.element(1001))
-
-        let callbackDelivered = expectation(description: "Geometry callback delivery")
-        Task { @MainActor in callbackDelivered.fulfill() }
-        await fulfillment(of: [callbackDelivered], timeout: 2)
-        XCTAssertTrue(fixture.session.subscribed.withLock { $0.isEmpty })
-        XCTAssertTrue(fixture.writes.isEmpty)
-        XCTAssertEqual(fixture.reads, 0)
-    }
-
-}
-
 @MainActor
 final class BehaviorStatusItem: StatusItemPresenting {
     var isVisible = false
@@ -2489,7 +1968,6 @@ final class BehaviorPermissionWindow: NSWindow {
 
 final class BehaviorPermission: Sendable {
     let trusted = Mutex(false)
-    let clock = Mutex<TimeInterval>(0)
 }
 
 @MainActor
@@ -2501,9 +1979,6 @@ final class ApplicationBehaviorTests: XCTestCase {
         var panelCreations = 0
         var quitRequests = 0
         var instanceCleanupRequests = 0
-        var relaunchURLs: [URL] = []
-        var frameAtRelaunch: CGRect?
-        var relaunchFails = false
         var windows: [BehaviorPermissionWindow] = []
         var panels: TaskbarScreenOrchestrator?
     }
@@ -2521,24 +1996,16 @@ final class ApplicationBehaviorTests: XCTestCase {
 
         init(trusted initial: Bool = false,
              previousInstanceExit: (@MainActor @Sendable () async -> Bool)? = nil,
+             startInventory: @escaping @MainActor () -> Void = {},
              configureEnvironment: (inout ApplicationEnvironment, UserDefaults) -> Void = { _, _ in }) {
             permission.trusted.withLock { $0 = initial }
             defaults = UserDefaults(suiteName: domain)!
-            let reader = AXWindowReader(accessibility: desktop)
-            runtime = AppRuntime(tracker: BehaviorInventory(desktop),
-                actionExecutor: PlatformActionExecutor(reader: reader, system: desktop, focusBackend: desktop))
             let topology = DisplayTopologyStore(initialSnapshot: .init(physicalDisplayCount: 0, identifiedDisplayUUIDs: [], attributionTable: .empty))
             var environment = ApplicationEnvironment()
             environment.bundleURL = URL(fileURLWithPath: "/Applications/DeskMote.app")
             environment.permissionService = PermissionService(trustCheck: { [permission] in permission.trusted.withLock { $0 } },
                 promptRequest: { [effects] in effects.prompts += 1; return false }, readOnlyVolumeCheck: { _ in false })
             environment.permissionProbe = { [permission] in permission.trusted.withLock { $0 } }
-            environment.now = { [permission] in
-                permission.clock.withLock { value in
-                    defer { value += 6 }
-                    return value
-                }
-            }
             environment.setActivationPolicy = { _ in }
             environment.retirePreviousInstances = { [effects] in
                 effects.instanceCleanupRequests += 1
@@ -2547,11 +2014,7 @@ final class ApplicationBehaviorTests: XCTestCase {
             environment.resetAppearance = {}
             environment.activateApplication = {}
             environment.terminate = { [effects] in effects.quitRequests += 1 }
-            environment.launchInstance = { [effects, desktop] url in
-                effects.relaunchURLs.append(url)
-                effects.frameAtRelaunch = desktop.state.withLock { $0.windows[1001]?.bounds }
-                return effects.relaunchFails ? .failure(CocoaError(.fileReadUnknown)) : .success(())
-            }
+            environment.forceExit = {}
             environment.makeStatusItem = { [status, effects] in effects.statusCreations += 1; return status }
             environment.makePermissionWindow = { [effects] frame, style in
                 let window = BehaviorPermissionWindow(contentRect: frame, styleMask: style, backing: .buffered, defer: true)
@@ -2562,11 +2025,15 @@ final class ApplicationBehaviorTests: XCTestCase {
                 effects.panelCreations += 1
                 let panels = TaskbarScreenOrchestrator(runtime: runtime, stripOrderStore: ordering, displayTopologyStore: topology,
                     spaceStore: TaskbarSpaceStore(read: { _ in nil }, notifications: NotificationCenter(), pollInterval: 0),
-                    topologySnapshotProvider: { .init(physicalDisplayCount: 0, identifiedDisplayUUIDs: [], attributionTable: .empty) }, makeGeometryObserver: { nil })
+                    topologySnapshotProvider: { .init(physicalDisplayCount: 0, identifiedDisplayUUIDs: [], attributionTable: .empty) })
                 effects.panels = panels
                 return panels
             }
             configureEnvironment(&environment, defaults)
+            let reader = AXWindowReader(accessibility: desktop)
+            runtime = AppRuntime(tracker: BehaviorInventory(desktop, onStart: startInventory),
+                accessibilityAccess: environment.runtimeAccessibilityAccess,
+                actionExecutor: PlatformActionExecutor(reader: reader, system: desktop, focusBackend: desktop))
             delegate = AppDelegate(environment: environment, runtime: runtime, displayTopologyStore: topology,
                 stripOrderStore: StripOrderStore(defaults: defaults))
         }
@@ -2603,32 +2070,25 @@ final class ApplicationBehaviorTests: XCTestCase {
         XCTAssertEqual(starts, [false])
     }
 
-    func testAccessibilityRecoveryDoesNotStartTheInputModuleInAnInactiveSession() async {
-        var sessionActive = true
+    func testWatchdogDefersInputModuleUntilSessionIsActive() async {
+        let notifications = NotificationCenter()
+        var sessionActive = false
         var starts = 0
-        var stops = 0
         let fixture = Fixture(trusted: true, configureEnvironment: { environment, defaults in
             environment.moduleSessionIsActive = { sessionActive }
+            environment.moduleSessionNotifications = notifications
             defaults.set(true, forKey: "deskmote.module.session-input")
             let toggle = DeskMoteModuleToggle(id: "session-input", title: "Input", defaults: defaults,
-                requiresAccessibility: true, start: { _ in starts += 1; return .running }, stop: { stops += 1 })
+                requiresAccessibility: true, start: { _ in starts += 1; return .running }, stop: {})
             environment.makeModules = { _ in [.toggle(toggle)] }
         })
         defer { fixture.stop() }
         fixture.launch()
-        XCTAssertEqual(starts, 1)
-        sessionActive = false
-        fixture.permission.trusted.withLock { $0 = false }
-        fixture.delegate.schedulePermissionProbe()
-        await wait { stops == 1 }
-        fixture.permission.trusted.withLock { $0 = true }
-        fixture.delegate.schedulePermissionProbe()
-        let deadline = ContinuousClock.now + .milliseconds(100)
-        while ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
-        XCTAssertEqual(starts, 1)
+        await wait { fixture.delegate.permissionWatchdog.isReady }
+        XCTAssertEqual(starts, 0)
         sessionActive = true
-        fixture.delegate.schedulePermissionProbe()
-        await wait { starts == 2 }
+        notifications.post(name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+        XCTAssertEqual(starts, 1)
     }
 
     func testFirstLaunchUsesOnlySystemPromptAndLateGrantStartsRuntimeOnce() async {
@@ -2691,21 +2151,23 @@ final class ApplicationBehaviorTests: XCTestCase {
     }
 
     func testQuitStopsWindowRuntimeAndKeepsTheAdjustedHeight() async {
-        let height = WindowHeightAdjustmentTests.Fixture()
-        let fixture = Fixture(trusted: true, configureEnvironment: { environment, _ in
-            environment.makePanels = { _, _, _ in height.orchestrator }
-        })
-        defer { fixture.stop(); height.orchestrator.suspendAndRelease() }
-        fixture.launch()
-        await wait { fixture.runtime.snapshot.windows.count == 3 }
-        await height.start()
-        await height.report(CGRect(x: 200, y: 30, width: 700, height: 1050))
-        await height.wait { height.writes == ["1001:AXSize"] }
+        await WindowHeightFallbackTests.verifyQuitKeepsCorrectedHeight()
+    }
 
-        XCTAssertEqual(fixture.delegate.applicationShouldTerminate(NSApplication.shared), .terminateNow)
-        XCTAssertTrue(fixture.runtime.snapshot.windows.isEmpty)
-        XCTAssertEqual(height.frame(), CGRect(x: 200, y: 30, width: 700, height: 1018))
-        XCTAssertEqual(height.writes, ["1001:AXSize"])
+    func testPermissionWatchdogSubmitsTheFirstPeriodicProbeOffMain() async {
+        let probes = expectation(description: "Startup and first scheduled trust probes")
+        probes.expectedFulfillmentCount = 2
+        let fixture = Fixture(trusted: true, configureEnvironment: { environment, _ in
+            environment.moduleSessionNotifications = NotificationCenter()
+            environment.permissionProbe = {
+                XCTAssertFalse(Thread.isMainThread)
+                probes.fulfill()
+                return true
+            }
+        })
+        defer { fixture.stop() }
+        fixture.launch()
+        await fulfillment(of: [probes], timeout: 9)
     }
 
     func testPermissionWatchdogProbesWhileMainThreadIsBusy() {
@@ -2727,44 +2189,135 @@ final class ApplicationBehaviorTests: XCTestCase {
         }, .apiDisabled)
     }
 
-    func testPermissionLossSuspendsRealRuntime() async {
-        let fixture = Fixture(trusted: true); defer { fixture.stop() }
-        fixture.launch()
-        await wait { fixture.runtime.snapshot.windows.count == 3 }
-        fixture.permission.trusted.withLock { $0 = false }
-        fixture.delegate.schedulePermissionProbe()
-        await wait { fixture.runtime.snapshot.windows.isEmpty }
-        fixture.runtime.activate(windowID: "editor-a")
-        XCTAssertTrue(fixture.runtime.pendingActionsForTesting.isEmpty)
-        XCTAssertEqual(fixture.effects.panels?.units.count, 0)
-        XCTAssertTrue(fixture.desktop.state.withLock { $0.writes.isEmpty })
-        XCTAssertEqual(fixture.effects.prompts, 1)
-        XCTAssertFalse(fixture.effects.windows.contains { $0.isVisible })
-    }
-
-    func testPermissionRecoveryRelaunchesWithTheCurrentFrame() async {
-        for failRelaunch in [false, true] {
-            let fixture = Fixture(trusted: true); defer { fixture.stop() }
-            fixture.effects.relaunchFails = failRelaunch
+    func testFirstRuntimeAXCallHasTerminalProtection() async {
+        for initiallyTrusted in [true, false] {
+            let access = RuntimeAccessibilityAccess(initiallyTrusted: false)
+            let calls = Mutex(0)
+            let fixture = Fixture(trusted: initiallyTrusted, startInventory: {
+                XCTAssertEqual(access.call {
+                    calls.withLock { $0 += 1 }
+                    return .apiDisabled
+                }, .apiDisabled)
+            }, configureEnvironment: { environment, _ in
+                environment.runtimeAccessibilityAccess = access
+                environment.permissionProbe = { true }
+            })
+            defer { fixture.stop() }
             fixture.launch()
-            await wait { fixture.runtime.snapshot.windows.count == 3 }
-            let adjusted = CGRect(x: 0, y: 30, width: 1920, height: 1016)
-            fixture.desktop.state.withLock { $0.windows[1001]?.bounds = adjusted }
-            fixture.permission.trusted.withLock { $0 = false }
-            fixture.delegate.schedulePermissionProbe()
-            await wait { fixture.runtime.snapshot.windows.isEmpty }
-            fixture.permission.trusted.withLock { $0 = true }
-            fixture.delegate.applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification))
-            await wait { fixture.effects.relaunchURLs.count == 1 }
-            XCTAssertEqual(fixture.effects.frameAtRelaunch, adjusted)
-            XCTAssertTrue(fixture.desktop.state.withLock { $0.writes.isEmpty })
-            XCTAssertEqual(fixture.effects.relaunchURLs, [URL(fileURLWithPath: "/Applications/DeskMote.app")])
-            await wait { failRelaunch || fixture.effects.quitRequests == 1 }
-            XCTAssertEqual(fixture.effects.quitRequests, failRelaunch ? 0 : 1)
-            fixture.delegate.applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification))
-            XCTAssertEqual(fixture.effects.relaunchURLs.count, 1)
+            if !initiallyTrusted {
+                XCTAssertFalse(access.allowsCalls)
+                XCTAssertEqual(calls.withLock { $0 }, 0)
+                XCTAssertEqual(fixture.effects.prompts, 1)
+                fixture.permission.trusted.withLock { $0 = true }
+                fixture.delegate.applicationDidBecomeActive(Notification(name: NSApplication.didBecomeActiveNotification))
+            }
+            await wait { fixture.effects.quitRequests == 1 }
+            XCTAssertEqual(calls.withLock { $0 }, 1)
+            XCTAssertFalse(access.allowsCalls)
+            _ = access.updateTrust(true)
+            XCTAssertFalse(access.allowsCalls)
         }
     }
+
+    func testRequiredAccessibilityLossRequestsQuitOnce() async throws {
+        let access = RuntimeAccessibilityAccess(initiallyTrusted: false)
+        let exits = Mutex(0)
+        let clock = WatchdogTestClock()
+        let fixture = Fixture(trusted: true, configureEnvironment: { environment, _ in
+            environment.runtimeAccessibilityAccess = access
+            environment.permissionClock = { clock.now }
+            environment.schedulePermissionDeadline = clock.schedule
+            environment.forceExit = { exits.withLock { $0 += 1 } }
+        })
+        defer { fixture.stop() }
+        fixture.launch()
+        await wait { fixture.delegate.permissionWatchdog.isReady }
+        XCTAssertEqual(access.call { .apiDisabled }, .apiDisabled)
+        XCTAssertFalse(access.allowsCalls)
+        await wait { fixture.effects.quitRequests == 1 }
+        clock.advance(to: 2)
+        XCTAssertEqual(exits.withLock { $0 }, 0)
+        clock.advance(to: 3)
+        clock.advance(to: 6)
+        XCTAssertEqual(exits.withLock { $0 }, 1)
+        XCTAssertEqual(fixture.effects.quitRequests, 1)
+    }
+
+    func testPermissionWatchdogAndHeightPollProgressIndependently() async {
+        let access = RuntimeAccessibilityAccess(initiallyTrusted: false)
+        let probing = Mutex(0)
+        let probeRelease = DispatchSemaphore(value: 0)
+        let fixture = Fixture(trusted: true, configureEnvironment: { environment, _ in
+            environment.runtimeAccessibilityAccess = access
+            environment.permissionProbe = {
+                let sample = probing.withLock { $0 += 1; return $0 }
+                if sample == 1 {
+                    _ = probeRelease.wait(timeout: .now() + 2)
+                    return true
+                }
+                return false
+            }
+        })
+        defer { probeRelease.signal(); fixture.stop() }
+        fixture.launch()
+        await wait { probing.withLock { $0 == 1 } }
+        await WindowHeightFallbackTests.verifyCaptureDuringHeldAX(access: access) {
+            XCTAssertEqual(probing.withLock { $0 }, 1)
+            probeRelease.signal()
+            await self.wait { fixture.delegate.permissionWatchdog.isReady }
+            fixture.delegate.schedulePermissionProbe()
+            await self.wait { probing.withLock({ $0 == 2 }) && fixture.effects.quitRequests == 1 }
+            XCTAssertFalse(access.allowsCalls)
+        }
+    }
+
+    func testWakeRequiresFreshPermissionReadiness() async throws {
+        let access = RuntimeAccessibilityAccess(initiallyTrusted: false)
+        let clock = WatchdogTestClock()
+        let notifications = NotificationCenter()
+        let exits = Mutex(0)
+        let fixture = Fixture(trusted: true, configureEnvironment: { environment, _ in
+            environment.runtimeAccessibilityAccess = access
+            environment.permissionClock = { clock.now }
+            environment.schedulePermissionDeadline = clock.schedule
+            environment.moduleSessionNotifications = notifications
+            environment.forceExit = { exits.withLock { $0 += 1 } }
+        })
+        defer { fixture.stop() }
+        fixture.launch()
+        await wait { fixture.delegate.permissionWatchdog.isReady }
+        notifications.post(name: NSWorkspace.willSleepNotification, object: nil)
+        XCTAssertFalse(fixture.delegate.permissionWatchdog.isReady)
+        clock.advance(to: 3)
+        XCTAssertEqual(exits.withLock { $0 }, 0)
+        XCTAssertEqual(fixture.effects.quitRequests, 0)
+        notifications.post(name: NSWorkspace.didWakeNotification, object: nil)
+        await wait { fixture.delegate.permissionWatchdog.isReady }
+    }
+
+    func testCommandShiftRestoresOnlyAfterTheWatchdogIsReady() async {
+        let probing = Mutex(false)
+        let release = DispatchSemaphore(value: 0)
+        var starts = 0
+        let fixture = Fixture(trusted: true, configureEnvironment: { environment, defaults in
+            environment.permissionProbe = {
+                probing.withLock { $0 = true }
+                _ = release.wait(timeout: .now() + 2)
+                return true
+            }
+            defaults.set(true, forKey: "deskmote.module.test-command-shift")
+            let toggle = DeskMoteModuleToggle(id: "test-command-shift", title: "Command Shift", defaults: defaults,
+                requiresAccessibility: true, start: { _ in starts += 1; return .running }, stop: {})
+            environment.makeModules = { _ in [.toggle(toggle)] }
+        })
+        defer { release.signal(); fixture.stop() }
+        fixture.launch()
+        await wait { probing.withLock { $0 } && fixture.runtime.snapshot.windows.count == 3 }
+        XCTAssertEqual(starts, 0)
+        release.signal()
+        await wait { starts == 1 }
+    }
+
 }
 
 
@@ -2778,7 +2331,7 @@ extension TaskbarBehaviorTests {
             fixture.desktop.state.withLock { $0.frontmostPIDOverride = frontmost }
             fixture.runtime.activate(windowID: "editor-b")
             for task in fixture.runtime.pendingActionsForTesting { await task.value }
-            XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"]?.phase, .failure)
+            XCTAssertEqual(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"]?.phase, .failure)
         }
     }
 
@@ -2814,6 +2367,6 @@ extension TaskbarBehaviorTests {
         for task in pending { await task.value }
         XCTAssertEqual(fixture.desktop.state.withLock { $0.focused }, 1002)
         XCTAssertEqual(fixture.desktop.state.withLock { $0.windows[1002]?.status }, .active)
-        XCTAssertEqual(fixture.runtime.debugState.feedbackEntriesByWindowID["editor-b"]?.phase, .success)
+        XCTAssertEqual(fixture.runtime.feedbackTestProbe.feedbackEntriesByWindowID["editor-b"]?.phase, .success)
     }
 }

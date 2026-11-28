@@ -76,32 +76,6 @@ final class TaskbarLayoutTests: XCTestCase {
         }
     }
 
-    func testAppsButtonReservesSpaceWithoutChangingWindowButtonMetrics() {
-        let apps = AppsMenuGeometry.buttonFrame
-        let result = TaskbarLayout.resolve(groups: [group("editor", count: 1, width: 100)],
-                                           width: 1024, leadingInset: AppsMenuGeometry.windowLeadingInset)
-        XCTAssertEqual(apps, CGRect(x: 10, y: 2, width: 29, height: 28))
-        XCTAssertEqual(result.buttons.first?.frame, CGRect(x: 41, y: 2, width: 100, height: 28))
-        XCTAssertEqual(AppsMenuGeometry.windowLeadingInset - apps.maxX, 2)
-
-        let crowded = TaskbarLayout.resolve(groups: [group("editor", count: 2)], width: 181,
-                                            leadingInset: AppsMenuGeometry.windowLeadingInset)
-        XCTAssertEqual(crowded.buttons.first?.frame.minX, 41)
-        XCTAssertTrue(crowded.buttons.first?.isCombined == true)
-    }
-
-    func testAppsMenuUsesMeasuredFrameAndStaysOnItsDisplay() {
-        let reference = CGRect(x: 0, y: 0, width: 1024, height: 768)
-        XCTAssertEqual(AppsMenuGeometry.popupFrame(taskbar: TaskbarMetrics.panelFrame(on: reference),
-                                                  screen: reference, visibleTop: reference.maxY),
-                       CGRect(x: 12, y: 44, width: 642, height: 676))
-
-        let smaller = CGRect(x: -530, y: -150, width: 530, height: 560)
-        XCTAssertEqual(AppsMenuGeometry.popupFrame(taskbar: TaskbarMetrics.panelFrame(on: smaller),
-                                                  screen: smaller, visibleTop: 385),
-                       CGRect(x: -518, y: -106, width: 506, height: 483))
-    }
-
     func testOverflowRetainsEveryWindowAndKeepsGroupsTogether() {
         let groups = (0..<20).map { group("app-\($0)", count: 2) }
         let result = TaskbarLayout.resolve(groups: groups, width: 400)

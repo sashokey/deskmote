@@ -13,6 +13,7 @@ final class StripOrderStore: ObservableObject {
     private let bootSession: UUID?
 
     private var absentSince: [String: TimeInterval] = [:]
+    var hasAbsentRankMemory: Bool { !absentSince.isEmpty }
     private static let rankRetentionGrace: TimeInterval = 5.0
     private static let retiredSeatPrefix = "tabgrp-retired-"
 
@@ -21,22 +22,15 @@ final class StripOrderStore: ObservableObject {
 
     private let defaults: UserDefaults
     private let elapsed: () -> TimeInterval
-    #if DEBUG
-    private let inventoryLog: WindowInventoryAnomalyLog
-    #endif
 
 
     init(defaults: UserDefaults = .standard,
          now: @escaping () -> Date = Date.init,
          bootTimeProvider: () -> Int? = StripOrderStore.bootTimeSeconds,
          bootSessionProvider: () -> UUID? = StripOrderStore.bootSessionUUID,
-         elapsed: @escaping () -> TimeInterval = StripOrderStore.elapsedTime,
-         inventoryLog: WindowInventoryAnomalyLog = WindowInventoryAnomalyLog()) {
+         elapsed: @escaping () -> TimeInterval = StripOrderStore.elapsedTime) {
         self.defaults = defaults
         self.elapsed = elapsed
-        #if DEBUG
-        self.inventoryLog = inventoryLog
-        #endif
         bootSession = bootSessionProvider()
 
         guard let saved = defaults.stringArray(forKey: orderKey) else { return }
@@ -117,9 +111,6 @@ final class StripOrderStore: ObservableObject {
         let memory = reconciliationMemory(current: currentSet, appKeyOf: appKeyOf, at: now)
         let previousAppKeys = stickyAppKeys
         stickyAppKeys = memory.appKeys.merging(appKeyOf) { _, new in new }
-        #if DEBUG
-        let expiredMemory = absentSince.filter { now - $0.value > Self.rankRetentionGrace }
-        #endif
 
         for (seat, anchor) in memory.displacedSeats {
             absentSince[anchor] = absentSince.removeValue(forKey: seat) ?? now
@@ -137,26 +128,6 @@ final class StripOrderStore: ObservableObject {
         let next = preservingApplicationOrder(reconcileResult.order, appKeys: stickyAppKeys,
                                               rememberedOrder: memory.order, rememberedAppKeys: memory.appKeys)
         absentSince = absentSince.filter { now - $0.value <= Self.rankRetentionGrace }
-        #if DEBUG
-        for (chipID, since) in expiredMemory {
-            inventoryLog.record(.orderMemoryDropped(InventoryOrderMemoryDroppedPayload(
-                chipID: chipID,
-                appKey: stickyAppKeys[chipID],
-                previousIndex: liveOrder.firstIndex(of: chipID) ?? -1,
-                absentForMs: max(0, Int(((now - since) * 1_000).rounded()))
-            )))
-        }
-        let currentSetForLog = Set(current)
-        let visibleNextForLog = next.filter(currentSetForLog.contains)
-        for placement in reconcileResult.placements where currentSetForLog.contains(placement.chipID) {
-            inventoryLog.record(.orderChipPlaced(InventoryOrderChipPlacedPayload(
-                chipID: placement.chipID,
-                appKey: stickyAppKeys[placement.chipID],
-                index: visibleNextForLog.firstIndex(of: placement.chipID) ?? placement.index,
-                reason: placement.reason.rawValue
-            )))
-        }
-        #endif
         if next != liveOrder || previousAppKeys != stickyAppKeys {
             if next != liveOrder { liveOrder = next }
             persistLiveOrder()

@@ -24,11 +24,45 @@ struct TaskbarButtonSelection {
     }
 }
 
-extension NSView {
-    var containsCurrentMouse: Bool? {
-        guard let window else { return nil }
-        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
-        return isMousePoint(point, in: visibleRect)
+@MainActor
+struct TaskbarPointerPosition {
+    private var point: NSPoint?
+    private var timestamp: TimeInterval = -.infinity
+    private var validSince: TimeInterval = -.infinity
+    private var windowFrame: NSRect?
+
+    mutating func receive(_ event: NSEvent, in view: NSView, tracking: NSTrackingArea?) -> Bool {
+        guard event.windowNumber == (view.window?.windowNumber ?? 0),
+              event.timestamp >= timestamp, event.timestamp >= validSince else { return false }
+        if event.type != .mouseMoved, let area = event.trackingArea, area !== tracking { return false }
+        timestamp = event.timestamp
+        point = event.type == .mouseExited ? nil : event.locationInWindow
+        windowFrame = view.window?.frame
+        return true
+    }
+
+    func isInside(_ view: NSView) -> Bool {
+        guard let point, !view.isHiddenOrHasHiddenAncestor, view.window?.frame == windowFrame else { return false }
+        return view.isMousePoint(view.convert(point, from: nil), in: view.visibleRect)
+    }
+
+    mutating func clear() {
+        point = nil
+        validSince = ProcessInfo.processInfo.systemUptime
+    }
+
+    mutating func rebase(in view: NSView, to newFrame: NSRect) -> Bool {
+        guard let point, let windowFrame, view.window?.frame == windowFrame, newFrame.size == windowFrame.size else {
+            clear()
+            return false
+        }
+        let rebased = CGPoint(x: point.x + windowFrame.minX - newFrame.minX,
+                              y: point.y + windowFrame.minY - newFrame.minY)
+        clear()
+        guard view.isMousePoint(view.convert(rebased, from: nil), in: view.visibleRect) else { return false }
+        self.point = rebased
+        self.windowFrame = newFrame
+        return true
     }
 }
 
@@ -59,6 +93,7 @@ final class TaskbarButtonView: NSButton {
     var onClick: (() -> Void)?
     var onContextMenu: ((NSEvent) -> Void)?
     var onHover: ((Bool) -> Void)?
+    var acceptPointerEntry: (TimeInterval) -> Bool = { _ in true }
     var onBeginDrag: ((NSEvent, CGPoint) -> Void)?
     var onDragMoved: ((NSEvent) -> Void)?
     var onEndDrag: ((NSEvent?, Bool) -> Void)?
@@ -70,6 +105,7 @@ final class TaskbarButtonView: NSButton {
     let indicator = NSBox()
     private let groupIndicator = NSBox()
     private var tracking: NSTrackingArea?
+    private var pointer = TaskbarPointerPosition()
     private var downPointInWindow: CGPoint?
     private var beganDrag = false
     private var hovered = false
@@ -77,6 +113,9 @@ final class TaskbarButtonView: NSButton {
     private var actionTargets: ActionTargets?
 
     override var isFlipped: Bool { true }
+    override var frame: NSRect {
+        didSet { if frame != oldValue { clearPointer() } }
+    }
     override var acceptsFirstResponder: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -160,26 +199,55 @@ final class TaskbarButtonView: NSButton {
     override func updateTrackingAreas() {
         if let tracking { removeTrackingArea(tracking) }
         let area = NSTrackingArea(rect: .zero,
-                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+                                  options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self)
         addTrackingArea(area)
         tracking = area
         super.updateTrackingAreas()
     }
 
     override func mouseEntered(with event: NSEvent) {
-        guard containsCurrentMouse != false else { return }
-        super.mouseEntered(with: event)
-        hovered = true
-        updateAppearance(animated: true)
-        onHover?(true)
+        receivePointer(event)
     }
 
     override func mouseExited(with event: NSEvent) {
-        guard containsCurrentMouse != true else { return }
-        super.mouseExited(with: event)
-        hovered = false
+        receivePointer(event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        receivePointer(event)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        clearPointer()
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        clearPointer()
+    }
+
+    var acceptsDelayedHover: Bool { window == nil || pointer.isInside(self) }
+
+    private func receivePointer(_ event: NSEvent) {
+        guard pointer.receive(event, in: self, tracking: tracking) else { return }
+        let inside = window == nil ? event.type != .mouseExited : pointer.isInside(self)
+        guard !inside || acceptPointerEntry(event.timestamp) else { return }
+        let wasHovered = hovered
+        setHovered(inside)
+        if inside, wasHovered, event.type == .mouseEntered { onHover?(true) }
+    }
+
+    func clearPointer() {
+        pointer.clear()
+        setHovered(false)
+    }
+
+    private func setHovered(_ value: Bool) {
+        guard hovered != value else { return }
+        hovered = value
         updateAppearance(animated: true)
-        onHover?(false)
+        onHover?(value)
     }
 
     var canInteract: () -> Bool = { true }

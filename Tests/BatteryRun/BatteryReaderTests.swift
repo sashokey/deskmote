@@ -1,109 +1,65 @@
 import Foundation
-import IOKit.ps
 
-let batteryReaderTests = [
-    TestCase(name: "internal battery is selected over a peripheral and capacity is normalized") {
-        let descriptions: [[String: Any]] = [
-            [kIOPSTypeKey: "UPS", kIOPSCurrentCapacityKey: 10, kIOPSMaxCapacityKey: 100],
-            [kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSIsPresentKey: true,
-             kIOPSCurrentCapacityKey: 3000, kIOPSMaxCapacityKey: 5000,
-             kIOPSPowerSourceStateKey: kIOPSBatteryPowerValue]
-        ]
-        let sample = BatteryReader.sample(from: descriptions, at: Date(timeIntervalSince1970: 1000))
-        try expectNear(sample?.percent, 60, "must scale internal battery capacity to percent")
-        try expect(sample?.onBattery == true, "must use the battery power-source state")
-    },
-    TestCase(name: "external power is distinguished from a paused charge") {
-        let descriptions: [[String: Any]] = [
-            [kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: 80,
-             kIOPSMaxCapacityKey: 100, kIOPSIsChargingKey: false,
-             kIOPSPowerSourceStateKey: kIOPSACPowerValue]
-        ]
-        try expect(BatteryReader.sample(from: descriptions, at: Date())?.onBattery == false, "not charging does not mean running on battery")
-    },
-    TestCase(name: "power channels preserve measured zero and reject invalid readings") {
-        let battery: [String: Any] = [
-            kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: 80,
-            kIOPSMaxCapacityKey: 100, kIOPSPowerSourceStateKey: kIOPSACPowerValue,
-            kIOPSIsChargingKey: false, kIOPSTimeToFullChargeKey: 20
-        ]
-        let date = Date(timeIntervalSince1970: 1000)
-        let zero = BatteryReader.sample(from: [battery], at: date, powerProperties: [
-            "PowerTelemetryData": ["BatteryPower": 0, "SystemPowerIn": 0]
-        ])
-        try expectNear(zero?.batteryWatts, 0, "zero battery flow is a reading")
-        try expectNear(zero?.inputWatts, 0, "zero input is a reading")
-        try expect(zero?.timeToFull == nil, "paused charging must discard a stale ETA")
-
-        let invalid = BatteryReader.sample(from: [battery], at: date, powerProperties: [
-            "PowerTelemetryData": ["BatteryPower": Double.nan, "SystemPowerIn": -1]
-        ])
-        try expect(invalid?.batteryWatts == nil && invalid?.inputWatts == nil, "invalid channels must be unavailable")
-    },
-    TestCase(name: "battery power falls back to signed instantaneous current and voltage") {
-        let battery: [String: Any] = [
-            kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: 80,
-            kIOPSMaxCapacityKey: 100, kIOPSPowerSourceStateKey: kIOPSACPowerValue
-        ]
-        let sample = BatteryReader.sample(from: [battery], at: Date(), powerProperties: [
-            "Voltage": 12000, "InstantAmperage": UInt64(bitPattern: -40), "Amperage": 30
-        ])
-        try expectNear(sample?.batteryWatts, -0.48, "signed current and millivolts must convert to watts")
-        try expect(sample?.inputWatts == nil, "missing measured input must be unavailable")
-    },
-    TestCase(name: "idle power prefers the direct channels and falls back independently") {
-        let battery: [String: Any] = [
-            kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: 80,
-            kIOPSMaxCapacityKey: 100, kIOPSPowerSourceStateKey: kIOPSACPowerValue,
-            kIOPSIsChargingKey: false
-        ]
-        let properties = ["PowerTelemetryData": ["BatteryPower": 100, "SystemPowerIn": 15250]]
-        let live = BatteryReader.sample(from: [battery], at: Date(), powerProperties: properties, readLivePower: {
-            PowerWatts(battery: 0.47, input: 12.01)
-        })
-        try expectNear(live?.batteryWatts, 0.47, "fresh Battery watts must take precedence over the cached value")
-        try expectNear(live?.inputWatts, 12.01, "fresh DC In watts must take precedence over the cached value")
-        try expect(live?.powerReadingSource == .direct, "success requires both channels to be read directly")
-
-        let partial = BatteryReader.sample(from: [battery], at: Date(), powerProperties: properties, readLivePower: {
-            PowerWatts(battery: 0, input: .nan)
-        })
-        try expectNear(partial?.batteryWatts, 0, "a fresh measured zero must be kept")
-        try expectNear(partial?.inputWatts, 15.25, "an invalid direct reading must fall back for that channel only")
-        try expect(partial?.powerReadingSource == .partial, "a cached channel must not be marked as a direct reading")
-    },
-    TestCase(name: "one measured percentage point is enough to estimate the charge rate") {
-        let date = Date(timeIntervalSince1970: 1000)
-        func reading(_ capacity: Int, at date: Date) -> BatterySample? {
-            BatteryReader.sample(from: [[
-                kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: capacity,
-                kIOPSMaxCapacityKey: 100, kIOPSPowerSourceStateKey: kIOPSACPowerValue,
-                kIOPSIsChargingKey: true
-            ]], at: date)
+let reportedWattsTests = [
+    TestCase(name: "Reported watts interprets encoded signed power and converts units") {
+        for value in [NSNumber(value: -7_800), NSNumber(value: UInt64(bitPattern: -7_800))] {
+            let result = BatteryReader.reportedWatts(
+                from: ["PowerTelemetryData": ["BatteryPower": value, "SystemPowerIn": 15_090]],
+                externalPower: true, isCharging: true, readSMC: { nil }
+            )
+            try expectNear(result.battery, -7.8, "battery milliwatts are signed")
+            try expectNear(result.input, 15.09, "input milliwatts converted to watts")
         }
-        guard let start = reading(56, at: date), let current = reading(57, at: date.addingTimeInterval(60)) else {
-            throw TestFailure.failed("valid charging samples expected")
-        }
-        let session = ChargingSession(start: start, observedStart: true)
-        try expectNear(session.secondsPerPoint(at: current), 60, "roundoff must not delay the estimate")
     },
-    TestCase(name: "missing absent or invalid battery data is unavailable rather than fabricated") {
-        for descriptions: [[String: Any]] in [
-            [],
-            [[kIOPSTypeKey: "UPS", kIOPSCurrentCapacityKey: 80, kIOPSMaxCapacityKey: 100]],
-            [[kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: 80, kIOPSMaxCapacityKey: 0]],
-            [[kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSIsPresentKey: false, kIOPSCurrentCapacityKey: 80, kIOPSMaxCapacityKey: 100]],
-            [[kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: -1, kIOPSMaxCapacityKey: 100]],
-            [[kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSCurrentCapacityKey: 80, kIOPSMaxCapacityKey: 100]]
-        ] {
-            try expect(BatteryReader.sample(from: descriptions, at: Date()) == nil, "invalid battery dictionary must yield no sample")
+    TestCase(name: "Reported watts selects idle AC sensors and falls back per channel") {
+        let properties = ["PowerTelemetryData": ["BatteryPower": -7_800, "SystemPowerIn": 15_090]]
+        let partial = BatteryReader.reportedWatts(from: properties, externalPower: true, isCharging: false) {
+            PowerWatts(battery: 0, input: -.infinity)
         }
-    }
+        try expectNear(partial.battery, 0, "a reported zero is valid")
+        try expectNear(partial.input, 15.09, "nonfinite input falls back")
+        let other = BatteryReader.reportedWatts(from: properties, externalPower: true, isCharging: false) {
+            PowerWatts(battery: .nan, input: 10)
+        }
+        try expectNear(other.battery, -7.8, "battery fallback is independent")
+        try expectNear(other.input, 10, "reported SMC input takes precedence when idle")
+        let negativeInput = BatteryReader.reportedWatts(from: properties, externalPower: true, isCharging: false) {
+            PowerWatts(battery: nil, input: -1)
+        }
+        try expectNear(negativeInput.input, 15.09, "negative SMC input falls back")
+    },
+    TestCase(name: "Reported watts ignores input and idle AC sensors on battery") {
+        var queriedSMC = false
+        let result = BatteryReader.reportedWatts(
+            from: ["PowerTelemetryData": ["BatteryPower": -7_800, "SystemPowerIn": 0]],
+            externalPower: false, isCharging: false
+        ) {
+            queriedSMC = true
+            return PowerWatts(battery: 15, input: 20)
+        }
+        try expect(!queriedSMC && result.input == nil, "AC sensor data do not apply on battery")
+        try expectNear(result.battery, -7.8, "reported battery power remains available")
+    },
+    TestCase(name: "Reported watts declines invalid telemetry and never multiplies voltage and current") {
+        for input: NSNumber in [NSNumber(value: -1), NSNumber(value: Double.infinity), NSNumber(value: true)] {
+            let result = BatteryReader.reportedWatts(
+                from: ["PowerTelemetryData": ["BatteryPower": true, "SystemPowerIn": input]],
+                externalPower: true, isCharging: true, readSMC: { nil }
+            )
+            try expect(result.battery == nil && result.input == nil, "wrong values are unavailable")
+        }
+        let unreported = BatteryReader.reportedWatts(
+            from: ["Voltage": 4000, "InstantAmperage": 2500],
+            externalPower: true, isCharging: true, readSMC: { nil }
+        )
+        try expect(unreported.battery == nil && unreported.input == nil, "derived power is not reported by the system")
+    },
 ]
 
 let batteryHardwareTests = [
-    TestCase(name: "real IOKit battery read returns a valid internal battery sample") {
-        let sample = BatteryReader.read()
-        try expect(sample?.isValid == true, "this Mac has a readable battery")
-    }
+    TestCase(name: "real IOKit reports finite watt values when available") {
+        let watts = BatteryReader.readWatts()
+        try expect(watts.battery?.isFinite != false, "battery watts are finite when reported")
+        try expect(watts.input.map { $0.isFinite && $0 >= 0 } != false, "input watts are finite and nonnegative when reported")
+    },
 ]

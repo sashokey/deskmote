@@ -1,8 +1,5 @@
 import AppKit
 import Combine
-#if DESKMOTE_QA_JOURNAL
-import os
-#endif
 
 @MainActor
 public final class BatteryRunModule {
@@ -10,9 +7,6 @@ public final class BatteryRunModule {
     private var controller: BatteryWindowController?
     private var pendingPresentation: UUID?
     private var activationObservation: AnyCancellable?
-    #if DESKMOTE_QA_JOURNAL
-    private var latestRequest: UUID?
-    #endif
 
     public init(windowPresented: @escaping @MainActor (NSWindow) -> Void = { _ in }) {
         self.windowPresented = windowPresented
@@ -29,10 +23,6 @@ public final class BatteryRunModule {
         let application = NSApplication.shared
         pendingPresentation = request
         activationObservation = nil
-        #if DESKMOTE_QA_JOURNAL
-        latestRequest = request
-        logPresentation("requested", request: request)
-        #endif
 
         if application.isActive {
             presentWindow(request, reason: "already-active")
@@ -44,9 +34,6 @@ public final class BatteryRunModule {
         ).sink { [weak self] _ in
             MainActor.assumeIsolated { self?.schedulePresentation(request, reason: "activation-notification") }
         }
-        #if DESKMOTE_QA_JOURNAL
-        logPresentation("activating", request: request)
-        #endif
         application.activate()
         if application.isActive {
             presentWindow(request, reason: "activation-immediate")
@@ -70,12 +57,10 @@ public final class BatteryRunModule {
         activationObservation = nil
 
         if controller == nil {
-            let monitor = BatteryMonitor()
-            monitor.start()
-            controller = BatteryWindowController(monitor: monitor)
+            controller = BatteryWindowController(monitor: BatteryMonitor())
             controller?.window?.tabbingMode = .disallowed
         }
-        guard let window = controller?.window else { return }
+        guard let controller, let window = controller.window else { return }
 
         let active = NSApplication.shared.isActive
         if window.isMiniaturized { window.deminiaturize(nil) }
@@ -85,27 +70,7 @@ public final class BatteryRunModule {
             window.orderFrontRegardless()
         }
         windowPresented(window)
-        #if DESKMOTE_QA_JOURNAL
-        logPresentation(reason, request: request)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
-            guard let self, self.latestRequest == request else { return }
-            self.logPresentation("settled", request: request)
-        }
-        #endif
+        controller.monitor.refresh()
     }
 
-    #if DESKMOTE_QA_JOURNAL
-    private static let logger = Logger(subsystem: "io.github.sashokey.deskmote.batteryrun", category: "QA")
-
-    private func logPresentation(_ event: String, request: UUID) {
-        let window = controller?.window
-        Self.logger.notice("""
-            battery event=\(event, privacy: .public) request=\(request.uuidString, privacy: .public) \
-            active=\(NSApplication.shared.isActive, privacy: .public) hasWindow=\(window != nil, privacy: .public) \
-            visible=\(window?.isVisible == true, privacy: .public) key=\(window?.isKeyWindow == true, privacy: .public) \
-            minimized=\(window?.isMiniaturized == true, privacy: .public) onSpace=\(window?.isOnActiveSpace == true, privacy: .public) \
-            onscreen=\(window?.occlusionState.contains(.visible) == true, privacy: .public)
-            """)
-    }
-    #endif
 }

@@ -1,25 +1,21 @@
 import argparse
+import json
 import plistlib
 import re
 import subprocess
 from pathlib import Path
 
+from check_release_inputs import check_executables, check_registrations
 
-WIDGET = "DeskMoteWidgets.appex"
 FINDER = "DeskMoteFinder.appex"
 FINDER_SERVICE = "DeskMoteFinderService.xpc"
 BUNDLE_ID = "io.github.sashokey.deskmote"
 VARIANTS = {
-    "full": {WIDGET, FINDER},
+    "full": {FINDER},
     "base": set(),
-    "no-widget": {FINDER},
-    "no-finder": {WIDGET},
+    "no-finder": set(),
 }
 EXTENSIONS = {
-    WIDGET: ("widgets", "com.apple.widgetkit-extension", {
-        "com.apple.security.app-sandbox": True,
-        "com.apple.security.network.client": True,
-    }),
     FINDER: ("finder-sync", "com.apple.FinderSync", {
         "com.apple.security.app-sandbox": True,
     }),
@@ -45,12 +41,36 @@ def check_signature(bundle, expected):
     require("Signature=adhoc" in details, f"Expected an ad hoc signature on {bundle.name}")
 
 
+def check_apps_table(app: Path, variant: str, catalog=None) -> None:
+    resources = app / "Contents/Resources"
+    if variant == "base":
+        require(not any(resources.glob("*.lproj/Apps.strings")) and
+                not any(resources.glob("*.lproj/Apps.stringsdict")),
+                "Unexpected Apps localization in Base")
+        return
+
+    if catalog is None:
+        catalog = Path(__file__).resolve().parent.parent / "Modules/Apps/Resources/Apps.xcstrings"
+    expected = {}
+    for key, entry in json.loads(catalog.read_text(encoding="utf-8"))["strings"].items():
+        for language, translation in entry.get("localizations", {}).items():
+            expected.setdefault(language, {})[key] = translation["stringUnit"]["value"]
+    require(bool(expected), "Empty Apps localization catalog")
+    for language, entries in expected.items():
+        table = resources / f"{language}.lproj/Apps.strings"
+        require(table.is_file(), f"Missing Apps localization for {language}")
+        actual = plistlib.loads(run("/usr/bin/plutil", "-convert", "xml1", "-o", "-", str(table)))
+        for key, value in entries.items():
+            require(actual.get(key) == value, f"Unexpected Apps translation for {language}: {key}")
+
+
 def check_bundle(app, variant, version, source):
     require(app.name == "DeskMote.app", "Unexpected application name")
     number = version[1:]
     bundle_versions = (f"{number}.0.0", number)
+    executables = []
 
-    def check_info(bundle, identifier, package_type):
+    def check_info(bundle, identifier, package_type, executable):
         with (bundle / "Contents/Info.plist").open("rb") as plist:
             info = plistlib.load(plist)
         require(info["CFBundleIdentifier"] == identifier, f"Unexpected identifier in {bundle.name}")
@@ -60,16 +80,19 @@ def check_bundle(app, variant, version, source):
             f"Unexpected version in {bundle.name}",
         )
         require(info["LSMinimumSystemVersion"] == "27.0", f"Unexpected deployment target in {bundle.name}")
-        binary = bundle / "Contents/MacOS" / info["CFBundleExecutable"]
+        require(info["CFBundleExecutable"] == executable, f"Unexpected executable name in {bundle.name}")
+        check_registrations(info, executable)
+        binary = bundle / "Contents/MacOS" / executable
         require(run("/usr/bin/lipo", "-archs", str(binary)).strip() == b"arm64",
                 f"Unexpected architecture in {bundle.name}")
+        executables.append((binary, executable))
         return info
 
     plugins = app / "Contents/PlugIns"
     actual_extensions = {entry.name for entry in plugins.iterdir()} if plugins.exists() else set()
     require(actual_extensions == VARIANTS[variant],
             f"Unexpected extensions in {variant}: {', '.join(sorted(actual_extensions))}")
-    info = check_info(app, BUNDLE_ID, "APPL")
+    info = check_info(app, BUNDLE_ID, "APPL", "DeskMote")
     require(info["CFBundleName"] == info["CFBundleDisplayName"] == info["CFBundleExecutable"] == "DeskMote",
             "Unexpected application display name or executable")
     require(info["DeskMoteVersion"] == version, "Unexpected public version")
@@ -81,7 +104,7 @@ def check_bundle(app, variant, version, source):
     for extension in sorted(actual_extensions):
         suffix, point, entitlements = EXTENSIONS[extension]
         bundle = plugins / extension
-        extension_info = check_info(bundle, f"{BUNDLE_ID}.{suffix}", "XPC!")
+        extension_info = check_info(bundle, f"{BUNDLE_ID}.{suffix}", "XPC!", "DeskMoteFinder")
         require(extension_info["NSExtension"]["NSExtensionPointIdentifier"] == point,
                 f"Unexpected extension point in {extension}")
         if extension == FINDER:
@@ -89,10 +112,12 @@ def check_bundle(app, variant, version, source):
             require(services.is_dir() and {entry.name for entry in services.iterdir()} == {FINDER_SERVICE},
                     "Unexpected Finder XPC services")
             service = services / FINDER_SERVICE
-            service_info = check_info(service, f"{BUNDLE_ID}.finder-sync.service", "XPC!")
+            service_info = check_info(service, f"{BUNDLE_ID}.finder-sync.service", "XPC!", "DeskMoteFinderService")
             require(service_info["XPCService"]["ServiceType"] == "Application", "Unexpected Finder XPC service type")
             check_signature(service, {})
         check_signature(bundle, entitlements)
+    check_apps_table(app, variant)
+    check_executables(app, variant, executables, run)
     check_signature(app, {})
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
     print(f"Verified {variant} DeskMote {version} for {source}")

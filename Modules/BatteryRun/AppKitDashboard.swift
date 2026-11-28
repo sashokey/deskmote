@@ -4,13 +4,13 @@ import AppKit
 final class AppKitDashboard: NSView {
     private let charge = NSTextField(labelWithString: "—")
     private let source = NSTextField(labelWithString: "")
+    private let journalDate = NSTextField(labelWithString: "")
     private let batteryImage = NSImageView()
     private let chargeBar = NSProgressIndicator()
     private let remainingLabel = NSTextField(labelWithString: "Remaining to 0%")
     private let fullDurationLabel = NSTextField(labelWithString: "100% → 0%")
     private let remaining = NSTextField(labelWithString: "—")
     private let fullDuration = NSTextField(labelWithString: "—")
-    private let fullChargingNote = NSTextField(wrappingLabelWithString: "")
     private let sessionHeading = NSTextField(labelWithString: "Discharge")
     private let startLabel = NSTextField(labelWithString: "Discharge started")
     private let elapsedLabel = NSTextField(labelWithString: "Discharge elapsed")
@@ -26,15 +26,15 @@ final class AppKitDashboard: NSView {
     private let rate = NSTextField(labelWithString: "—")
     private let explanation = NSTextField(wrappingLabelWithString: "")
     private let originNote = NSTextField(wrappingLabelWithString: "")
-    private let storageNotice = NSTextField(wrappingLabelWithString: "")
     private let progress = NSProgressIndicator()
     private let progressRow = NSStackView()
     private let available = NSStackView()
     private let compact = NSStackView()
     private let batteryWatts = NSTextField(labelWithString: "")
     private let inputWatts = NSTextField(labelWithString: "")
-    private let powerStatus = NSTextField(labelWithString: "")
-    private let unavailable = NSView()
+    private let compactStatus = NSTextField(labelWithString: "External Power")
+    private let compactCharge = NSTextField(labelWithString: "")
+    private let powerStatus = NSTextField(labelWithString: "Battery history unavailable.")
     private let scroll = NSScrollView()
 
     override init(frame frameRect: NSRect) {
@@ -49,29 +49,32 @@ final class AppKitDashboard: NSView {
         return scroll.documentView?.bounds.height ?? 0
     }
 
-    func update(model: DashboardModel, notice: String?, isReadingHistory: Bool, powerRefreshMessage: String? = nil) {
-        available.isHidden = model.sample == nil || model.isCompact
+    func update(model: DashboardModel, isReadingHistory: Bool) {
+        available.isHidden = model.isCompact
         compact.isHidden = !model.isCompact
-        unavailable.isHidden = model.sample != nil
-        if let sample = model.sample, !model.isCompact {
-            charge.stringValue = DashboardModel.percent(sample.percent)
-            source.stringValue = model.isCharging ? "Charging" : "On Battery"
-            chargeBar.doubleValue = sample.percent
-            let level = Int((sample.percent / 25).rounded()) * 25
-            let symbol = sample.onBattery ? "battery.\(level)percent" : "battery.100percent.bolt"
-            batteryImage.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        charge.stringValue = model.recordedCharge.map(DashboardModel.percent) ?? "—"
+        source.stringValue = model.sourceLabel
+        journalDate.stringValue = model.asOf ?? ""
+        journalDate.isHidden = model.asOf == nil
+        chargeBar.isHidden = model.recordedCharge == nil
+        chargeBar.doubleValue = model.recordedCharge ?? 0
+        let level = Int(((model.recordedCharge ?? 0) / 25).rounded()) * 25
+        let symbol = model.isOnBattery ? "battery.\(level)percent" : "battery.100percent.bolt"
+        batteryImage.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        compactStatus.stringValue = model.powerHeading
+        if let date = model.asOf, let percent = model.recordedCharge {
+            compactCharge.stringValue = "\(date) · \(DashboardModel.percent(percent))"
+            compactCharge.isHidden = false
+        } else {
+            compactCharge.isHidden = true
         }
         batteryWatts.stringValue = model.batteryPower
         inputWatts.stringValue = model.inputPower
-        powerStatus.stringValue = powerRefreshMessage ?? ""
-        powerStatus.isHidden = powerRefreshMessage == nil
+        powerStatus.isHidden = !model.historyUnavailable || isReadingHistory
         remainingLabel.stringValue = model.isCharging ? "Time to Full" : "Remaining to 0%"
         fullDurationLabel.stringValue = model.isCharging ? "0% → 100%" : "100% → 0%"
         remaining.stringValue = model.remaining
         fullDuration.stringValue = model.fullDuration
-        let chargingNote = model.fullChargingNote
-        fullChargingNote.stringValue = chargingNote ?? ""
-        fullChargingNote.isHidden = chargingNote == nil
         sessionHeading.stringValue = model.isCharging ? "Charging" : "Discharge"
         startLabel.stringValue = model.startLabel
         elapsedLabel.stringValue = model.isCharging ? "Charging elapsed" : "Discharge elapsed"
@@ -85,16 +88,12 @@ final class AppKitDashboard: NSView {
         forecastElapsed.stringValue = model.forecastElapsed
         used.stringValue = model.chargeUsed
         rate.stringValue = model.rate
-        let explanationText = model.explanation
-        explanation.stringValue = explanationText
-        explanation.isHidden = explanationText.isEmpty
+        explanation.stringValue = model.explanation
+        explanation.isHidden = model.explanation.isEmpty
         originNote.stringValue = model.originNote ?? ""
         originNote.isHidden = model.originNote == nil
-        storageNotice.stringValue = notice ?? ""
-        storageNotice.isHidden = notice == nil
-        let showHistoryProgress = isReadingHistory && model.mode == .discharging
-        progressRow.isHidden = !showHistoryProgress
-        if showHistoryProgress { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
+        progressRow.isHidden = !isReadingHistory
+        if isReadingHistory { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
         needsLayout = true
     }
 
@@ -130,7 +129,8 @@ final class AppKitDashboard: NSView {
         let descriptor = NSFont.systemFont(ofSize: 40, weight: .semibold).fontDescriptor
         charge.font = NSFont(descriptor: descriptor.withDesign(.rounded) ?? descriptor, size: 40)
         source.textColor = .secondaryLabelColor
-        let headerText = verticalStack(spacing: 4, views: [charge, source])
+        journalDate.textColor = .secondaryLabelColor
+        let headerText = verticalStack(spacing: 4, views: [charge, source, journalDate])
         batteryImage.contentTintColor = .controlAccentColor
         batteryImage.imageScaling = .scaleProportionallyUpOrDown
         batteryImage.setAccessibilityElement(false)
@@ -148,10 +148,6 @@ final class AppKitDashboard: NSView {
         addFullWidth(chargeBar, to: available)
 
         let fullColumn = estimateColumn(fullDurationLabel, value: fullDuration)
-        fullChargingNote.font = .systemFont(ofSize: 11)
-        fullChargingNote.textColor = .secondaryLabelColor
-        fullChargingNote.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        addFullWidth(fullChargingNote, to: fullColumn)
         let estimates = NSStackView(views: [estimateColumn(remainingLabel, value: remaining), fullColumn])
         estimates.distribution = .fillEqually
         estimates.spacing = 24
@@ -195,14 +191,14 @@ final class AppKitDashboard: NSView {
         historyLabel.textColor = .secondaryLabelColor
         progressRow.addArrangedSubview(historyLabel)
         progressRow.spacing = 8
-        available.addArrangedSubview(progressRow)
 
         compact.orientation = .vertical
         compact.alignment = .leading
         compact.spacing = 14
-        let compactStatus = NSTextField(labelWithString: "External Power")
         compactStatus.font = .systemFont(ofSize: 16, weight: .semibold)
         compact.addArrangedSubview(compactStatus)
+        compactCharge.textColor = .secondaryLabelColor
+        compact.addArrangedSubview(compactCharge)
         let batteryLabel = NSTextField(labelWithString: "Battery")
         batteryLabel.toolTip = "Power flowing into or out of the battery."
         let inputLabel = NSTextField(labelWithString: "DC In")
@@ -223,28 +219,8 @@ final class AppKitDashboard: NSView {
         addFullWidth(powerStatus, to: compact)
         addFullWidth(compact, to: root)
 
-        let emptyTitle = NSTextField(labelWithString: "Battery Unavailable")
-        emptyTitle.font = .systemFont(ofSize: 20, weight: .semibold)
-        let emptyText = NSTextField(wrappingLabelWithString: "No readable internal battery was found. Try refreshing the battery data.")
-        emptyText.alignment = .center
-        emptyText.textColor = .secondaryLabelColor
-        let emptyContent = verticalStack(spacing: 12, views: [emptyTitle, emptyText])
-        emptyContent.alignment = .centerX
-        emptyContent.translatesAutoresizingMaskIntoConstraints = false
-        unavailable.addSubview(emptyContent)
-        root.addArrangedSubview(unavailable)
-        storageNotice.font = .systemFont(ofSize: 12)
-        storageNotice.textColor = .labelColor
-        storageNotice.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        addFullWidth(storageNotice, to: root)
-        NSLayoutConstraint.activate([
-            unavailable.widthAnchor.constraint(equalTo: root.widthAnchor),
-            unavailable.heightAnchor.constraint(equalToConstant: 420),
-            emptyContent.leadingAnchor.constraint(equalTo: unavailable.leadingAnchor),
-            emptyContent.trailingAnchor.constraint(equalTo: unavailable.trailingAnchor),
-            emptyContent.centerYAnchor.constraint(equalTo: unavailable.centerYAnchor)
-        ])
-        update(model: DashboardModel(sample: nil, session: nil, forecastStart: nil), notice: nil, isReadingHistory: false)
+        root.addArrangedSubview(progressRow)
+        update(model: DashboardModel(snapshot: nil), isReadingHistory: false)
     }
 
     private func sessionSection(_ heading: NSTextField, rows: [(label: NSTextField, value: NSTextField)]) -> NSStackView {

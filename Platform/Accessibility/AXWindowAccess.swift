@@ -3,11 +3,6 @@ import ApplicationServices
 import CoreGraphics
 import Darwin
 import Foundation
-#if DEBUG
-import os
-
-private let heightFrameLog = Logger(subsystem: "io.github.sashokey.deskmote", category: "window-height")
-#endif
 
 struct AXElementKey: Hashable, @unchecked Sendable {
     let e: AXUIElement
@@ -205,9 +200,15 @@ extension AccessibilityOperations {
 }
 
 struct NativeAccessibilityOperations: AccessibilityOperations {
-    private let access = RuntimeAccessibilityAccess.shared
+    private let access: RuntimeAccessibilityAccess
+    private let trustProbe: @Sendable () -> Bool
 
-    func isTrusted() -> Bool { access.checkTrust(AXIsProcessTrusted) }
+    init(access: RuntimeAccessibilityAccess = .shared, trustProbe: @escaping @Sendable () -> Bool = AXIsProcessTrusted) {
+        self.access = access
+        self.trustProbe = trustProbe
+    }
+
+    func isTrusted() -> Bool { access.checkTrust(trustProbe) }
     func application(_ pid: pid_t) -> AXUIElement { AXUIElementCreateApplication(pid) }
     func systemWide() -> AXUIElement? { access.allowsCalls ? AXUIElementCreateSystemWide() : nil }
     func copy(_ element: AXUIElement, _ attribute: CFString) -> (AXError, CFTypeRef?) {
@@ -218,11 +219,22 @@ struct NativeAccessibilityOperations: AccessibilityOperations {
         }
     }
     func copyAttributes(_ element: AXUIElement, _ attributes: [String]) -> (AXError, [CFTypeRef]?) {
-        access.call(denied: (.apiDisabled, nil), status: { $0.0 }) {
+        access.call(denied: (.apiDisabled, nil), status: Self.batchStatus) {
             var values: CFArray?
             let error = AXUIElementCopyMultipleAttributeValues(element, attributes as CFArray, [], &values)
             return (error, values as? [CFTypeRef])
         }
+    }
+
+    static func batchStatus(_ batch: (AXError, [CFTypeRef]?)) -> AXError {
+        guard batch.0 == .success, let values = batch.1 else { return batch.0 }
+        for value in values where CFGetTypeID(value) == AXValueGetTypeID() {
+            var error = AXError.failure
+            if AXValueGetValue(unsafeDowncast(value, to: AXValue.self), .axError, &error), error == .apiDisabled {
+                return error
+            }
+        }
+        return .success
     }
     func set(_ element: AXUIElement, _ attribute: CFString, _ value: CFTypeRef) -> AXError {
         access.call { AXUIElementSetAttributeValue(element, attribute, value) }
@@ -563,13 +575,7 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
             return [kAXMinimizedAttribute as String: (.cannotComplete, nil)]
         }
         applyMessagingTimeout(min(readMessagingTimeout, budget?.remaining ?? readMessagingTimeout), to: element)
-        #if DEBUG
-        let resources = ActionResourceLog.begin("native.ax.inventoryAttributes")
-        #endif
         let (error, values) = accessibility.copyAttributes(element, attributes)
-        #if DEBUG
-        resources?.finish()
-        #endif
         switch error {
         case .notImplemented, .attributeUnsupported, .illegalArgument, .failure:
             return [:]
@@ -824,41 +830,19 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
 
     func heightAdjustmentFrame(of element: AXUIElement) -> CGRect? {
         guard accessibility.isTrusted() else {
-            #if DEBUG
-            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=permission-unavailable")
-            #endif
             return nil
         }
         applyMessagingTimeout(0.1, to: element)
-        #if DEBUG
-        let resources = ActionResourceLog.begin("native.ax.heightFrame")
-        #endif
         let (error, values) = accessibility.copyAttributes(element, Self.inventoryGeometryAttributes + [
             kAXMinimizedAttribute as String, "AXFullScreen",
         ])
-        #if DEBUG
-        resources?.finish()
-        #endif
         guard error == .success, let values, values.count == 4 else {
-            #if DEBUG
-            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=batch-unread axError=\(error.rawValue) count=\(values?.count ?? 0)")
-            #endif
             return nil
         }
         guard isInactiveWindowFlag(values[2]), isInactiveWindowFlag(values[3]) else {
-            #if DEBUG
-            let minimized = (values[2] as? NSNumber)?.stringValue ?? "unread"
-            let fullscreen = (values[3] as? NSNumber)?.stringValue ?? "unread"
-            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=ineligible minimized=\(minimized, privacy: .public) fullscreen=\(fullscreen, privacy: .public)")
-            #endif
             return nil
         }
         let measured = frame(position: values[0], size: values[1])
-        #if DEBUG
-        if measured == nil {
-            heightFrameLog.notice("height-frame window=\(AXElementKey(e: element).hashValue) outcome=invalid-position-or-size")
-        }
-        #endif
         return measured
     }
 
@@ -873,11 +857,13 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
     func writeWindowSize(_ size: CGSize, to element: AXUIElement) -> AXError {
         var size = size
         guard let value = AXValueCreate(.cgSize, &size) else { return .illegalArgument }
-        #if DEBUG
-        let resources = ActionResourceLog.begin("native.ax.writeSize")
-        defer { resources?.finish() }
-        #endif
         return accessibility.set(element, kAXSizeAttribute as CFString, value)
+    }
+
+    func writeWindowPosition(_ position: CGPoint, to element: AXUIElement) -> AXError {
+        var position = position
+        guard let value = AXValueCreate(.cgPoint, &position) else { return .illegalArgument }
+        return accessibility.set(element, kAXPositionAttribute as CFString, value)
     }
 
     func setMinimized(_ minimized: Bool, for handle: AXWindowHandle) -> Bool {
@@ -915,14 +901,7 @@ struct AXWindowReader: AppTrackerWindowReading, Sendable {
                 applyMessagingTimeout(min(readMessagingTimeout, budget.remaining), to: element)
             }
             let result: AXError
-            #if DEBUG
-            let resources = (attribute as String) == (kAXWindowsAttribute as String)
-                ? ActionResourceLog.begin("native.ax.inventoryWindowList") : nil
-            #endif
             (result, value) = accessibility.copy(element, attribute)
-            #if DEBUG
-            resources?.finish()
-            #endif
             if result == .success {
                 return result
             }

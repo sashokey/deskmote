@@ -164,21 +164,21 @@ final class RuntimeFeedbackClockTests: XCTestCase {
         runtime.toggle(windowID: id.rawValue)
         for task in runtime.pendingActionsForTesting { await task.value }
         XCTAssertNotNil(runtime.pendingMinimizations[id.rawValue])
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID[id.rawValue]?.phase, .pending)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID[id.rawValue]?.phase, .pending)
 
         now = start + .seconds(4)
         observation.windows[id]?.title = "At the deadline"
         desktop.values.send(observation)
         await flushSnapshots()
         XCTAssertNotNil(runtime.pendingMinimizations[id.rawValue])
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID[id.rawValue]?.phase, .pending)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID[id.rawValue]?.phase, .pending)
 
         now = now + .nanoseconds(1)
         observation.windows[id]?.title = "Past the deadline"
         desktop.values.send(observation)
         await flushSnapshots()
         XCTAssertNil(runtime.pendingMinimizations[id.rawValue])
-        XCTAssertEqual(runtime.debugState.feedbackEntriesByWindowID[id.rawValue]?.phase, .failure)
+        XCTAssertEqual(runtime.feedbackTestProbe.feedbackEntriesByWindowID[id.rawValue]?.phase, .failure)
     }
 
     private func flushSnapshots() async {

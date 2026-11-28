@@ -7,71 +7,48 @@ struct PowerWatts: Sendable {
 }
 
 enum BatteryReader {
-    static func sample(
-        from descriptions: [[String: Any]], at date: Date, powerProperties: [String: Any] = [:],
-        readLivePower: () -> PowerWatts? = { nil }
-    ) -> BatterySample? {
-        guard let battery = descriptions.first(where: { $0[kIOPSTypeKey] as? String == kIOPSInternalBatteryType }),
+    static func readWatts() -> PowerWatts {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef],
+              let battery = sources.lazy.compactMap({
+                  IOPSGetPowerSourceDescription(info, $0)?.takeUnretainedValue() as? [String: Any]
+              }).first(where: { $0[kIOPSTypeKey] as? String == kIOPSInternalBatteryType }),
               battery[kIOPSIsPresentKey] as? Bool != false,
-              let current = (battery[kIOPSCurrentCapacityKey] as? NSNumber)?.doubleValue,
-              let maximum = (battery[kIOPSMaxCapacityKey] as? NSNumber)?.doubleValue,
-              current.isFinite, maximum.isFinite, maximum > 0,
               let source = battery[kIOPSPowerSourceStateKey] as? String,
-              source == kIOPSBatteryPowerValue || source == kIOPSACPowerValue else { return nil }
-        let onBattery = source == kIOPSBatteryPowerValue
-        let isCharging = !onBattery && battery[kIOPSIsChargingKey] as? Bool == true
-        let seconds = number(battery[kIOPSTimeToFullChargeKey]).map { $0.doubleValue * 60 }
-        let timeToFull = isCharging ? seconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil } : nil
-        let telemetry = powerProperties["PowerTelemetryData"] as? [String: Any] ?? [:]
-        let milliwatts = number(telemetry["BatteryPower"]).map { Double($0.int64Value) }
-        let input = number(telemetry["SystemPowerIn"])?.doubleValue
-        let count = number(telemetry["SystemPowerInAccumulatorCount"])?.int64Value
-        let live = !onBattery && !isCharging ? readLivePower() : nil
-        let liveBattery = live?.battery.flatMap { $0.isFinite ? $0 : nil }
-        let liveInput = live?.input.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        let powerReadingSource: PowerReadingSource? = switch (liveBattery, liveInput) {
-        case (_?, _?): .direct
-        case (_?, nil), (nil, _?): .partial
-        case (nil, nil): nil
+              source == kIOPSBatteryPowerValue || source == kIOPSACPowerValue else {
+            return PowerWatts(battery: nil, input: nil)
         }
-        let cachedBattery = milliwatts.map { $0 / 1000 } ?? batteryPower(from: powerProperties)
-        let cachedInput = input.flatMap { $0 >= 0 ? $0 / 1000 : nil }
-        let sample = BatterySample(
-            date: date, percent: current * 100 / maximum, onBattery: onBattery,
-            isCharging: isCharging, timeToFull: timeToFull,
-            batteryWatts: liveBattery ?? cachedBattery,
-            inputWatts: onBattery ? nil : liveInput ?? cachedInput,
-            powerSampleCount: count.flatMap(UInt64.init(exactly:)),
-            powerReadingSource: powerReadingSource
+        return reportedWatts(
+            from: readPowerProperties(),
+            externalPower: source == kIOPSACPowerValue,
+            isCharging: battery[kIOPSIsChargingKey] as? Bool != false,
+            readSMC: SMCPowerReader.read
         )
-        return sample.isValid ? sample : nil
     }
 
-    static func read(at date: Date = Date()) -> BatterySample? {
-        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
-        let descriptions = sources.compactMap {
-            IOPSGetPowerSourceDescription(info, $0)?.takeUnretainedValue() as? [String: Any]
-        }
-        return sample(from: descriptions, at: date, powerProperties: readPowerProperties(), readLivePower: SMCPowerReader.read)
+    static func reportedWatts(
+        from properties: [String: Any], externalPower: Bool, isCharging: Bool,
+        readSMC: () -> PowerWatts?
+    ) -> PowerWatts {
+        let telemetry = properties["PowerTelemetryData"] as? [String: Any] ?? [:]
+        let reportedBattery = number(telemetry["BatteryPower"]).map { Double($0.int64Value) / 1000 }
+        let reportedInput = number(telemetry["SystemPowerIn"])?.doubleValue
+        let live = externalPower && !isCharging ? readSMC() : nil
+        let battery = live?.battery.flatMap { $0.isFinite ? $0 : nil } ?? reportedBattery
+        let input = live?.input.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+            ?? reportedInput.flatMap { $0 >= 0 ? $0 / 1000 : nil }
+        return PowerWatts(battery: battery, input: externalPower ? input : nil)
     }
 
     private static func readPowerProperties() -> [String: Any] {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
         guard service != IO_OBJECT_NULL else { return [:] }
         defer { IOObjectRelease(service) }
-        var properties = [String: Any]()
-        for key in ["PowerTelemetryData", "Voltage", "InstantAmperage", "Amperage"] {
-            properties[key] = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+        let key = "PowerTelemetryData"
+        guard let value = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else {
+            return [:]
         }
-        return properties
-    }
-
-    private static func batteryPower(from properties: [String: Any]) -> Double? {
-        guard let voltage = number(properties["Voltage"])?.doubleValue, voltage > 0,
-              let current = number(properties["InstantAmperage"]) ?? number(properties["Amperage"]) else { return nil }
-        let watts = (voltage / 1000) * (Double(current.int64Value) / 1000)
-        return watts.isFinite ? watts : nil
+        return [key: value]
     }
 
     private static func number(_ value: Any?) -> NSNumber? {

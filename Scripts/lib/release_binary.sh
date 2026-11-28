@@ -65,30 +65,18 @@ verify_release_binary() {
 }
 
 verify_release_diagnostics() {
-  local binary="$1" imports literals registry debug_switches failed=0
+  local binary="$1" imports literals failed=0
   imports="$(nm -u "$binary")" || return 1
   literals="$(strings -a "$binary")" || return 1
-  registry="$(dirname "${BASH_SOURCE[0]}")/../../Core/Support/DebugOptions.swift"
-  debug_switches="$(awk -F '"' '
-    /^[[:space:]]*#if DEBUG[[:space:]]*$/ { depth = 1; next }
-    depth && /^[[:space:]]*#if[[:space:]]/ { ++depth; next }
-    depth && /^[[:space:]]*#endif[[:space:]]*$/ { --depth; next }
-    depth == 1 && /^[[:space:]]*#else[[:space:]]*$/ { depth = 0; next }
-    depth && $1 ~ /^[[:space:]]*case[[:space:]]/ && $2 ~ /^DOCK_[A-Z0-9_]+$/ {
-      if (count++) printf "|"
-      printf "%s", $2
-    }
-  ' "$registry")" || return 1
-  if [[ -z "$debug_switches" ]]; then
-    printf 'release diagnostic scan found no registered Debug switches\n' >&2
-    return 1
-  fi
   reject_release_diagnostic_matches \
-    '(^|[[:space:]])_{1,2}(os_log(_[[:alnum:]_]+)?|os_signpost(_[[:alnum:]_]+)?|NSLogv?)$|\$s2os6Logger' \
+    '(^|[[:space:]])_{1,2}(os_log(_[[:alnum:]_]+)?|os_signpost(_[[:alnum:]_]+)?|NSLogv?)$|\$s2os(6Logger|12OSSignposter)' \
     "$imports" 'imports logging or signpost APIs' || failed=1
   reject_release_diagnostic_matches \
-    "window-inventory\.jsonl|click-latency\.jsonl|hover-trace\.jsonl|($debug_switches)" \
+    'window-inventory(\.[0-9]+)?\.jsonl|click-latency\.jsonl|hover-trace\.jsonl|taskbar-visibility\.jsonl|DOCK_[A-Z0-9_]+' \
     "$literals" 'contains diagnostic settings or file journal names' || failed=1
+  reject_release_diagnostic_matches \
+    'Dev(FillCheck|TestScenario|TestSession)|deskmote-dev-(fill-check|test)|io\.github\.sashokey\.deskmote\.dev([.]|$)|DESKMOTE_(QA_JOURNAL|WINDOW_FILL_CHECK|APPS_TEST_HOOKS)' \
+    "$literals" 'contains a Dev product or test entry' || failed=1
   return "$failed"
 }
 

@@ -1,78 +1,112 @@
 import Combine
 import Foundation
-#if DEBUG
-import OSLog
-#endif
 import Synchronization
 
-#if DEBUG
-private extension PermissionPhase {
-    var logName: String {
-        switch self {
-        case .idle: "idle"
-        case .transientShell: "transient-shell"
-        case .onboarding: "onboarding"
-        case .running: "running"
-        case .uncertain: "uncertain"
-        case .suspended: "suspended"
-        case .relaunching: "relaunching"
-        case .relaunchFailed: "relaunch-failed"
-        case .terminating: "terminating"
-        }
-    }
-}
-#endif
 
-final class PermissionWatchdogGate: Sendable {
+final class RuntimePermissionWatchdog: Sendable {
+    typealias Schedule = @Sendable (DispatchTime, @escaping @Sendable () -> Void) -> Void
+
+    struct ProbeTicket: Equatable, Sendable {
+        fileprivate let id: UInt64
+        fileprivate let run: UInt64
+        fileprivate let axGeneration: UInt64
+    }
+
     private struct State {
-        var generation: UInt64 = 0
-        var isRunning = false
-        var isProbeInFlight = false
-        var pendingDelivery: Bool?
+        var sequence: UInt64 = 0
+        var run: UInt64 = 0
+        var running = false
+        var ready = false
+        var terminal = false
+        var forcedExit = false
+        var probe: ProbeTicket?
     }
 
     private let state = Mutex(State())
+    private let access: RuntimeAccessibilityAccess
+    private let now: @Sendable () -> DispatchTime
+    private let schedule: Schedule
+    private let requestQuit: @Sendable () -> Void
+    private let forceExit: @Sendable () -> Void
+    private let notifyReady: @Sendable () -> Void
+
+    init(access: RuntimeAccessibilityAccess, now: @escaping @Sendable () -> DispatchTime = DispatchTime.now,
+         schedule: @escaping Schedule, requestQuit: @escaping @Sendable () -> Void,
+         forceExit: @escaping @Sendable () -> Void, notifyReady: @escaping @Sendable () -> Void = {}) {
+        self.access = access
+        self.now = now
+        self.schedule = schedule
+        self.requestQuit = requestQuit
+        self.forceExit = forceExit
+        self.notifyReady = notifyReady
+    }
 
     @discardableResult
     func start() -> UInt64 {
         state.withLock {
-            $0 = State(generation: $0.generation &+ 1, isRunning: true)
-            return $0.generation
+            $0.run &+= 1
+            $0.running = !$0.terminal
+            $0.ready = false
+            return $0.run
         }
     }
 
     func stop() {
-        state.withLock { $0 = State(generation: $0.generation &+ 1) }
-    }
-
-    func beginProbe(for expectedGeneration: UInt64? = nil) -> UInt64? {
         state.withLock {
-            guard $0.isRunning, !$0.isProbeInFlight,
-                  expectedGeneration == nil || expectedGeneration == $0.generation else { return nil }
-            $0.isProbeInFlight = true
-            return $0.generation
+            $0.run &+= 1
+            $0.running = false
+            $0.ready = false
         }
     }
 
-    func completeProbe(generation completedGeneration: UInt64, deliver trusted: Bool? = nil,
-                       accept: () -> Bool = { true }) -> Bool {
+    var isReady: Bool { state.withLock { $0.running && $0.ready && !$0.terminal && access.allowsCalls } }
+    var canRequestStartupPrompt: Bool { state.withLock { !$0.terminal } }
+
+    func beginProbe(for expectedRun: UInt64? = nil) -> ProbeTicket? {
         state.withLock {
-            guard completedGeneration == $0.generation, $0.isProbeInFlight else { return false }
-            $0.isProbeInFlight = false
-            guard accept() else { return false }
-            guard let trusted else { return true }
-            let needsDispatch = $0.pendingDelivery == nil
-            $0.pendingDelivery = trusted && ($0.pendingDelivery ?? true)
-            return needsDispatch
+            guard $0.running, !$0.terminal, $0.probe == nil,
+                  expectedRun == nil || $0.run == expectedRun else { return nil }
+            let generation = access.trustGeneration
+            guard access.acceptsResult(for: generation) else { return nil }
+            $0.sequence &+= 1
+            let ticket = ProbeTicket(id: $0.sequence, run: $0.run, axGeneration: generation)
+            $0.probe = ticket
+            return ticket
         }
     }
 
-    func takeDelivery(generation expectedGeneration: UInt64) -> Bool? {
-        state.withLock {
-            guard $0.isRunning, $0.generation == expectedGeneration else { return nil }
-            defer { $0.pendingDelivery = nil }
-            return $0.pendingDelivery
+    func completeProbe(_ ticket: ProbeTicket, verdict: Bool) {
+        let deliver = state.withLock { state -> (@Sendable () -> Void)? in
+            guard state.probe == ticket else { return nil }
+            state.probe = nil
+            guard state.running, state.run == ticket.run, !state.terminal else { return nil }
+            guard verdict else { return access.commitLoss(.negativeProbe, for: ticket.axGeneration) }
+            guard !state.ready, access.acceptsResult(for: ticket.axGeneration) else { return nil }
+            state.ready = true
+            return notifyReady
         }
+        deliver?()
+    }
+
+    func requiredPermissionLost() {
+        let shouldQuit = state.withLock {
+            guard !$0.terminal else { return false }
+            $0.terminal = true
+            $0.ready = false
+            return true
+        }
+        guard shouldQuit else { return }
+        schedule(now() + .seconds(3)) { [weak self] in self?.exitIfRequired() }
+        requestQuit()
+    }
+
+    private func exitIfRequired() {
+        let shouldExit = state.withLock {
+            guard $0.terminal, !$0.forcedExit else { return false }
+            $0.forcedExit = true
+            return true
+        }
+        if shouldExit { forceExit() }
     }
 }
 
@@ -87,9 +121,6 @@ protocol PermissionEffectHandler: AnyObject {
     func openApplicationsFolder()
     func startWatchdog()
     func stopWatchdog()
-    func suspendPanelsAndStores()
-
-    func launchNewInstance(episode: UInt64) async -> Result<Void, Error>
     func terminateSelf()
 }
 
@@ -97,19 +128,13 @@ protocol PermissionEffectHandler: AnyObject {
 final class PermissionRecoveryCoordinator: ObservableObject {
     @Published private(set) var presentation: PermissionPresentation?
 
-    #if DEBUG
-    private let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "permissions")
-    #endif
     private weak var handler: PermissionEffectHandler?
     private let installLocation: AppInstallLocation
-    private let now: () -> TimeInterval
     private let makeModel: (PermissionEpisodePurpose, UInt64) -> AccessibilityPermissionModel
 
     private var machine = PermissionRecoveryMachine()
-    private var detector = PermissionLossDetector()
     private var model: AccessibilityPermissionModel?
     private var modelSubscription: AnyCancellable?
-    private var recoveryTask: Task<Void, Never>?
     private var onboardingState: PermissionOnboardingState = .waiting
 
     private var pendingEvents: [PermissionEvent] = []
@@ -121,12 +146,10 @@ final class PermissionRecoveryCoordinator: ObservableObject {
         handler: PermissionEffectHandler?,
         permissionService: PermissionService,
         installLocation: AppInstallLocation,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         makeModel: ((PermissionEpisodePurpose, UInt64) -> AccessibilityPermissionModel)? = nil
     ) {
         self.handler = handler
         self.installLocation = installLocation
-        self.now = now
         self.makeModel = makeModel ?? { _, _ in
             AccessibilityPermissionModel(
                 permissionService: permissionService,
@@ -139,20 +162,12 @@ final class PermissionRecoveryCoordinator: ObservableObject {
         dispatch(.launched(location: installLocation, trusted: trusted))
     }
 
-    func sampleTrust(_ trusted: Bool) {
-        dispatch(.trustVerdict(detector.record(trusted: trusted, at: now())))
-    }
-
     func applicationDidBecomeActive() {
         model?.applicationDidBecomeActive()
     }
 
     func recheck() { dispatch(.recheckRequested) }
-    func retryRelaunch() { dispatch(.retryRequested) }
     func quit() {
-        #if DEBUG
-        logger.notice("permission-guide-quit-requested")
-        #endif
         dispatch(.quitRequested)
     }
     func terminationRequested() { dispatch(.terminationRequested) }
@@ -162,22 +177,10 @@ final class PermissionRecoveryCoordinator: ObservableObject {
     private func dispatch(_ event: PermissionEvent) {
         pendingEvents.append(event)
         guard !isDispatching else { return }
-        #if DEBUG
-        let resources = ActionResourceLog.begin("permission.dispatch")
-        defer { resources?.finish() }
-        #endif
         isDispatching = true
         defer { isDispatching = false }
         while !pendingEvents.isEmpty {
-            #if DEBUG
-            let before = machine.phase
-            #endif
             let effects = machine.handle(pendingEvents.removeFirst())
-            #if DEBUG
-            if before != machine.phase {
-                logger.notice("permission-phase from=\(before.logName, privacy: .public) to=\(self.machine.phase.logName, privacy: .public)")
-            }
-            #endif
             run(effects)
         }
     }
@@ -190,17 +193,8 @@ final class PermissionRecoveryCoordinator: ObservableObject {
             case let .setActivationPolicy(policy):
                 handler?.setActivationPolicy(policy)
             case .showGuide:
-                #if DEBUG
-                logger.notice("permission-guide-opening")
-                #endif
                 refreshPresentation()
                 handler?.showGuideWindow()
-                #if DEBUG
-                logger.notice("permission-guide-opened")
-                #endif
-            case .updateGuide:
-                refreshPresentation()
-                handler?.updateGuideWindow()
             case .closeGuide:
                 refreshPresentation()
                 handler?.closeGuideWindow()
@@ -209,28 +203,13 @@ final class PermissionRecoveryCoordinator: ObservableObject {
             case .stopPermissionEpisode:
                 stopEpisode()
             case .requestSystemPrompt:
-                #if DEBUG
-                logger.notice("permission-system-prompt-check-started")
-                #endif
                 model?.requestSystemPromptIfNeeded()
-                #if DEBUG
-                logger.notice("permission-system-prompt-check-completed")
-                #endif
             case .recheckNow:
                 model?.checkNow()
             case .startWatchdog:
-                detector = PermissionLossDetector()
                 handler?.startWatchdog()
             case .stopWatchdog:
                 handler?.stopWatchdog()
-            case .suspendPanelsAndStores:
-                handler?.suspendPanelsAndStores()
-
-            case let .launchNewInstance(episode):
-                startLaunch(episode: episode)
-            case .cancelRecoveryTask:
-                recoveryTask?.cancel()
-                recoveryTask = nil
             case .terminateSelf:
                 handler?.terminateSelf()
             }
@@ -272,20 +251,5 @@ final class PermissionRecoveryCoordinator: ObservableObject {
         model?.onGranted = nil
         model?.stop()
         model = nil
-    }
-
-    private func startLaunch(episode: UInt64) {
-        recoveryTask?.cancel()
-        recoveryTask = Task { @MainActor [weak self] in
-            guard !Task.isCancelled, let self, let handler = self.handler else { return }
-            let result = await handler.launchNewInstance(episode: episode)
-            guard !Task.isCancelled else { return }
-            switch result {
-            case .success:
-                self.dispatch(.relaunchSucceeded(episode: episode))
-            case let .failure(error):
-                self.dispatch(.relaunchFailed(episode: episode, message: error.localizedDescription))
-            }
-        }
     }
 }

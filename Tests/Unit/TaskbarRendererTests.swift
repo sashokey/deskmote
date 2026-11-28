@@ -80,286 +80,6 @@ final class TaskbarRendererTests: XCTestCase {
         func dismiss() { menu = nil }
     }
 
-    func testAppsButtonHoverMatchesTaskbarButtonGeometry() throws {
-        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 600, height: 32))
-        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        XCTAssertEqual(button.convert(selection.frame, to: content), AppsMenuGeometry.buttonFrame)
-        XCTAssertEqual(selection.cornerRadius, TaskbarMetrics.buttonCornerRadius)
-        XCTAssertEqual(selection.alphaValue, 0)
-        let reference = TaskbarButtonView(frame: button.frame)
-        reference.reduceMotion = { true }
-
-        for (eventType, highlighted) in [(NSEvent.EventType.mouseEntered, true), (.mouseExited, false)] {
-            let event = try XCTUnwrap(NSEvent.enterExitEvent(with: eventType, location: .zero, modifierFlags: [],
-                                                            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1,
-                                                            trackingNumber: 1, userData: nil))
-            if highlighted { button.mouseEntered(with: event) } else { button.mouseExited(with: event) }
-            if highlighted { reference.mouseEntered(with: event) } else { reference.mouseExited(with: event) }
-            XCTAssertEqual(selection.alphaValue > 0, highlighted)
-            XCTAssertEqual(selection.alphaValue, reference.selectionView.alphaValue)
-            XCTAssertEqual(selection.borderColor, reference.selectionView.borderColor)
-        }
-    }
-
-    func testAppsIconIsMonochromeUntilHoveredOrActive() throws {
-        let frame = CGRect(x: 0, y: 0, width: 260, height: 32)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        defer { panel.close() }
-        let content = TaskbarContentView(frame: frame)
-        content.appearance = NSAppearance(named: .darkAqua)
-        panel.contentView = content
-        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        func chromaticPixels() throws -> Int {
-            let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 58, pixelsHigh: 56,
-                                                        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                                                        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
-            bitmap.size = selection.bounds.size
-            button.layoutSubtreeIfNeeded()
-            button.effectiveAppearance.performAsCurrentDrawingAppearance {
-                button.cacheDisplay(in: selection.frame, to: bitmap)
-            }
-            var count = 0
-            for y in 10..<46 {
-                for x in 11..<47 {
-                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
-                          color.alphaComponent > 0.6 else { continue }
-                    let components = [color.redComponent, color.greenComponent, color.blueComponent]
-                    if components.max()! - components.min()! > 0.24 { count += 1 }
-                }
-            }
-            return count
-        }
-        XCTAssertEqual(try chromaticPixels(), 0)
-        panel.pointer = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
-        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: button)
-        XCTAssertGreaterThan(try chromaticPixels(), 15)
-        panel.pointer = .zero
-        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: button)
-        XCTAssertEqual(try chromaticPixels(), 0)
-        button.state = .on
-        XCTAssertGreaterThan(try chromaticPixels(), 15)
-        button.state = .off
-        XCTAssertEqual(try chromaticPixels(), 0)
-        XCTAssertFalse(panel.isVisible)
-    }
-
-    func testAppsButtonDetectsPointerWhenTrackingStartsBeforeFirstClick() throws {
-        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        defer { panel.close() }
-        let content = TaskbarContentView(frame: frame)
-        panel.contentView = content
-        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        panel.pointer = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
-        button.updateTrackingAreas()
-        XCTAssertGreaterThan(selection.alphaValue, 0)
-        XCTAssertEqual(button.state, .off)
-        XCTAssertFalse(panel.isVisible)
-    }
-
-    func testAppsButtonHoversAtTheBottomScreenPixelAtBothScales() throws {
-        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        defer { panel.close() }
-        let content = TaskbarContentView(frame: frame, popup: Popup())
-        panel.contentView = content
-        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        content.layoutSubtreeIfNeeded()
-
-        for scale: CGFloat in [1, 2] {
-            let point = CGPoint(x: button.frame.midX, y: 32 - 0.5 / scale)
-            panel.pointer = content.convert(point, to: nil)
-            button.updateTrackingAreas()
-            let area = try XCTUnwrap(button.trackingAreas.first { $0.options.contains(.mouseEnteredAndExited) })
-            let trackingRect = area.options.contains(.inVisibleRect) ? button.visibleRect : area.rect
-            XCTAssertTrue(trackingRect.contains(button.convert(point, from: content)))
-            XCTAssertFalse(trackingRect.contains(button.convert(CGPoint(x: 40, y: point.y), from: content)))
-            XCTAssertTrue(content.hitTest(panel.pointer) === button)
-            XCTAssertGreaterThan(selection.alphaValue, 0)
-            XCTAssertEqual(button.convert(selection.frame, to: content), CGRect(x: 10, y: 2, width: 29, height: 28))
-        }
-        XCTAssertFalse(panel.isVisible)
-    }
-
-    func testAppsButtonOpensAtTheBottomLeftCorner() throws {
-        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        defer { panel.close() }
-        let popup = Popup()
-        let content = TaskbarContentView(frame: frame, popup: popup)
-        panel.contentView = content
-        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        content.layoutSubtreeIfNeeded()
-
-        let points = [CGPoint(x: 0, y: frame.maxY - 1),
-                      CGPoint(x: 0.5, y: frame.maxY - 0.5),
-                      CGPoint(x: 0.25, y: frame.maxY - 0.25)]
-        for point in points {
-            panel.pointer = content.convert(point, to: nil)
-            button.updateTrackingAreas()
-            XCTAssertGreaterThan(selection.alphaValue, 0)
-            let target = try XCTUnwrap(content.hitTest(panel.pointer) as? NSButton, "Corner \(point)")
-            XCTAssertTrue(target === button)
-            target.performClick(nil)
-            XCTAssertTrue(popup.content is AppsMenuView)
-            content.dismissAppsMenu()
-            XCTAssertFalse(popup.isPresented)
-            XCTAssertEqual(button.convert(selection.frame, to: content), CGRect(x: 10, y: 2, width: 29, height: 28))
-        }
-        let neighboringGap = content.convert(CGPoint(x: 40, y: frame.maxY - 0.5), to: nil)
-        XCTAssertFalse(content.hitTest(neighboringGap) === button)
-    }
-
-    func testAppsButtonHoverFollowsTheCurrentPointerWhenTrackingEventsArriveLate() throws {
-        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        defer { panel.close() }
-        let content = TaskbarContentView(frame: frame, popup: Popup())
-        panel.contentView = content
-        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        let inside = content.convert(CGPoint(x: 24, y: 15), to: nil)
-        let outside = content.convert(CGPoint(x: 90, y: 15), to: nil)
-
-        panel.pointer = inside
-        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
-        XCTAssertGreaterThan(selection.alphaValue, 0)
-        try sendTrackingEvent(.mouseExited, at: outside, to: button)
-        XCTAssertGreaterThan(selection.alphaValue, 0)
-        panel.pointer = outside
-        try sendTrackingEvent(.mouseExited, at: outside, to: button)
-        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
-        XCTAssertEqual(selection.alphaValue, 0)
-
-        panel.pointer = inside
-        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
-        button.state = .on
-        panel.pointer = outside
-        button.state = .off
-        XCTAssertEqual(selection.alphaValue, 0)
-    }
-
-    func testAppsButtonGlyphIsCenteredInTheRenderedHoverAtBothScales() throws {
-        let content = TaskbarContentView(frame: CGRect(x: 0, y: 0, width: 200, height: 32))
-        content.appearance = NSAppearance(named: .darkAqua)
-        let panel = RecordingPopupPanel(contentRect: content.frame, styleMask: .borderless, backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        defer { panel.close() }
-        panel.contentView = content
-        content.enableAppsMenu(store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] }))
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        panel.pointer = button.convert(CGPoint(x: selection.frame.midX, y: selection.frame.midY), to: nil)
-        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: button)
-        button.layoutSubtreeIfNeeded()
-        for scale in [1.0, 2.0] {
-            let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(29 * scale),
-                                                       pixelsHigh: Int(28 * scale), bitsPerSample: 8,
-                                                       samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                                                       colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
-            bitmap.size = selection.bounds.size
-            button.effectiveAppearance.performAsCurrentDrawingAppearance {
-                button.cacheDisplay(in: selection.frame, to: bitmap)
-            }
-            var glyph = CGRect.null
-            var weightedX = 0.0
-            var weightedY = 0.0
-            var totalWeight = 0.0
-            for y in 0..<bitmap.pixelsHigh {
-                for x in 0..<bitmap.pixelsWide {
-                    guard let pixel = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
-                    let weight = max(0, pixel.redComponent - 0.45) * pixel.alphaComponent
-                    weightedX += (Double(x) + 0.5) * weight / scale
-                    weightedY += (Double(y) + 0.5) * weight / scale
-                    totalWeight += weight
-                    guard pixel.alphaComponent > 0.5, pixel.redComponent > 0.58 else { continue }
-                    glyph = glyph.union(CGRect(x: Double(x) / scale, y: Double(y) / scale,
-                                               width: 1 / scale, height: 1 / scale))
-                }
-            }
-            XCTAssertGreaterThan(glyph.width, 12, "\(scale)×")
-            XCTAssertLessThan(glyph.width, 18, "\(scale)×")
-            XCTAssertEqual(weightedX / totalWeight, 14.5, accuracy: 0.25, "\(scale)×: \(glyph)")
-            XCTAssertEqual(weightedY / totalWeight, 14, accuracy: 0.25, "\(scale)×: \(glyph)")
-        }
-        XCTAssertFalse(panel.isVisible)
-    }
-
-    func testAppsButtonOpensAndDismissesAnExplicitPopupWithoutWindowGroups() throws {
-        _ = NSApplication.shared
-        let screen = try XCTUnwrap(NSScreen.main)
-        let frame = TaskbarMetrics.panelFrame(on: screen.frame)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        defer { panel.close() }
-        let popup = Popup()
-        let content = TaskbarContentView(frame: CGRect(origin: .zero, size: frame.size),
-                                         popup: popup, contextMenu: ContextMenu())
-        panel.contentView = content
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DeskMoteTests.AppsPopup.\(UUID())"))
-        content.enableAppsMenu(store: AppsMenuStore(defaults: defaults, applicationDirectories: [],
-                                                   runningApplicationSnapshot: { [] }))
-        var admissions: [Bool] = []
-        content.admitWindowList = { explicit in admissions.append(explicit); return true }
-        let button = try XCTUnwrap(content.subviews.compactMap { $0 as? NSButton }
-            .first { $0.accessibilityIdentifier() == "DeskMote.Apps" })
-        let selection = try XCTUnwrap(button.subviews.compactMap { $0 as? NSBox }.first)
-        XCTAssertEqual(button.convert(selection.frame, to: content), AppsMenuGeometry.buttonFrame)
-        button.performClick(nil)
-        let firstMenu = try XCTUnwrap(popup.content as? AppsMenuView)
-        XCTAssertEqual(admissions, [true])
-        XCTAssertTrue(content.hasExplicitPopup)
-        XCTAssertEqual(button.state, .on)
-        XCTAssertGreaterThan(selection.alphaValue, 0)
-        let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero, modifierFlags: [],
-                                                       timestamp: 0, windowNumber: panel.windowNumber, context: nil,
-                                                       eventNumber: 1, trackingNumber: 1, userData: nil))
-        button.mouseExited(with: exit)
-        XCTAssertGreaterThan(selection.alphaValue, 0)
-
-        let otherDisplay = TaskbarContentView(frame: content.frame, popup: Popup(), contextMenu: ContextMenu())
-        otherDisplay.onBackgroundClick = { content.dismissAppsMenu() }
-        let click = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [],
-                                                    timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1,
-                                                    clickCount: 1, pressure: 1))
-        otherDisplay.mouseDown(with: click)
-        XCTAssertFalse(content.hasExplicitPopup)
-        XCTAssertEqual(button.state, .off)
-        XCTAssertEqual(selection.alphaValue, 0)
-
-        button.performClick(nil)
-        XCTAssertTrue(popup.content === firstMenu)
-        XCTAssertTrue(content.hasExplicitPopup)
-        content.prepareForHiding()
-        XCTAssertFalse(content.hasExplicitPopup)
-        XCTAssertFalse(popup.isPresented)
-        XCTAssertEqual(button.state, .off)
-        XCTAssertFalse(panel.isVisible)
-    }
-
     @MainActor
     private final class FileDrag: NSObject, NSDraggingInfo {
         weak var draggingDestinationWindow: NSWindow?
@@ -403,7 +123,6 @@ final class TaskbarRendererTests: XCTestCase {
         var pointer = CGPoint.zero
         var frameAtFront: CGRect?
         var alphaAtFront: CGFloat?
-        override var mouseLocationOutsideOfEventStream: NSPoint { pointer }
         override var canBecomeKey: Bool { true }
         override func orderFrontRegardless() {
             frontRequests += 1
@@ -856,156 +575,6 @@ final class TaskbarRendererTests: XCTestCase {
         XCTAssertEqual(activated, [replacement])
     }
 
-    func testAppsPopupSlidesAndStopsInterceptingClicksWhileClosing() async throws {
-        let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
-        let animatedFrame = CGRect(x: 12, y: 32, width: 642, height: 688)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        var tick: (@MainActor (TimeInterval) -> Void)?
-        let controller = TaskbarPopupController(makePanel: { _ in panel }, reduceMotion: { false },
-                                                appsFrameSource: { _, update in
-            tick = update
-            return { tick = nil }
-        })
-        defer { controller.dismissImmediately() }
-        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [],
-            runningApplicationSnapshot: { [] }), deferCatalog: true) {}
-        controller.present(content: menu, frame: frame, anchorWindow: nil)
-        XCTAssertFalse(panel.hasShadow)
-        XCTAssertEqual(panel.frameAtFront, animatedFrame)
-        let viewport = try XCTUnwrap(panel.contentView)
-        XCTAssertTrue(viewport.clipsToBounds)
-        XCTAssertEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)),
-                       frame.offsetBy(dx: 0, dy: -animatedFrame.height))
-        XCTAssertNil(viewport.hitTest(CGPoint(x: 100, y: 100)))
-        XCTAssertTrue(menu.catalogDeferredUntilFrame)
-
-        let search = try XCTUnwrap(menu.contentView?.subviews.compactMap { $0 as? NSSearchField }.first)
-        tick?(0.19 * 0.84)
-        XCTAssertTrue(menu.catalogDeferredUntilFrame)
-        let searchPoint = search.convert(CGPoint(x: search.bounds.midX, y: search.bounds.midY), to: viewport.superview)
-        let hit = try XCTUnwrap(viewport.hitTest(searchPoint))
-        XCTAssertTrue(hit === search || hit.isDescendant(of: search))
-
-        let movedFrame = frame.offsetBy(dx: 24, dy: 40)
-        let movedAnimatedFrame = animatedFrame.offsetBy(dx: 24, dy: 40)
-        controller.updateFrame(movedFrame)
-        XCTAssertEqual(panel.frame, movedAnimatedFrame)
-        tick?(0.18)
-        XCTAssertFalse(menu.catalogDeferredUntilFrame)
-        XCTAssertNotEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)), movedFrame)
-        XCTAssertTrue(panel.makeFirstResponder(search))
-        XCTAssertNotNil(search.currentEditor())
-
-        tick?(0.19)
-        XCTAssertNil(tick)
-        XCTAssertEqual(panel.frame, movedFrame)
-        XCTAssertEqual(panel.convertToScreen(menu.convert(menu.bounds, to: nil)), movedFrame)
-
-        controller.dismiss()
-        XCTAssertFalse(controller.isPresented)
-        XCTAssertTrue(panel.ignoresMouseEvents)
-        XCTAssertNil(search.currentEditor())
-        XCTAssertEqual(panel.frame, movedAnimatedFrame)
-        let closing = try XCTUnwrap(menu.layer?.animation(forKey: "apps-popup-slide") as? CAKeyframeAnimation)
-        XCTAssertEqual(closing.duration, 0.19, accuracy: 0.001)
-        XCTAssertEqual((closing.values?.first as? NSNumber)?.doubleValue, 0)
-        XCTAssertEqual((closing.values?.last as? NSNumber)?.doubleValue, -animatedFrame.height)
-        let deadline = ContinuousClock.now + .seconds(1)
-        while panel.contentView != nil, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        XCTAssertNil(panel.contentView)
-        XCTAssertFalse(panel.isVisible)
-    }
-
-    func testClosingAppsDuringOpeningStartsFromItsVisiblePositionAndCanReopenImmediately() throws {
-        let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
-        var panels: [RecordingPopupPanel] = []
-        var tick: (@MainActor (TimeInterval) -> Void)?
-        let controller = TaskbarPopupController(makePanel: { frame in
-            let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-            panels.append(panel)
-            return panel
-        }, reduceMotion: { false }, appsFrameSource: { _, update in
-            tick = update
-            return { tick = nil }
-        })
-        defer { controller.dismissImmediately() }
-        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [],
-            runningApplicationSnapshot: { [] })) {}
-        controller.present(content: menu, frame: frame, anchorWindow: nil)
-        let panel = try XCTUnwrap(panels.last)
-        tick?(0.095)
-        let offset = panel.convertToScreen(menu.convert(menu.bounds, to: nil)).minY - frame.minY
-
-        controller.dismiss()
-        XCTAssertNil(tick)
-        let closing = try XCTUnwrap(menu.layer?.animation(forKey: "apps-popup-slide") as? CAKeyframeAnimation)
-        let start = try XCTUnwrap(closing.values?.first as? NSNumber)
-        XCTAssertEqual(start.doubleValue, offset, accuracy: 0.001)
-
-        menu.prepareForPresentation(size: frame.size)
-        controller.present(content: menu, frame: frame, anchorWindow: nil)
-        XCTAssertNil(panel.contentView)
-        XCTAssertNotNil(tick)
-        tick?(0.19)
-        XCTAssertEqual(panels.last?.frame, frame)
-        XCTAssertTrue(controller.isPresented)
-    }
-
-    func testAppsPopupClipsItsMaterialToRoundedCornersInHiddenPanel() throws {
-        let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        let controller = TaskbarPopupController(makePanel: { _ in panel }, reduceMotion: { true })
-        defer { controller.dismissImmediately() }
-        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] })) {}
-        controller.present(content: menu, frame: frame, anchorWindow: nil)
-        let viewport = try XCTUnwrap(panel.contentView)
-        viewport.layoutSubtreeIfNeeded()
-        let glassLayer = try XCTUnwrap(menu.layer)
-        let materialSample = CALayer()
-        materialSample.frame = glassLayer.bounds
-        materialSample.backgroundColor = NSColor(white: 0.53, alpha: 1).cgColor
-        glassLayer.addSublayer(materialSample)
-        defer { materialSample.removeFromSuperlayer() }
-
-        for scale in [1, 2] {
-            let width = Int(frame.width) * scale
-            let height = Int(frame.height) * scale
-            let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
-                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
-            let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: bitmap)?.cgContext)
-            context.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
-            glassLayer.render(in: context)
-            for (x, y) in [(1, 1), (width - 2, 1), (1, height - 2), (width - 2, height - 2)] {
-                let corner = try XCTUnwrap(bitmap.colorAt(x: x, y: y))
-                XCTAssertLessThan(corner.alphaComponent, 0.05, "Corner at \(x), \(y) at \(scale)x")
-            }
-            XCTAssertGreaterThan(try XCTUnwrap(bitmap.colorAt(x: width / 2, y: 2 * scale)).alphaComponent, 0.95)
-            if let path = ProcessInfo.processInfo.environment["DESKMOTE_RENDER_PATH"] {
-                let url = URL(fileURLWithPath: path, isDirectory: true).appendingPathComponent("apps-corners-\(scale)x.png")
-                try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
-            }
-        }
-        XCTAssertFalse(panel.isVisible)
-    }
-
-    func testAppsPopupPresentsAndDismissesImmediatelyWithReduceMotion() {
-        let frame = CGRect(x: 12, y: 44, width: 642, height: 676)
-        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        let controller = TaskbarPopupController(makePanel: { _ in panel }, reduceMotion: { true })
-        let menu = AppsMenuView(frame: frame, store: AppsMenuStore(applicationDirectories: [], runningApplicationSnapshot: { [] })) {}
-        controller.present(content: menu, frame: frame, anchorWindow: nil)
-        XCTAssertFalse(panel.hasShadow)
-        XCTAssertEqual(panel.frameAtFront, frame)
-        XCTAssertEqual(panel.alphaAtFront, 1)
-        XCTAssertNil(menu.layer?.animation(forKey: "apps-popup-slide"))
-        controller.dismiss()
-        XCTAssertNil(panel.contentView)
-        XCTAssertFalse(panel.isVisible)
-    }
-
     func testPopupClosesOnItsOwnFocusLossAndIgnoresOtherWindows() {
         let first = RecordingPopupPanel(contentRect: CGRect(x: 0, y: 0, width: 216, height: 120),
                                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -1041,7 +610,7 @@ final class TaskbarRendererTests: XCTestCase {
         await clock.advance()
         let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
         let enter = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
-            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
             trackingNumber: 0, userData: nil))
         list.mouseEntered(with: enter)
         XCTAssertTrue(list.isPointerInside)
@@ -1049,7 +618,7 @@ final class TaskbarRendererTests: XCTestCase {
         await clock.advance(allowIdle: true)
         XCTAssertTrue(popup.isPresented)
         let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
-            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
             trackingNumber: 0, userData: nil))
         list.mouseExited(with: exit)
         XCTAssertFalse(list.isPointerInside)
@@ -1281,7 +850,7 @@ final class TaskbarRendererTests: XCTestCase {
             XCTAssertTrue(area.options.contains(.activeAlways))
             panel.pointer = content.convert(point, to: nil)
             let entered = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered,
-                location: panel.pointer, modifierFlags: [], timestamp: 0,
+                location: panel.pointer, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                 windowNumber: panel.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil))
             (area.owner as? NSResponder)?.mouseEntered(with: entered)
             XCTAssertGreaterThan(button.selectionView.alphaValue, 0)
@@ -1535,10 +1104,10 @@ final class TaskbarRendererTests: XCTestCase {
 
     func testLatePopupExitRetiresOnlyTheListAndRespectsTheHoveredAnchor() async throws {
         let enter = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
-            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
             trackingNumber: 0, userData: nil))
         let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
-            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
             trackingNumber: 0, userData: nil))
         for returnsToAnchor in [true, false] {
             let popup = Popup()
@@ -1683,21 +1252,20 @@ final class TaskbarRendererTests: XCTestCase {
         await clock.advance(.milliseconds(250), allowIdle: true)
         XCTAssertTrue(popup.content === list)
 
-        let enter = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
-            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
-            trackingNumber: 0, userData: nil))
-        let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
-            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
-            trackingNumber: 0, userData: nil))
-        list.mouseEntered(with: enter)
-        list.mouseExited(with: exit)
+        func event(_ type: NSEvent.EventType) -> NSEvent {
+            NSEvent.enterExitEvent(with: type, location: .zero, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil,
+                eventNumber: 0, trackingNumber: 0, userData: nil)!
+        }
+        list.mouseEntered(with: event(.mouseEntered))
+        list.mouseExited(with: event(.mouseExited))
         XCTAssertTrue(list.isPointerInside)
-        list.mouseEntered(with: enter)
+        list.mouseEntered(with: event(.mouseEntered))
         sendTerminalDrag(drag, to: second)
         XCTAssertTrue(list.isPointerInside)
         await clock.advance(allowIdle: true)
         XCTAssertTrue(popup.content === list)
-        list.mouseExited(with: exit)
+        list.mouseExited(with: event(.mouseExited))
         await clock.advance()
         XCTAssertFalse(popup.isPresented)
     }
@@ -1998,7 +1566,7 @@ final class TaskbarRendererTests: XCTestCase {
         var hovering: [Bool] = []
         button.onHover = { hovering.append($0) }
         for type: NSEvent.EventType in [.mouseEntered, .mouseExited] {
-            let event = NSEvent.enterExitEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0,
+            let event = NSEvent.enterExitEvent(with: type, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                                               windowNumber: 0, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
             if type == .mouseEntered { button.mouseEntered(with: event) }
             else { button.mouseExited(with: event) }
@@ -2021,17 +1589,18 @@ final class TaskbarRendererTests: XCTestCase {
             button.reduceMotion = { true }
             var clicks = 0
             button.onClick = { clicks += 1 }
-            let enter = NSEvent.enterExitEvent(with: .mouseEntered, location: .zero, modifierFlags: [], timestamp: 0,
-                                              windowNumber: 0, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
-            let exit = NSEvent.enterExitEvent(with: .mouseExited, location: .zero, modifierFlags: [], timestamp: 0,
-                                             windowNumber: 0, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
-            button.mouseEntered(with: enter)
+            func event(_ type: NSEvent.EventType) -> NSEvent {
+                NSEvent.enterExitEvent(with: type, location: .zero, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil,
+                    eventNumber: 0, trackingNumber: 0, userData: nil)!
+            }
+            button.mouseEntered(with: event(.mouseEntered))
             let hoverFill = button.selectionView.alphaValue
             let hoverBorder = button.selectionView.borderColor.alphaComponent
             XCTAssertGreaterThan(hoverFill, 0)
             XCTAssertEqual(button.selectionView.borderWidth, 1)
             XCTAssertEqual(button.indicator.frame.width, 4)
-            button.mouseExited(with: exit)
+            button.mouseExited(with: event(.mouseExited))
             XCTAssertEqual(button.selectionView.alphaValue, 0)
             button.isActiveWindow = true
             let activeFill = button.selectionView.alphaValue
@@ -2039,7 +1608,7 @@ final class TaskbarRendererTests: XCTestCase {
             XCTAssertEqual(hoverFill, activeFill)
             XCTAssertGreaterThan(activeBorder, hoverBorder)
             XCTAssertEqual(button.indicator.frame.width, 11)
-            button.mouseEntered(with: enter)
+            button.mouseEntered(with: event(.mouseEntered))
             let activeHoverFill = button.selectionView.alphaValue
             XCTAssertGreaterThan(activeHoverFill, activeFill)
             XCTAssertLessThan(button.selectionView.borderColor.alphaComponent, activeBorder)
@@ -2053,7 +1622,7 @@ final class TaskbarRendererTests: XCTestCase {
             button.isActiveWindow = false
             XCTAssertEqual(button.selectionView.alphaValue, hoverFill)
             XCTAssertEqual(button.selectionView.borderColor.alphaComponent, hoverBorder)
-            button.mouseExited(with: exit)
+            button.mouseExited(with: event(.mouseExited))
             XCTAssertEqual(button.selectionView.alphaValue, 0)
         }
     }
@@ -2409,7 +1978,7 @@ final class TaskbarRendererTests: XCTestCase {
         let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
         let row = try XCTUnwrap(list.nativeRow(at: 1))
         row.mouseEntered(with: try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
-            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+            modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
             trackingNumber: 0, userData: nil)))
         XCTAssertFalse(row.closeButton.isHidden)
         row.closeButton.performClick(nil)
@@ -2559,10 +2128,10 @@ extension TaskbarRendererTests {
             XCTAssertEqual(popup.keyRequests, 1)
             let list = try XCTUnwrap(popup.content as? TaskbarWindowListView)
             let enter = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseEntered, location: .zero,
-                modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
                 trackingNumber: 0, userData: nil))
             let exit = try XCTUnwrap(NSEvent.enterExitEvent(with: .mouseExited, location: .zero,
-                modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+                modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: 0, context: nil, eventNumber: 0,
                 trackingNumber: 0, userData: nil))
             list.mouseEntered(with: enter)
             list.mouseExited(with: exit)
@@ -2658,6 +2227,31 @@ extension TaskbarRendererTests {
         XCTAssertFalse(popup.isPresented)
     }
 
+    func testQueuedPointerMoveCannotRestoreTaskbarHoverAfterGeometryChanges() throws {
+        let frame = CGRect(x: 0, y: 0, width: 240, height: 32)
+        let panel = RecordingPopupPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        defer { panel.close() }
+        let host = NSView(frame: frame)
+        panel.contentView = host
+        let button = TaskbarButtonView(frame: CGRect(x: 10, y: 0, width: 90, height: 32))
+        button.reduceMotion = { true }
+        host.addSubview(button)
+        let point = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        func pointerMove() throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber, context: nil,
+                eventNumber: 1, clickCount: 0, pressure: 0))
+        }
+        let queued = try pointerMove()
+        let original = button.frame
+        button.frame = original.offsetBy(dx: 100, dy: 0)
+        button.frame = original
+        button.mouseMoved(with: queued)
+        XCTAssertEqual(button.selectionView.alphaValue, 0)
+        button.mouseMoved(with: try pointerMove())
+        XCTAssertGreaterThan(button.selectionView.alphaValue, 0)
+    }
+
     func testLateExitFromTheReturnedButtonPreservesCombinedHoverAndFeedback() async throws {
         let popup = Popup()
         let clock = Clock()
@@ -2674,18 +2268,18 @@ extension TaskbarRendererTests {
         let secondPoint = second.convert(CGPoint(x: second.bounds.midX, y: second.bounds.midY), to: nil)
 
         panel.pointer = firstPoint
-        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first)
+        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first, timestamp: 1)
         panel.pointer = secondPoint
-        try sendTrackingEvent(.mouseEntered, at: secondPoint, to: second)
+        try sendTrackingEvent(.mouseEntered, at: secondPoint, to: second, timestamp: 2)
         panel.pointer = firstPoint
-        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first)
-        try sendTrackingEvent(.mouseExited, at: secondPoint, to: first)
+        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first, timestamp: 4)
+        try sendTrackingEvent(.mouseExited, at: secondPoint, to: first, timestamp: 3)
         XCTAssertGreaterThan(first.selectionView.alphaValue, 0)
         await clock.advance(.milliseconds(400))
         XCTAssertEqual((popup.content as? TaskbarWindowListView)?.nativeRows.map(\.item.id), ["narrow-0", "narrow-1"])
 
         panel.pointer = CGPoint(x: -1, y: -1)
-        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: first)
+        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: first, timestamp: 5)
         XCTAssertEqual(first.selectionView.alphaValue, 0)
         XCTAssertNotNil(popup.content)
         await clock.advance(.milliseconds(250), allowIdle: true)
@@ -2708,8 +2302,8 @@ extension TaskbarRendererTests {
         let firstPoint = first.convert(CGPoint(x: first.bounds.midX, y: first.bounds.midY), to: nil)
         panel.pointer = second.convert(CGPoint(x: second.bounds.midX, y: second.bounds.midY), to: nil)
 
-        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: second)
-        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first)
+        try sendTrackingEvent(.mouseEntered, at: panel.pointer, to: second, timestamp: 2)
+        try sendTrackingEvent(.mouseEntered, at: firstPoint, to: first, timestamp: 1)
         XCTAssertEqual(first.selectionView.alphaValue, 0)
         XCTAssertGreaterThan(second.selectionView.alphaValue, 0)
         await clock.advance(.milliseconds(400))
@@ -2726,11 +2320,11 @@ extension TaskbarRendererTests {
         button.onHover = { hovering.append($0) }
         let inside = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
         panel.pointer = inside
-        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: button, timestamp: 1)
         XCTAssertGreaterThan(button.selectionView.alphaValue, 0)
         panel.pointer = CGPoint(x: -1, y: -1)
-        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: button)
-        try sendTrackingEvent(.mouseEntered, at: inside, to: button)
+        try sendTrackingEvent(.mouseExited, at: panel.pointer, to: button, timestamp: 2)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: button, timestamp: 1)
         XCTAssertEqual(button.selectionView.alphaValue, 0)
         XCTAssertEqual(hovering, [true, false])
     }
@@ -2752,22 +2346,22 @@ extension TaskbarRendererTests {
         let inside = list.convert(CGPoint(x: list.bounds.midX, y: list.bounds.midY), to: nil)
         let outside = CGPoint(x: -1, y: -1)
         panel.pointer = inside
-        try sendTrackingEvent(.mouseEntered, at: inside, to: list)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: list, timestamp: 1)
         button.onHover?(false)
         panel.pointer = outside
-        try sendTrackingEvent(.mouseExited, at: outside, to: list)
+        try sendTrackingEvent(.mouseExited, at: outside, to: list, timestamp: 2)
         XCTAssertFalse(list.isPointerInside)
-        try sendTrackingEvent(.mouseEntered, at: inside, to: list)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: list, timestamp: 1)
         XCTAssertFalse(list.isPointerInside)
         panel.pointer = inside
-        try sendTrackingEvent(.mouseEntered, at: inside, to: list)
-        try sendTrackingEvent(.mouseExited, at: outside, to: list)
+        try sendTrackingEvent(.mouseEntered, at: inside, to: list, timestamp: 4)
+        try sendTrackingEvent(.mouseExited, at: outside, to: list, timestamp: 3)
         XCTAssertTrue(list.isPointerInside)
         await clock.advance(.milliseconds(250), allowIdle: true)
         XCTAssertTrue(popup.panel === panel)
 
         panel.pointer = outside
-        try sendTrackingEvent(.mouseExited, at: outside, to: list)
+        try sendTrackingEvent(.mouseExited, at: outside, to: list, timestamp: 5)
         XCTAssertFalse(list.isPointerInside)
         await clock.advance(.milliseconds(250), allowIdle: true)
         XCTAssertFalse(popup.isPresented)
@@ -2891,9 +2485,10 @@ extension TaskbarRendererTests {
         XCTAssertFalse(panel.isVisible)
     }
 
-    private func sendTrackingEvent(_ type: NSEvent.EventType, at point: CGPoint, to view: NSView) throws {
+    private func sendTrackingEvent(_ type: NSEvent.EventType, at point: CGPoint, to view: NSView,
+                                   timestamp: TimeInterval = 0) throws {
         let event = try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [],
-            timestamp: 0, windowNumber: view.window?.windowNumber ?? 0, context: nil,
+            timestamp: ProcessInfo.processInfo.systemUptime + timestamp, windowNumber: view.window?.windowNumber ?? 0, context: nil,
             eventNumber: 0, trackingNumber: 0, userData: nil))
         if type == .mouseEntered { view.mouseEntered(with: event) }
         else { view.mouseExited(with: event) }

@@ -11,18 +11,19 @@ public final class CommandShiftModule {
 
     public var onInterruption: ((Bool) -> Void)?
     private let notifications = NSWorkspace.shared.notificationCenter
-    private let monitor = KeyboardMonitor(readInput: { ShortcutRecognizer.currentInput() }) {
-        let status = SystemInputSources.selectNext()
-        if status != 0 {
-            Alerts.error("Couldn’t Switch Input Source",
-                         "macOS returned error \(status). Check your enabled input sources in System Settings > Keyboard > Text Input.")
-        }
-    }
+    private let monitor: KeyboardMonitor
     private var observers: [NSObjectProtocol] = []
     private var sleeping = false
     private var sessionInactive = false
 
-    public init() {
+    public init(hasPermission: @escaping () -> Bool) {
+        monitor = KeyboardMonitor(hasPermission: hasPermission, readInput: { ShortcutRecognizer.currentInput() }) {
+            let status = SystemInputSources.selectNext()
+            if status != 0 {
+                Alerts.error("Couldn’t Switch Input Source",
+                             "macOS returned error \(status). Check your enabled input sources in System Settings > Keyboard > Text Input.")
+            }
+        }
         monitor.onInterruption = { [weak self] state in
             guard let self else { return }
             self.stop()
@@ -31,12 +32,7 @@ public final class CommandShiftModule {
     }
 
     public func start(requestPermission: Bool) -> StartResult {
-        var result = monitor.start()
-        if result == .permissionRequired, requestPermission {
-            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-            result = monitor.start()
-        }
-        switch result {
+        switch monitor.start() {
         case .running:
             observeWorkspace()
             return .running

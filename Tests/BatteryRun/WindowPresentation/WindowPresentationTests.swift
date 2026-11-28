@@ -9,6 +9,7 @@ enum WindowSystem {
     static var keyShows = 0
     static var fallbackShows = 0
     static var controllers = 0
+    static var refreshes = 0
     static var foreground = false
     static weak var currentWindow: NSWindow?
 
@@ -49,7 +50,7 @@ final class NSApplication: NSObject {
 
 @MainActor
 final class BatteryMonitor {
-    func start() {}
+    func refresh() { WindowSystem.refreshes += 1 }
 }
 
 @MainActor
@@ -77,8 +78,10 @@ public final class NSWindow {
 @MainActor
 final class BatteryWindowController {
     let window: NSWindow? = NSWindow()
+    let monitor: BatteryMonitor
 
     init(monitor: BatteryMonitor) {
+        self.monitor = monitor
         WindowSystem.controllers += 1
         WindowSystem.currentWindow = window
     }
@@ -149,6 +152,10 @@ struct WindowPresentationTest {
         if presented.count != WindowSystem.presentations || presented.isEmpty ||
             presented.contains(where: { $0 !== WindowSystem.currentWindow }) {
             failures.append("each presentation must register the same exact window once")
+        }
+
+        if WindowSystem.refreshes != WindowSystem.presentations {
+            failures.append("refresh must run exactly once per actual presentation")
         }
 
         for failure in failures { print("FAIL \(failure)") }

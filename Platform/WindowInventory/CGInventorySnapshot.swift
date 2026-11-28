@@ -61,23 +61,11 @@ struct AppTrackerCGWindowSnapshot: Equatable {
     }
 
     static func capture() -> AppTrackerCGWindowSnapshot {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("cg.windowList.full")
-        #endif
         let info = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID)
-        #if DEBUG
-        resources?.finish()
-        #endif
         guard let windowInfo = info as? [[String: Any]] else { return .failed }
         let ids = Set(windowInfo.compactMap(layerZeroWindowID(in:)))
         guard !ids.isEmpty else { return parse(windowInfo) }
-        #if DEBUG
-        let parentsRead = ActionResourceLog.begin("cg.windowParents.batch")
-        #endif
         let parents = NativeWindowParentReader.parents(for: ids)
-        #if DEBUG
-        parentsRead?.finish()
-        #endif
         return parse(windowInfo, parentWindowIDs: parents)
     }
 
@@ -88,34 +76,18 @@ struct AppTrackerCGWindowSnapshot: Equatable {
     static func captureRootCandidate(windowID: CGWindowID) -> AppTrackerCGWindowSnapshot {
         var snapshot = capture(windowID: windowID, system: NativeWindowSystem())
         guard snapshot.onScreenWindowIDs.contains(windowID) else { return snapshot }
-        #if DEBUG
-        let resources = ActionResourceLog.begin("cg.windowParents.byID")
-        defer { resources?.finish() }
-        #endif
         snapshot.parentWindowIDs = NativeWindowParentReader.parents(for: [windowID])
         return snapshot
     }
 
     static func capture(windowID: CGWindowID, system: any WindowSystemAccess) -> AppTrackerCGWindowSnapshot {
-        #if DEBUG
-        let byID = ActionResourceLog.begin("cg.windowDescriptions.byID")
-        #endif
         let descriptions = system.windowDescriptions(for: [windowID])
-        #if DEBUG
-        byID?.finish()
-        #endif
         guard let descriptions, descriptions.count == 1,
               nativeWindowNumber(in: descriptions[0]) == windowID else { return .failed }
         let snapshot = parse(descriptions)
         let visibilityKey = kCGWindowIsOnscreen as String
         guard descriptions[0][visibilityKey] == nil, let owner = snapshot.ownerPIDByWindowID[windowID] else { return snapshot }
-        #if DEBUG
-        let fallback = ActionResourceLog.begin("cg.windowList.visibilityFallback")
-        #endif
         let visible = system.windowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-        #if DEBUG
-        fallback?.finish()
-        #endif
         guard let visible else { return snapshot }
         let matches = visible.filter { nativeWindowNumber(in: $0) == windowID }
         guard matches.count == 1, var match = matches.first else { return snapshot }
@@ -127,14 +99,18 @@ struct AppTrackerCGWindowSnapshot: Equatable {
         return current
     }
 
+    static func heightScanRows(system: any WindowSystemAccess) -> [WindowHeightScanRow]? {
+        system.windowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)?.compactMap { info in
+            guard let id = nativeWindowNumber(in: info), id != 0,
+                  let owner = info[kCGWindowOwnerPID as String] as? Int, let pid = pid_t(exactly: owner), pid > 0,
+                  (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue != 0 else { return nil }
+            let bounds = (info[kCGWindowBounds as String] as? NSDictionary).flatMap { CGRect(dictionaryRepresentation: $0) }
+            return WindowHeightScanRow(windowID: id, pid: pid, layer: info[kCGWindowLayer as String] as? Int, bounds: bounds)
+        }
+    }
+
     static func captureOnScreenWindowIDs() -> Set<CGWindowID>? {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("cg.windowList.onScreen")
-        #endif
         let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-        #if DEBUG
-        resources?.finish()
-        #endif
         guard let windowInfo = info as? [[String: Any]] else { return nil }
         return layerZeroWindowIDs(in: windowInfo)
     }

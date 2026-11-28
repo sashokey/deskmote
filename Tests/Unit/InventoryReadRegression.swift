@@ -178,7 +178,7 @@ final class InventoryReadRegression: XCTestCase {
 
         _ = tracker.reconcileFixtureForTesting(pid: pid, cgSnapshot: cg([77, 88]), now: Date(),
             eligible: [knownActiveTab] + read.windows,
-            readOutcome: read.outcome.kind == .unread ? read.outcome : .success(count: 2))
+            readOutcome: read.outcome)
 
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: pid)?.windowOrder, [77],
             "A known background tab must not gain a separate seat merely because AXMinimized timed out")
@@ -247,28 +247,29 @@ final class InventoryReadRegression: XCTestCase {
     func testTransientMinimizedReadIsUnreadAndHealthyReadRecovers() {
         for error in [AXError.cannotComplete, .failure, .invalidUIElement, .apiDisabled] {
             let read = inventory(InventoryRegressionAX(minimizedResult: error))
-            XCTAssertEqual(read.outcome, .unread(errorCode: error.rawValue))
+            XCTAssertEqual(read.outcome, .unread)
+            XCTAssertEqual(read.error, error)
         }
         let healthy = inventory(InventoryRegressionAX(minimizedResult: .success))
-        XCTAssertEqual(healthy.outcome, .success(count: 1))
+        XCTAssertEqual(healthy.outcome, .success)
         XCTAssertEqual(healthy.windows.first?.isMinimized, true)
     }
 
     func testUnsupportedMinimizedAttributeStillAdmitsOrdinaryWindows() {
         for error in [AXError.attributeUnsupported, .noValue] {
             let read = inventory(InventoryRegressionAX(minimizedResult: error))
-            XCTAssertEqual(read.outcome, .success(count: 1))
+            XCTAssertEqual(read.outcome, .success)
             XCTAssertEqual(read.windows.first?.isMinimized, false)
             XCTAssertEqual(read.windows.first?.title, "Window")
         }
     }
 
-    private func inventory(_ fixture: InventoryRegressionAX) -> (windows: [AXWindowSnapshot], outcome: InventoryAXReadOutcome) {
+    private func inventory(_ fixture: InventoryRegressionAX) -> (windows: [AXWindowSnapshot], outcome: InventoryAXReadOutcome, error: AXError?) {
         let result = AXWindowReader(accessibility: fixture).inventoryWindows(forPID: fixture.pidValue,
             messagingTimeout: 0.1)
         switch result {
-        case let .success(windows): return (windows, .success(count: windows.count))
-        case let .unread(error): return ([], .unread(errorCode: error.rawValue))
+        case let .success(windows): return (windows, .success, nil)
+        case let .unread(error): return ([], .unread, error)
         }
     }
 
@@ -288,10 +289,7 @@ final class InventoryReadRegression: XCTestCase {
     private func makeTracker(reader: any AppTrackerWindowReading = AXWindowReader(),
         processSeconds: Int64 = 1, cgSnapshot: AppTrackerCGWindowSnapshot = .failed,
         process: (any AppTrackerProcessProviding)? = nil) -> AppTracker {
-        let log = WindowInventoryAnomalyLog(configuration: .init(enabled: false,
-            directoryURL: URL(fileURLWithPath: #filePath).deletingLastPathComponent(),
-            maxFileSize: 1_000_000, archiveCount: 1))
-        let tracker = AppTracker(inventoryLog: log, reader: reader,
+        let tracker = AppTracker(reader: reader,
             processProvider: process ?? InventoryRegressionProcess(seconds: processSeconds),
             cgSnapshotProvider: { cgSnapshot }, onScreenWindowIDsProvider: { [] })
         tracker.setFrontmostPIDForTesting(pid)

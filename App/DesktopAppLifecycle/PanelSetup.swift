@@ -1,14 +1,19 @@
 import AppKit
 
 extension PanelCoordinator {
-    func setupDockPanel(makeTaskbarView: (CGRect) -> TaskbarView = { TaskbarView(frame: $0) }) -> Bool {
+    func setupDockPanel(
+        makeTaskbarView: (CGRect) -> TaskbarView = { TaskbarView(frame: $0) },
+        makeDockPanel: (CGRect) -> NSPanel = {
+            NonConstrainingPanel(contentRect: $0, styleMask: [.borderless, .nonactivatingPanel],
+                                 backing: .buffered, defer: false)
+        }
+    ) -> Bool {
         let fallback = fixedUnitDisplayUUID == nil ? screenProvider().first ?? mainScreenProvider()
             : mainScreenProvider() ?? screenProvider().first
         guard let screen = resolvedPinnedScreen() ?? fallback else { return false }
         let frame = TaskbarMetrics.panelFrame(on: screen.frame)
-        let panel = NonConstrainingPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
-                                          backing: .buffered, defer: false)
-        configurePanel(panel, backgroundColor: .clear, appliesLevelOverride: true)
+        let panel = makeDockPanel(frame)
+        configurePanel(panel, backgroundColor: .clear)
         panel.isReleasedWhenClosed = false
         let view = makeTaskbarView(CGRect(origin: .zero, size: frame.size))
         view.taskbarContent.admitWindowList = { [weak self] openedByClick in
@@ -19,7 +24,7 @@ extension PanelCoordinator {
             guard let self else { return }
             _ = self.onAccessoryInteraction?(self, .backgroundClick)
         }
-        view.taskbarContent.enableAppsMenu()
+        view.taskbarContent.installLeadingSlot(leadingSlotFactory)
         view.autoresizingMask = [.width, .height]
         dockContentHost = ManualPanelHost(contentView: view, in: panel)
         taskbarView = view
@@ -39,17 +44,11 @@ extension PanelCoordinator {
 
     func orderDockSurfaceFront(source: String) {
         dockPanel?.orderFrontRegardless()
-        #if DEBUG
-        recordPanelVisibility(event: "order-front", source: source)
-        #endif
     }
 
     func orderDockSurfaceOut(source: String) {
         taskbarView?.taskbarContent.prepareForHiding()
         dockPanel?.orderOut(nil)
-        #if DEBUG
-        recordPanelVisibility(event: "order-out", source: source)
-        #endif
     }
 
     func presentInitialPanels() {
@@ -60,11 +59,10 @@ extension PanelCoordinator {
         applyPanelVisibility(source: "initial")
     }
 
-    func configurePanel(_ panel: NSPanel, backgroundColor: NSColor, appliesLevelOverride: Bool) {
+    func configurePanel(_ panel: NSPanel, backgroundColor: NSColor) {
         panel.level = .floating
         panel.collectionBehavior = PanelCollectionBehavior.standard
         panel.isFloatingPanel = true
-        if appliesLevelOverride, let level = Self.panelLevelOverride { panel.level = level }
         panel.isMovable = false
         panel.isOpaque = false
         panel.backgroundColor = backgroundColor

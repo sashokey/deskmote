@@ -9,6 +9,9 @@ final class AppDisplayNameCache {
     private let lock = NSLock()
     private var values: [Key: String] = [:]
     private var order: [Key] = []
+    private var invalidationGeneration: UInt64 = 0
+
+    var generation: UInt64 { lock.withLock { invalidationGeneration } }
 
     func value(for bundleID: String, bundlePath: String? = nil, loader: () -> String?) -> String {
         let key = Key(bundleID: bundleID, bundlePath: bundlePath)
@@ -24,7 +27,10 @@ final class AppDisplayNameCache {
         lock.lock()
         if values[key] == nil { order.append(key) }
         values[key] = bounded
-        while order.count > 512 { values.removeValue(forKey: order.removeFirst()) }
+        while order.count > 512 {
+            values.removeValue(forKey: order.removeFirst())
+            invalidationGeneration &+= 1
+        }
         lock.unlock()
         return bounded
     }
@@ -33,6 +39,7 @@ final class AppDisplayNameCache {
         lock.lock()
         for key in values.keys where key.bundleID == bundleID { values.removeValue(forKey: key) }
         order.removeAll { $0.bundleID == bundleID }
+        invalidationGeneration &+= 1
         lock.unlock()
     }
 }

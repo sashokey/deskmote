@@ -7,11 +7,13 @@ final class TaskbarPresenter {
     private let topology: DisplayTopologyStore
     private let spaces: TaskbarSpaceStore
     private let displayUUID: String?
+    private let applicationName: @MainActor (StripItem) -> String
     private weak var view: TaskbarView?
     private var subscriptions = Set<AnyCancellable>()
     private var refreshing = false
     private var liveIDs: [String] = []
     private var renderedSpaceRevision: UInt64 = 0
+    private var renderedNameGeneration: UInt64?
     private var panelAllowsWindowActions = true
     private let panelInvalidations = PassthroughSubject<Void, Never>()
 
@@ -19,13 +21,20 @@ final class TaskbarPresenter {
          topology: DisplayTopologyStore, spaces: TaskbarSpaceStore, displayUUID: String?,
          backgroundMenu: @escaping (NSEvent, NSView) -> Void,
          contextMenuVisibilityChanged: @escaping (Bool) -> Void,
-         icons: AppIconResolver = .shared, system: any WindowSystemAccess = NativeWindowSystem()) {
+         icons: AppIconResolver = .shared, system: any WindowSystemAccess = NativeWindowSystem(),
+         applicationName: (@MainActor (StripItem) -> String)? = nil) {
         self.view = view
         self.runtime = runtime
         self.ordering = ordering
         self.topology = topology
         self.spaces = spaces
         self.displayUUID = displayUUID
+        self.applicationName = applicationName ?? { item in
+            if let bundleID = item.bundleIdentifier {
+                return AppDisplayNameResolver.displayName(for: bundleID, origin: item.resourceOrigin)
+            }
+            return NSRunningApplication(processIdentifier: item.resourcePID)?.localizedName ?? item.appID
+        }
         view.taskbarContent.canUseWindowActions = { [weak self] in
             guard let self, self.panelAllowsWindowActions else { return false }
             return self.allowsExternalProjection(revision: self.renderedSpaceRevision)
@@ -76,7 +85,21 @@ final class TaskbarPresenter {
         topology.$physicalDisplayCount.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         spaces.activeSpaceChanges.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         spaces.$activeLayouts.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
-        spaces.$snapshot.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
+        spaces.$snapshot
+            .map { snapshot in
+                var presentation = snapshot
+                presentation.heightMembershipStamps = [:]
+                return presentation
+            }
+            .removeDuplicates(by: { [weak self] previous, current in
+                guard let self, previous == current,
+                      let renderedNameGeneration = self.renderedNameGeneration,
+                      !self.runtime.hasRegisteredUtilityWindows,
+                      !self.ordering.hasAbsentRankMemory else { return false }
+                return renderedNameGeneration == AppDisplayNameResolver.cacheGeneration
+            })
+            .sink { [weak self] _ in self?.scheduleRefresh() }
+            .store(in: &subscriptions)
         spaces.$confirmedSpaceRevision.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &subscriptions)
         icons.changes.sink { [weak self] in self?.scheduleRefresh(refreshIcons: true) }.store(in: &subscriptions)
         refresh()
@@ -150,10 +173,6 @@ final class TaskbarPresenter {
     }
 
     private func refresh() {
-        #if DEBUG
-        let resources = ActionResourceLog.begin("taskbar.presentSnapshot")
-        defer { resources?.finish() }
-        #endif
         guard !refreshing, let view else { return }
         refreshing = true
         let refreshIcons = iconsDirty
@@ -172,15 +191,19 @@ final class TaskbarPresenter {
         let liveUtility = permitsExternal ? [] : visibleItems().values.filter(isLiveUtility)
         renderedOnlyLiveUtility = !liveUtility.isEmpty
         let activeItemID = runtime.effectiveActiveWindowID.flatMap { runtime.snapshot.windows[$0]?.groupID }
+        let nameGeneration = AppDisplayNameResolver.cacheGeneration
+        var namesAreCached = true
         let groups = TaskbarPresentation.groups(items: permitsExternal ? items : liveUtility, order: order, filter: displayFilter,
                                                 activeItemID: activeItemID,
                                                 spaces: spaces.snapshot,
                                                 utilityOnPanelDisplay: utilityOnPanelDisplay,
                                                 utilityOnActiveSpace: { runtime.utilityWindowOnActiveSpace($0) }) { item in
-            if let bundleID = item.bundleIdentifier { return AppDisplayNameResolver.displayName(for: bundleID, origin: item.resourceOrigin) }
-            return NSRunningApplication(processIdentifier: item.resourcePID)?.localizedName ?? item.appID
+            let name = applicationName(item)
+            if item.bundleIdentifier == nil || item.bundleIdentifier == name { namesAreCached = false }
+            return name
         }
         view.taskbarContent.update(groups: groups, refreshIcons: refreshIcons)
         renderedSpaceRevision = confirmedSpaceRevision
+        renderedNameGeneration = namesAreCached ? nameGeneration : nil
     }
 }

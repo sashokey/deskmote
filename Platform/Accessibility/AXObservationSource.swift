@@ -1,17 +1,8 @@
 import AppKit
 import ApplicationServices
 import Foundation
-#if DEBUG
-import OSLog
-#endif
 
 final class AccessibilitySource {
-    #if DEBUG
-    private static let logger = Logger(
-        subsystem: DockWindowEligibilityPolicy.selfBundleIdentifier,
-        category: "WindowFiltering"
-    )
-    #endif
 
     private let reader = AXWindowReader()
     private let eligibilityPolicy = DockWindowEligibilityPolicy()
@@ -35,9 +26,6 @@ final class AccessibilitySource {
                 isTopLevel: window.isTopLevel
             )
             guard axDecision.isAccepted else { return false }
-            #if DEBUG
-            logUnconfirmedWindowIfNeeded(axDecision, window: window, app: app)
-            #endif
 
             return eligibilityPolicy.evaluate(
                 DockWindowEligibilityPolicy.Candidate(
@@ -54,18 +42,6 @@ final class AccessibilitySource {
         }
     }
 
-    #if DEBUG
-    private func logUnconfirmedWindowIfNeeded(
-        _ decision: AXTaskbarWindowRules.Decision,
-        window: AXWindowSnapshot,
-        app: NSRunningApplication
-    ) {
-        guard decision == .unconfirmedMainWindow else { return }
-        Self.logger.debug(
-            "Admitting AXWindow with missing subrole app=\(app.localizedName ?? "", privacy: .public) bundle=\(app.bundleIdentifier ?? "", privacy: .public) title=\(window.title ?? "", privacy: .private)"
-        )
-    }
-    #endif
 }
 
 struct AXObservationHistory {

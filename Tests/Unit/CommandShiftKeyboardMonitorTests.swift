@@ -3,6 +3,59 @@ import XCTest
 @testable import CommandShift
 
 final class KeyboardMonitorTests: XCTestCase {
+    func testRetiredListenerCannotSwitchAfterRestart() throws {
+        try MainActor.assumeIsolated {
+            let original = try TapFixture()
+            let replacement = try TapFixture()
+            var fixture = original
+            var switches = 0
+            let monitor = KeyboardMonitor(
+                hasPermission: { true },
+                makeTap: { fixture.makeTap($0, $1, $2, $3, $4, $5) },
+                enableTap: { fixture.setEnabled($0, $1) },
+                isTapEnabled: { _ in fixture.enabled },
+                readTaps: { fixture.installedTaps() },
+                onShortcut: { switches += 1 }
+            )
+            defer { monitor.stop() }
+            XCTAssertEqual(monitor.start(), .running)
+            try original.send(.flagsChanged, flags: [.maskCommand, .maskShift])
+            try original.send(.flagsChanged, flags: [])
+
+            monitor.stop()
+            XCTAssertFalse(CFMachPortIsValid(original.port))
+            fixture = replacement
+            XCTAssertEqual(monitor.start(), .running)
+            Self.drainQueue()
+            XCTAssertEqual(switches, 0)
+
+            try replacement.send(.flagsChanged, flags: [.maskCommand, .maskShift])
+            try replacement.send(.flagsChanged, flags: [])
+            Self.drainQueue()
+            XCTAssertEqual(switches, 1)
+        }
+    }
+
+    func testDelayedDisableOnEnabledTapPreservesCurrentGesture() throws {
+        try MainActor.assumeIsolated {
+            let fixture = try TapFixture()
+            var switches = 0
+            let monitor = fixture.makeMonitor(onShortcut: { switches += 1 })
+            monitor.onInterruption = { _ in XCTFail("Enabled tap reported an interruption") }
+            defer { monitor.stop() }
+            XCTAssertEqual(monitor.start(), .running)
+            let enableAttempts = fixture.enableAttempts
+
+            try fixture.send(.flagsChanged, flags: [.maskCommand, .maskShift])
+            try fixture.send(.tapDisabledByTimeout, flags: [])
+            try fixture.send(.flagsChanged, flags: [])
+            Self.drainQueue()
+
+            XCTAssertEqual(fixture.enableAttempts, enableAttempts)
+            XCTAssertEqual(switches, 1)
+        }
+    }
+
     func testStopOrRevocationCancelsAnAlreadyQueuedSwitch() throws {
         try MainActor.assumeIsolated {
             for revoke in [true, false] {
@@ -102,6 +155,7 @@ final class KeyboardMonitorTests: XCTestCase {
             fixture.enabled = false
             Self.drainQueue()
             XCTAssertTrue(fixture.enabled)
+            XCTAssertEqual(fixture.enableAttempts, [false, true, true])
             XCTAssertTrue(CFMachPortIsValid(fixture.port))
             XCTAssertEqual(switches, 0)
             XCTAssertTrue(interruptions.isEmpty)
@@ -291,12 +345,14 @@ final class KeyboardMonitorTests: XCTestCase {
     func testRegistersAnAccessibilitySessionTapWithOnlyRequiredEvents() {
         MainActor.assumeIsolated {
             var location: CGEventTapLocation?
+            var placement: CGEventTapPlacement?
             var options: CGEventTapOptions?
             var mask: CGEventMask = 0
             let monitor = KeyboardMonitor(
                 hasPermission: { true },
-                makeTap: { tap, _, mode, events, _, _ in
+                makeTap: { tap, position, mode, events, _, _ in
                     location = tap
+                    placement = position
                     options = mode
                     mask = events
                     return nil
@@ -305,14 +361,14 @@ final class KeyboardMonitorTests: XCTestCase {
             )
             XCTAssertEqual(monitor.start(), .unavailable)
             XCTAssertEqual(location, .cgSessionEventTap)
-            XCTAssertEqual(options, .defaultTap)
+            XCTAssertEqual(placement, .tailAppendEventTap)
+            XCTAssertEqual(options, .listenOnly)
             let required: [CGEventType] = [
                 .flagsChanged, .keyDown, .keyUp, .leftMouseDown, .leftMouseUp,
                 .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
                 .scrollWheel, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged
             ]
-            for type in required { XCTAssertNotEqual(mask & (1 << type.rawValue), 0, "\(type)") }
-            XCTAssertEqual(mask & (1 << CGEventType.mouseMoved.rawValue), 0)
+            XCTAssertEqual(mask, required.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) })
         }
     }
 }
@@ -378,19 +434,20 @@ private final class TapFixture {
     }
 
     func installedTaps() -> [CGEventTapInformation]? {
-        var taps: [CGEventTapInformation] = tap.map { tap in
-            var reported = tap
-            reported.enabled = reportsCompetingTapOnly || enabled
-            return [reported]
-        } ?? []
-        if includeExistingTap {
-            var existing = CGEventTapInformation()
-            existing.eventTapID = 2
-            existing.tappingProcess = getpid()
-            existing.tapPoint = .cgSessionEventTap
-            existing.options = .defaultTap
-            existing.eventsOfInterest = .max
-            taps.append(existing)
+        var taps: [CGEventTapInformation] = []
+        if var tap, !reportsCompetingTapOnly {
+            tap.enabled = enabled
+            taps.append(tap)
+        }
+        if includeExistingTap || (reportsCompetingTapOnly && tap != nil) {
+            var competing = CGEventTapInformation()
+            competing.eventTapID = 2
+            competing.tappingProcess = getpid()
+            competing.tapPoint = .cgSessionEventTap
+            competing.options = .listenOnly
+            competing.eventsOfInterest = .max
+            competing.enabled = true
+            taps.append(competing)
         }
         return taps
     }

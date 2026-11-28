@@ -1,6 +1,5 @@
 import Darwin
 import Foundation
-import os
 import Security
 import Synchronization
 
@@ -34,7 +33,6 @@ struct FinderDirectoryIdentity: Codable, Equatable, Sendable {
 }
 
 enum FinderFileCreationIPC {
-    static let logger = Logger(subsystem: "io.github.sashokey.deskmote.finder-sync", category: "FileCreation")
     static let serviceName = "io.github.sashokey.deskmote.finder-sync.service"
     static let servicePath = "Contents/XPCServices/DeskMoteFinderService.xpc"
 
@@ -69,7 +67,8 @@ enum FinderFileCreationClient {
     }
 
     static func send(_ type: NewFileType, to directory: URL, identity: FinderDirectoryIdentity,
-                     in extensionBundle: Bundle) -> Outcome {
+                     in extensionBundle: Bundle,
+                     makeConnection: (String) -> NSXPCConnection = { NSXPCConnection(serviceName: $0) }) -> Outcome {
         let path = directory.path
         let host = directory.host()
         guard directory.isFileURL, host == nil || host == "" || host == "localhost",
@@ -77,11 +76,10 @@ enum FinderFileCreationClient {
               let identityData = try? JSONEncoder().encode(identity) else { return .failed }
         let serviceURL = extensionBundle.bundleURL.appending(path: FinderFileCreationIPC.servicePath)
         guard let requirement = FinderFileCreationIPC.requirement(for: serviceURL) else {
-            FinderFileCreationIPC.logger.error("Invalid embedded Finder service signature")
             return .failed
         }
 
-        let connection = NSXPCConnection(serviceName: FinderFileCreationIPC.serviceName)
+        let connection = makeConnection(FinderFileCreationIPC.serviceName)
         connection.setCodeSigningRequirement(requirement)
         connection.remoteObjectInterface = NSXPCInterface(with: FinderFileCreationProtocol.self)
         connection.activate()
@@ -101,8 +99,7 @@ enum FinderFileCreationClient {
         _ invoke: (FinderFileCreationProtocol, @escaping @Sendable (Bool) -> Void) -> Void
     ) -> Outcome {
         awaitReply(deadline: deadline) { complete in
-            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
-                FinderFileCreationIPC.logger.error("Finder XPC request failed with code \((error as NSError).code, privacy: .public)")
+            let proxy = connection.remoteObjectProxyWithErrorHandler { _ in
                 complete(nil)
             }
             guard let service = proxy as? FinderFileCreationProtocol else {
@@ -123,9 +120,7 @@ enum FinderFileCreationClient {
             signal.signal()
         }
         send(complete)
-        if signal.wait(timeout: deadline) == .timedOut {
-            FinderFileCreationIPC.logger.error("Finder XPC request timed out")
-        }
+        _ = signal.wait(timeout: deadline)
         return result.withLock { $0 ?? .unconfirmed }
     }
 }

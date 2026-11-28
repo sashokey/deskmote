@@ -10,16 +10,6 @@ enum WindowSubscriptionItem: Int, CaseIterable, Comparable {
 
     var isCritical: Bool { self == .destroyed || self == .miniaturized }
 
-    #if DEBUG
-    var logName: String {
-        switch self {
-        case .destroyed: return "destroyed"
-        case .miniaturized: return "miniaturized"
-        case .deminiaturized: return "deminiaturized"
-        case .titleChanged: return "titleChanged"
-        }
-    }
-    #endif
 
     static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 }
@@ -151,21 +141,11 @@ struct WindowSubscriptionLedger<Element: Hashable> {
     }
 
     mutating func retain(keep: Set<CGWindowID>) -> [(cgWindowID: CGWindowID, instanceID: UInt64)] {
-        #if DEBUG
-        var dropped: [(cgWindowID: CGWindowID, instanceID: UInt64)] = []
-        #endif
         for (cgWindowID, record) in records where !keep.contains(cgWindowID) {
-            #if DEBUG
-            dropped.append((cgWindowID, record.instanceID))
-            #endif
             records.removeValue(forKey: cgWindowID)
             cgIDByElement.removeValue(forKey: record.element)
         }
-        #if DEBUG
-        return dropped.sorted { $0.cgWindowID < $1.cgWindowID }
-        #else
         return []
-        #endif
     }
 
     mutating func removeAll() {

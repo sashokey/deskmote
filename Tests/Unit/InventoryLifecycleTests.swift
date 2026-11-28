@@ -59,24 +59,18 @@ final class InventoryLifecycleTests: XCTestCase {
         XCTAssertEqual(captures.withLock { $0 }, 0)
     }
 
-    func testClosedHeldSeatsReleaseTheirDiagnosticEpisodesWhileTheApplicationKeepsRunning() throws {
-        let directory = TestFileSystem.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let log = WindowInventoryAnomalyLog(configuration: .init(enabled: true, directoryURL: directory,
-                                                                 maxFileSize: 1_000_000, archiveCount: 1))
-        let tracker = AppTracker(inventoryLog: log, reader: FocusLifecycleReader(blockFirst: false),
+    func testClosedHeldSeatsAreRemovedWhileTheApplicationKeepsRunning() {
+        let tracker = AppTracker(reader: FocusLifecycleReader(blockFirst: false),
                                  processProvider: LifecycleProcess(), cgSnapshotProvider: { .failed })
-        defer { tracker.stop(); try? FileManager.default.removeItem(at: directory) }
+        defer { tracker.stop() }
         for index in 0..<5 {
             let id = CGWindowID(77 + index)
             var seat = inventorySeat(id, token: "held-\(index)", bounds: inventoryFrame, minimized: true)
             seat.minAbsentSince = Date(timeIntervalSince1970: 80)
-            seat.absenceEpisodeID = UUID()
             tracker.installFixtureForTesting(inventoryApp(entries: [seat]))
             reconcileInventory(tracker, eligible: [], cg: inventoryCG(ids: [id]))
-            XCTAssertEqual(try heldEpisodeCount(tracker), 1)
             reconcileInventory(tracker, eligible: [], cg: inventoryCG(ids: []))
             XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID.count, 0)
-            XCTAssertEqual(try heldEpisodeCount(tracker), 0)
         }
     }
 
@@ -93,16 +87,6 @@ final class InventoryLifecycleTests: XCTestCase {
         }
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowOrder, [77, 88, 99])
         XCTAssertFalse(output.contains("[tabfold]"))
-    }
-
-    private func heldEpisodeCount(_ tracker: AppTracker) throws -> Int {
-        let deduplicator = try XCTUnwrap(Mirror(reflecting: tracker).children.first {
-            $0.label == "heldLogDeduplicator"
-        }?.value)
-        let storage = try XCTUnwrap(Mirror(reflecting: deduplicator).children.first {
-            $0.label == "reasonsByEpisode"
-        }?.value)
-        return Mirror(reflecting: storage).children.count
     }
 
     private func capturedStandardOutput(_ operation: () -> Void) throws -> String {
@@ -131,12 +115,12 @@ final class InventoryLifecycleTests: XCTestCase {
         tracker.installFixtureForTesting(inventoryApp(entries: [original]))
         let moved = inventoryWindow(88, bounds: inventoryFrame, element: element)
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: inventoryCG(ids: [77]),
-            now: Date(timeIntervalSince1970: 100), eligible: [moved], readOutcome: .success(count: 1), rawAXCgIDs: [88])
+            now: Date(timeIntervalSince1970: 100), eligible: [moved], readOutcome: .success, rawAXCgIDs: [88])
         let waiting = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(waiting.windowOrder, [77])
         XCTAssertEqual(waiting.windowsByID[77]?.actionTarget, target)
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: inventoryCG(ids: [88], onScreen: [88]),
-            now: Date(timeIntervalSince1970: 101), eligible: [moved], readOutcome: .success(count: 1), rawAXCgIDs: [88])
+            now: Date(timeIntervalSince1970: 101), eligible: [moved], readOutcome: .success, rawAXCgIDs: [88])
         let refreshed = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(refreshed.windowOrder, [88])
         XCTAssertEqual(refreshed.windowsByID[88]?.token, original.token)
@@ -219,7 +203,7 @@ final class InventoryLifecycleTests: XCTestCase {
             element: AXUIElementCreateApplication(inventoryPID), instanceID: 17)
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
             now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [88],
+            readOutcome: .success, rawAXCgIDs: [88],
             absenceEvidence: [77: missingInventoryEvidence(.alive(minimized: false), spaces: [], token: "native-tab-seat")])
         let switched = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(switched.windowOrder, [88])
@@ -297,13 +281,13 @@ final class InventoryLifecycleTests: XCTestCase {
         tracker.destroyForTesting(pid: inventoryPID, cgWindowID: id)
         let later = Date(timeIntervalSinceNow: 5)
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg, now: later, eligible: [],
-            readOutcome: .unread(errorCode: AXError.cannotComplete.rawValue))
+            readOutcome: .unread)
         tracker.rebuildSnapshotForTesting()
         XCTAssertTrue(tracker.snapshot.windows.isEmpty)
 
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg, now: later.addingTimeInterval(1),
             eligible: [inventoryWindow(id, bounds: inventoryFrame, minimized: true, element: destroyed)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [id])
+            readOutcome: .success, rawAXCgIDs: [id])
         tracker.rebuildSnapshotForTesting()
         XCTAssertTrue(tracker.snapshot.windows.isEmpty)
 
@@ -311,7 +295,7 @@ final class InventoryLifecycleTests: XCTestCase {
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: inventoryCG(ids: [id], onScreen: [id]),
             now: later.addingTimeInterval(2),
             eligible: [inventoryWindow(id, bounds: inventoryFrame, title: "Replacement", element: replacement)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [id])
+            readOutcome: .success, rawAXCgIDs: [id])
         tracker.rebuildSnapshotForTesting()
         XCTAssertEqual(tracker.snapshot.windows.values.map(\.title), ["Replacement"])
         XCTAssertNotEqual(tracker.snapshot.windows.values.first?.groupID, "destroyed-window")
@@ -339,7 +323,7 @@ final class InventoryLifecycleTests: XCTestCase {
                 isMinimized: false, isFocusedWindow: false, element: AXUIElementCreateApplication(newPID))
 
             tracker.reconcileFixtureForTesting(pid: newPID, cgSnapshot: cg, now: Date(),
-                eligible: [new], readOutcome: .success(count: 1), rawAXCgIDs: [77])
+                eligible: [new], readOutcome: .success, rawAXCgIDs: [77])
             tracker.rebuildSnapshotForTesting(onScreenCGIDs: [77])
 
             XCTAssertEqual(tracker.snapshot.orderedWindowIDs, [WindowID(rawValue: "cgw-77")])
@@ -462,7 +446,6 @@ final class InventoryLifecycleTests: XCTestCase {
         var seat = inventorySeat(77, token: "held-minimized", bounds: inventoryFrame, minimized: true)
         seat.priorTabWindowNumbers = [91]
         seat.minAbsentSince = Date(timeIntervalSince1970: 10)
-        seat.absenceEpisodeID = UUID()
         var app = inventoryApp(entries: [seat])
         app.shadowTabCgIDs = [92]
         tracker.installFixtureForTesting(app)
@@ -475,7 +458,6 @@ final class InventoryLifecycleTests: XCTestCase {
             XCTAssertEqual(after.windowsByID[77]?.token, "held-minimized")
             XCTAssertEqual(after.windowsByID[77]?.priorTabWindowNumbers, [91])
             XCTAssertEqual(after.windowsByID[77]?.minAbsentSince, seat.minAbsentSince)
-            XCTAssertEqual(after.windowsByID[77]?.absenceEpisodeID, seat.absenceEpisodeID)
             XCTAssertEqual(after.shadowTabCgIDs, [92])
             XCTAssertEqual(cache.element(pid: inventoryPID, cgWindowID: 77).map { CFEqual($0, handle) }, true)
             tracker.rebuildSnapshotForTesting()
@@ -517,7 +499,7 @@ final class InventoryLifecycleTests: XCTestCase {
             element: AXUIElementCreateApplication(inventoryPID), instanceID: 17)
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
             now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [88],
+            readOutcome: .success, rawAXCgIDs: [88],
             absenceEvidence: [77: missingInventoryEvidence(.alive(minimized: false), spaces: [], token: "native-tab-seat")])
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[88]?.priorTabWindowNumbers, [77])
         for cg in [AppTrackerCGWindowSnapshot.failed, inventoryCG(ids: [77, 88], onScreen: [77])] {
@@ -592,7 +574,7 @@ final class InventoryLifecycleTests: XCTestCase {
 
     private func reconcileInventory(_ tracker: AppTracker, eligible: [AXWindowSnapshot], cg: AppTrackerCGWindowSnapshot) {
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg, now: Date(timeIntervalSince1970: 100),
-                                           eligible: eligible, readOutcome: .success(count: eligible.count))
+                                           eligible: eligible, readOutcome: .success)
     }
 
     func testFocusedWindowReadDoesNotEnumerateWindowsOrReadTheirContent() {
@@ -905,7 +887,7 @@ final class InventoryLifecycleTests: XCTestCase {
             activationPolicy: .regular, executablePath: nil, windowsByID: [:], windowOrder: [], isHidden: false))
         tracker.terminateForTesting(pid: 42)
         XCTAssertEqual(tracker.mutationGenerationCountForTesting, 0)
-        XCTAssertTrue(tracker.diagnosticApps().isEmpty)
+        XCTAssertTrue(tracker.inventoryEntriesForTesting().isEmpty)
         XCTAssertTrue(tracker.snapshot.windows.isEmpty)
     }
 
@@ -1132,7 +1114,7 @@ final class InventoryLifecycleTests: XCTestCase {
             tracker.scheduleFrontmostPollForTesting(pid: pid)
             await drainInventory(tracker)
             XCTAssertEqual(tracker.snapshot.windows.count, 1)
-            XCTAssertEqual(AXElementCache.shared.containsForTesting(pid: pid, cgWindowID: 2001), AXElementCache.isEnabled)
+            XCTAssertEqual(AXElementCache.shared.containsForTesting(pid: pid, cgWindowID: 2001), true)
             current.withLock {
                 $0 = outcome == "failedCapture" ? .failed : AppTrackerCGWindowSnapshot(
                     allWindowIDs: [2001], onScreenWindowIDs: [2001], windowIDsByPID: [pid: [2001]],
@@ -1144,7 +1126,7 @@ final class InventoryLifecycleTests: XCTestCase {
             await drainInventory(tracker)
             let detached = outcome == "child" || outcome == "unreadChild"
             XCTAssertEqual(tracker.snapshot.windows.count, detached ? 0 : 1, outcome)
-            XCTAssertEqual(AXElementCache.shared.containsForTesting(pid: pid, cgWindowID: 2001), !detached && AXElementCache.isEnabled, outcome)
+            XCTAssertEqual(AXElementCache.shared.containsForTesting(pid: pid, cgWindowID: 2001), !detached, outcome)
             if detached {
                 current.withLock { $0 = original }
                 desktop.state.withLock { $0.unreadInventories.remove(pid) }
@@ -1989,7 +1971,7 @@ final class InventoryLifecycleTests: XCTestCase {
         process.parentAlive.withLock { $0 = false }
         tracker.handleAppTerminated(pid: -43000)
         XCTAssertTrue(tracker.snapshot.windows.isEmpty)
-        XCTAssertTrue(tracker.diagnosticApps().isEmpty)
+        XCTAssertTrue(tracker.inventoryEntriesForTesting().isEmpty)
     }
 
     func testPeriodicReconcileDetachesHelpersFromDeadAndReplacedHostsAndReadmitsThem() async throws {
@@ -2244,7 +2226,7 @@ final class InventoryLifecycleTests: XCTestCase {
                     executablePath: nil, bundleURL: URL(fileURLWithPath: "/Applications/MenuBar.app")))
                 for task in tracker.pendingInventoryWorkForTesting { await task.value }
                 XCTAssertTrue(StripItem.openWindows(from: tracker.snapshot).isEmpty, "\(source): \(kind)")
-                XCTAssertTrue(tracker.diagnosticApps().isEmpty, "\(source): \(kind)")
+                XCTAssertTrue(tracker.inventoryEntriesForTesting().isEmpty, "\(source): \(kind)")
             }
         }
     }
@@ -2322,16 +2304,14 @@ final class InventoryLifecycleTests: XCTestCase {
                 tracker.runAdmissionForTesting(source: source, application: application)
                 for task in tracker.pendingInventoryWorkForTesting { await task.value }
                 XCTAssertTrue(StripItem.openWindows(from: tracker.snapshot).isEmpty, source)
-                XCTAssertTrue(tracker.diagnosticApps().isEmpty, source)
+                XCTAssertTrue(tracker.inventoryEntriesForTesting().isEmpty, source)
             }
         }
     }
 
     private func admissionTracker(reader: AdmissionWindowReader) -> AppTracker {
         let pid = NSRunningApplication.current.processIdentifier
-        let log = WindowInventoryAnomalyLog(configuration: .init(enabled: false,
-            directoryURL: URL(fileURLWithPath: "/unused"), maxFileSize: 1024, archiveCount: 0))
-        return AppTracker(inventoryLog: log, reader: reader, processProvider: LifecycleProcess(),
+        return AppTracker(reader: reader, processProvider: LifecycleProcess(),
                           cgSnapshotProvider: {
                               let primary = Set(reader.state.withLock { $0.windowID.map { [$0] } ?? [] })
                               let additional = Set(reader.state.withLock { $0.additionalWindowID.map { [$0] } ?? [] })
@@ -2347,9 +2327,7 @@ final class InventoryLifecycleTests: XCTestCase {
         let pid = NSRunningApplication.current.processIdentifier
         let cg = AppTrackerCGWindowSnapshot(allWindowIDs: [77], onScreenWindowIDs: [77],
             windowIDsByPID: [pid: [77]], alphaByWindowID: [77: 1])
-        let log = WindowInventoryAnomalyLog(configuration: .init(enabled: false,
-            directoryURL: URL(fileURLWithPath: "/unused"), maxFileSize: 1024, archiveCount: 0))
-        return AppTracker(inventoryLog: log, reader: reader, processProvider: process,
+        return AppTracker(reader: reader, processProvider: process,
                           cgSnapshotProvider: { cg }, onScreenWindowIDsProvider: { [77] })
     }
 
@@ -2372,9 +2350,8 @@ final class InventoryLifecycleTests: XCTestCase {
             tracker.stop()
             reader.gates[0].signal()
             for task in pending { await task.value }
-            XCTAssertTrue(tracker.diagnosticApps().isEmpty, source)
+            XCTAssertTrue(tracker.inventoryEntriesForTesting().isEmpty, source)
             XCTAssertTrue(tracker.snapshot.windows.isEmpty, source)
-            XCTAssertTrue(tracker.lastAdmissionVerdictByPID.isEmpty, source)
             XCTAssertTrue(tracker.absenceProbeTimerPIDsForTesting.isEmpty)
         }
     }
@@ -2429,7 +2406,7 @@ final class InventoryLifecycleTests: XCTestCase {
         reader.gates[0].signal()
         for task in pending { await task.value }
         XCTAssertTrue(tracker.snapshot.windows.isEmpty)
-        XCTAssertTrue(tracker.diagnosticApps().isEmpty)
+        XCTAssertTrue(tracker.inventoryEntriesForTesting().isEmpty)
     }
 
     func testStopCancelsDelayedRetriesBeforeReading() async {
@@ -2441,7 +2418,6 @@ final class InventoryLifecycleTests: XCTestCase {
         tracker.stop()
         for task in pending { await task.value }
         XCTAssertEqual(reader.state.withLock { $0.count }, 0)
-        XCTAssertTrue(tracker.lastAdmissionVerdictByPID.isEmpty)
     }
 
     func testEmptyAndUnreadLaunchRetriesDoNotCaptureTheWindowServerList() async {
@@ -2531,67 +2507,30 @@ final class InventoryLifecycleTests: XCTestCase {
         XCTAssertEqual(fixture.tracker.snapshot.orderedWindowIDs, [id])
     }
 
-    func testLaunchHeightUsesExactFocusFromTheRemainingStartupRetry() async throws {
+    func testExactLaunchFocusStopsRemainingStartupRetries() async throws {
         let retry = LaunchRetryGate()
         let fixture = LaunchInventoryFixture(retry: retry, initialWindows: [1001], frontmost: true)
         fixture.session.applicationResults.withLock { $0[kAXWindowCreatedNotification] = [.notificationUnsupported] }
-        let heightSession = ObservationFixture()
-        heightSession.applicationResults.withLock {
-            $0[kAXFocusedWindowChangedNotification] = [.cannotComplete]
-            $0[kAXWindowCreatedNotification] = [.cannotComplete]
-        }
         let desktop = fixture.desktop
-        let process = fixture.process
         let pid = fixture.app.processIdentifier
-        let geometryReads = Mutex(0)
-        let directFocusReads = Mutex(0)
-        desktop.state.withLock {
-            $0.unreadFocusedWindows.insert(pid)
-            $0.afterFrameBatchRead = { geometryReads.withLock { $0 += 1 } }
-        }
-        let observer = FrontmostWindowGeometryObserver(makeSession: { _, _ in heightSession },
-            readFocused: { pid in
-                directFocusReads.withLock { $0 += 1 }
-                return FrontmostWindowGeometryObserver.readFocusedWindow(pid: pid, accessibility: desktop)
-            }, processGeneration: { _ in
-                ProcessGeneration(timeval(tv_sec: Int(process.generation.withLock { $0 }), tv_usec: 0))
-            })
-        let topology = ScreenTopologySnapshot(physicalDisplayCount: 0, identifiedDisplayUUIDs: [], attributionTable: .empty)
-        let screen = CGRect(x: 0, y: 0, width: 1920, height: 1080)
-        let area = CGRect(x: 0, y: 30, width: 1920, height: 1050)
-        let orchestrator = TaskbarScreenOrchestrator(runtime: AppRuntime(tracker: fixture.tracker),
-            stripOrderStore: StripOrderStore(), displayTopologyStore: DisplayTopologyStore(initialSnapshot: topology),
-            spaceStore: TaskbarSpaceStore(read: { _ in nil }, notifications: NotificationCenter(), pollInterval: 0),
-            topologySnapshotProvider: { topology }, workspaceNotifications: fixture.notifications,
-            frontmostApplicationPID: { pid }, makeGeometryObserver: { observer }, windowAdjustmentAccessibility: desktop,
-            windowAdjustmentDisplays: {
-                [.init(frame: screen, visibleFrame: area, panelFrame: CGRect(x: 0, y: 1048, width: 1920, height: 32))]
-            }, windowAdjustmentEnabled: true)
-        defer { retry.open(); orchestrator.suspendAndRelease(); fixture.tracker.stop() }
-        orchestrator.start()
+        desktop.state.withLock { _ = $0.unreadFocusedWindows.insert(pid) }
+        defer { retry.open(); fixture.tracker.stop() }
+        fixture.tracker.start()
         fixture.post(NSWorkspace.didLaunchApplicationNotification)
         let id = WindowID(rawValue: "cgw-1001")
         try await waitForLaunch {
-            retry.isWaiting && fixture.tracker.snapshot.windows[id]?.status == .inactive &&
-                !fixture.tracker.hasPendingEventReadForTesting(pid: pid) && directFocusReads.withLock { $0 } == 1
+            retry.isWaiting && fixture.tracker.snapshot.windows[id]?.status == .inactive
+                && !fixture.tracker.hasPendingEventReadForTesting(pid: pid)
         }
-        for task in observer.pendingWorkForTesting { await task.value }
-        XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
-        let inventoryReads = fixture.inventoryReads
-        let previousGeometryReads = geometryReads.withLock { $0 }
+        let previousReads = fixture.inventoryReads
         desktop.state.withLock {
             _ = $0.unreadFocusedWindows.remove(pid)
             $0.focused = 1001
         }
         retry.open()
-
-        try await waitForLaunch { desktop.state.withLock { $0.writes == ["1001:AXSize"] } }
-        XCTAssertEqual(desktop.state.withLock { $0.windows[1001]?.bounds },
-                       CGRect(x: area.minX, y: area.minY, width: area.width, height: area.height - 32))
-        XCTAssertEqual(geometryReads.withLock { $0 }, previousGeometryReads + 1)
-        XCTAssertEqual(directFocusReads.withLock { $0 }, 1)
-        XCTAssertEqual(heightSession.windowCalls.withLock { $0 }, 0)
-        XCTAssertEqual(fixture.inventoryReads, inventoryReads)
+        try await waitForLaunch { fixture.tracker.snapshot.windows[id]?.status == .active }
+        XCTAssertEqual(fixture.inventoryReads, previousReads)
+        XCTAssertTrue(desktop.state.withLock { $0.writes.isEmpty })
     }
 
     private func assertLaunchWindowCreatedPublishesButton(initiallyUnread: Bool,
@@ -3503,7 +3442,7 @@ extension InventoryLifecycleTests {
         XCTAssertEqual(evidence.spaces, .includesNonCurrent)
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg,
             now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [88], absenceEvidence: [77: evidence])
+            readOutcome: .success, rawAXCgIDs: [88], absenceEvidence: [77: evidence])
         let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(after.windowOrder, [77, 88])
         XCTAssertEqual(after.windowsByID[77]?.token, "independent-other-space")
@@ -3527,7 +3466,7 @@ extension InventoryLifecycleTests {
                 boundsByWindowID: [77: candidateFrame, 88: inventoryFrame], parentWindowIDs: [77: 0, 88: 0])
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg,
                 now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88])
+                readOutcome: .success, rawAXCgIDs: [88])
             let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertEqual(after.windowOrder, [77, 88])
             XCTAssertEqual(after.windowsByID[77]?.token, "independent-other-space")
@@ -3550,7 +3489,7 @@ extension InventoryLifecycleTests {
             now: Date(timeIntervalSince1970: 100), eligible: [
                 inventoryWindow(77, bounds: inventoryFrame, minimized: true),
                 inventoryWindow(88, bounds: siblingFrame, minimized: true)
-            ], readOutcome: .success(count: 2), rawAXCgIDs: [77, 88])
+            ], readOutcome: .success, rawAXCgIDs: [77, 88])
         let original = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         let originalToken = try XCTUnwrap(original.windowsByID[77]?.token)
         XCTAssertEqual(original.windowOrder, [77, 88])
@@ -3565,7 +3504,7 @@ extension InventoryLifecycleTests {
         for time: TimeInterval in [101, 112, 125] {
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg,
                 now: Date(timeIntervalSince1970: time), eligible: [inventoryWindow(88, bounds: siblingFrame, minimized: true)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88], absenceEvidence: [77: evidence])
+                readOutcome: .success, rawAXCgIDs: [88], absenceEvidence: [77: evidence])
             let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertEqual(after.windowOrder, [77, 88])
             XCTAssertEqual(after.windowsByID[77]?.token, originalToken)
@@ -3585,7 +3524,7 @@ extension InventoryLifecycleTests {
             installMissingInventorySeat(tracker, minimizedStartup: false)
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88],
+                readOutcome: .success, rawAXCgIDs: [88],
                 absenceEvidence: [77: missingInventoryEvidence(state, spaces: spaces)])
             let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertEqual(after.windowOrder, [88])
@@ -3608,13 +3547,13 @@ extension InventoryLifecycleTests {
         ]
         for (rawIDs, evidence) in rejectedEvidence {
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg, now: Date(),
-                eligible: [sibling], readOutcome: .success(count: rawIDs.count),
+                eligible: [sibling], readOutcome: .success,
                 rawAXCgIDs: rawIDs, absenceEvidence: [77: evidence])
             XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[77]?.isMinimized, false)
         }
 
         XCTAssertTrue(tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg, now: Date(),
-            eligible: [sibling], readOutcome: .success(count: 1), rawAXCgIDs: [88], absenceEvidence: [77: positive]))
+            eligible: [sibling], readOutcome: .success, rawAXCgIDs: [88], absenceEvidence: [77: positive]))
         tracker.rebuildSnapshotForTesting(onScreenCGIDs: [88])
 
         let record = try XCTUnwrap(tracker.snapshot.windows[WindowID(rawValue: "cgw-77")])
@@ -3638,7 +3577,7 @@ extension InventoryLifecycleTests {
         reconcileInventory(tracker, eligible: [returningWindow(minimizedRead: false), sibling], cg: cg)
         let evidence = missingInventoryEvidence(.alive(minimized: true))
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg, now: Date(),
-            eligible: [sibling], readOutcome: .success(count: 1), rawAXCgIDs: [88], absenceEvidence: [77: evidence])
+            eligible: [sibling], readOutcome: .success, rawAXCgIDs: [88], absenceEvidence: [77: evidence])
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[77]?.isMinimized, true)
 
         reconcileInventory(tracker, eligible: [returningWindow(minimizedRead: nil), sibling], cg: cg)
@@ -3660,7 +3599,7 @@ extension InventoryLifecycleTests {
             installMissingInventorySeat(tracker, minimizedStartup: true)
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88],
+                readOutcome: .success, rawAXCgIDs: [88],
                 absenceEvidence: [77: missingInventoryEvidence(state, spaces: spaces)])
             let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertEqual(after.windowOrder, [88])
@@ -3679,7 +3618,7 @@ extension InventoryLifecycleTests {
             boundsByWindowID: [77: independentFrame, 88: inventoryFrame], parentWindowIDs: [77: 0, 88: 0])
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg,
             now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [88],
+            readOutcome: .success, rawAXCgIDs: [88],
             absenceEvidence: [77: missingInventoryEvidence(.alive(minimized: false), spaces: [])])
         let absent = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(absent.windowOrder, [77, 88])
@@ -3689,7 +3628,7 @@ extension InventoryLifecycleTests {
             now: Date(timeIntervalSince1970: 101), eligible: [
                 inventoryWindow(77, bounds: independentFrame, minimized: true),
                 inventoryWindow(88, bounds: inventoryFrame)
-            ], readOutcome: .success(count: 2), rawAXCgIDs: [77, 88])
+            ], readOutcome: .success, rawAXCgIDs: [77, 88])
         let returned = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(returned.windowOrder, [77, 88])
         XCTAssertEqual(returned.windowsByID[77]?.token, "missing-seat")
@@ -3725,7 +3664,7 @@ extension InventoryLifecycleTests {
                 tracker.reconcileFixtureForTesting(pid: inventoryPID,
                     cgSnapshot: captureFailed ? .failed : missingInventoryCG(rootKnown: rootKnown),
                     now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                    readOutcome: .success(count: 1), rawAXCgIDs: rawAX,
+                    readOutcome: .success, rawAXCgIDs: rawAX,
                     absenceEvidence: evidence.map { [77: $0] } ?? [:])
                 let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
                 XCTAssertEqual(after.windowOrder, [77, 88], "\(name), minimized=\(minimized)")
@@ -3741,7 +3680,7 @@ extension InventoryLifecycleTests {
         installMissingInventorySeat(tracker, minimizedStartup: true)
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
             now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [88])
+            readOutcome: .success, rawAXCgIDs: [88])
         XCTAssertEqual(tracker.takeDueAbsenceProbesForTesting(pid: inventoryPID).map(\.cgWindowID), [77])
         XCTAssertTrue(tracker.takeDueAbsenceProbesForTesting(pid: inventoryPID).isEmpty)
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[77]?.absentProbe?.probeCount, 1)
@@ -3783,7 +3722,6 @@ extension InventoryLifecycleTests {
                                     minimized: minimizedStartup)
         missing.everSeenVisible = !minimizedStartup
         missing.minAbsentSince = Date(timeIntervalSince1970: 80)
-        missing.absenceEpisodeID = UUID()
         tracker.installFixtureForTesting(inventoryApp(entries: [missing,
             inventorySeat(88, token: "owner-seat", bounds: inventoryFrame)]))
         tracker.setSubscribedElementForTesting(pid: inventoryPID, cgWindowID: 77,
@@ -3853,7 +3791,7 @@ extension InventoryLifecycleTests {
             let evidence = missingInventoryEvidence(.alive(minimized: false), spaces: [], token: source.token)
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg, now: Date(),
                 eligible: [inventoryWindow(88, bounds: inventoryFrame), inventoryWindow(99, bounds: inventoryFrame)],
-                readOutcome: .success(count: 2), rawAXCgIDs: [88, 99], absenceEvidence: [77: evidence])
+                readOutcome: .success, rawAXCgIDs: [88, 99], absenceEvidence: [77: evidence])
 
             let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertNotEqual(after.windowsByID[88]?.token, source.token)
@@ -3881,7 +3819,7 @@ extension InventoryLifecycleTests {
             parentWindowIDs: [66: 0, 77: 0, 88: 0])
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg,
             now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [88])
+            readOutcome: .success, rawAXCgIDs: [88])
         let awaitingEvidence = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(awaitingEvidence.windowOrder, [77, 88])
         XCTAssertEqual(awaitingEvidence.windowsByID[77]?.token, "original-native-seat")
@@ -3893,14 +3831,14 @@ extension InventoryLifecycleTests {
             element: .alive(minimized: false), windowSpaceIDs: [], currentSpaceIDs: [1])
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg,
             now: Date(timeIntervalSince1970: 101), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [88], absenceEvidence: [77: evidence])
+            readOutcome: .success, rawAXCgIDs: [88], absenceEvidence: [77: evidence])
         let confirmed = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(confirmed.windowOrder, [88])
         XCTAssertEqual(confirmed.windowsByID[88]?.token, "original-native-seat")
         XCTAssertEqual(confirmed.windowsByID[88]?.priorTabWindowNumbers, [66, 77])
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: .failed,
             now: Date(timeIntervalSince1970: 102), eligible: [inventoryWindow(77, bounds: inventoryFrame)],
-            readOutcome: .success(count: 1), rawAXCgIDs: [77])
+            readOutcome: .success, rawAXCgIDs: [77])
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowOrder, [77])
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[77]?.token, "original-native-seat")
         XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[77]?.priorTabWindowNumbers, [66, 88])
@@ -3910,7 +3848,7 @@ extension InventoryLifecycleTests {
                 inventoryWindow(66, bounds: inventoryFrame, minimized: true),
                 inventoryWindow(77, bounds: moved, minimized: true),
                 inventoryWindow(88, bounds: inventoryFrame, minimized: true)
-            ], readOutcome: .success(count: 3), rawAXCgIDs: [66, 77, 88])
+            ], readOutcome: .success, rawAXCgIDs: [66, 77, 88])
         let minimized = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(minimized.windowOrder, [77])
         XCTAssertEqual(minimized.windowsByID[77]?.token, "original-native-seat")
@@ -3931,7 +3869,7 @@ extension InventoryLifecycleTests {
         for time: TimeInterval in [100, 101] {
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: time), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88], absenceEvidence: time == 101
+                readOutcome: .success, rawAXCgIDs: [88], absenceEvidence: time == 101
                     ? [77: missingInventoryEvidence(.alive(minimized: false), spaces: [], token: "source-independent-seat")]
                     : [:])
         }
@@ -3953,18 +3891,18 @@ extension InventoryLifecycleTests {
             let noncurrent = missingInventoryEvidence(.alive(minimized: false), spaces: [2], token: "independent-other-space")
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88],
+                readOutcome: .success, rawAXCgIDs: [88],
                 absenceEvidence: noncurrentOnFirstRead ? [77: noncurrent] : [:])
             let provisionalToken = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[88]?.token)
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 101), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88], absenceEvidence: [77: noncurrent])
+                readOutcome: .success, rawAXCgIDs: [88], absenceEvidence: [77: noncurrent])
             XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowOrder, [77, 88])
             XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[77]?.token, "independent-other-space")
             XCTAssertEqual(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[88]?.token, provisionalToken)
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 102), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88],
+                readOutcome: .success, rawAXCgIDs: [88],
                 absenceEvidence: [77: missingInventoryEvidence(.alive(minimized: false), spaces: [], token: "independent-other-space")])
             let merged = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertEqual(merged.windowOrder, [88])
@@ -3984,7 +3922,7 @@ extension InventoryLifecycleTests {
                 element: AXUIElementCreateApplication(inventoryPID), instanceID: 17)
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88])
+                readOutcome: .success, rawAXCgIDs: [88])
             let targetToken = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID)?.windowsByID[88]?.token)
             var target = inventoryWindow(88, bounds: inventoryFrame)
             var instance: UInt64 = 17
@@ -4003,7 +3941,7 @@ extension InventoryLifecycleTests {
                     : [inventoryWindow(77, bounds: inventoryFrame), inventoryWindow(88, bounds: inventoryFrame)]
                 tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                     now: Date(timeIntervalSince1970: 101), eligible: intermediate,
-                    readOutcome: .success(count: intermediate.count), rawAXCgIDs: Set(intermediate.compactMap(\.cgWindowID)))
+                    readOutcome: .success, rawAXCgIDs: Set(intermediate.compactMap(\.cgWindowID)))
             case "processReplacement":
                 tracker.terminateForTesting(pid: inventoryPID)
                 tracker.installFixtureForTesting(inventoryApp(entries: [
@@ -4017,7 +3955,7 @@ extension InventoryLifecycleTests {
             }
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 102), eligible: [target],
-                readOutcome: .success(count: 1), rawAXCgIDs: [88],
+                readOutcome: .success, rawAXCgIDs: [88],
                 absenceEvidence: [77: missingInventoryEvidence(.alive(minimized: false), spaces: [],
                     instanceID: instance, token: "original-seat")])
             let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
@@ -4048,7 +3986,7 @@ extension InventoryLifecycleTests {
                 element: AXUIElementCreateApplication(inventoryPID), instanceID: 17)
             tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: missingInventoryCG(),
                 now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                readOutcome: .success(count: 1), rawAXCgIDs: rawAX,
+                readOutcome: .success, rawAXCgIDs: rawAX,
                 absenceEvidence: evidence.map { [77: $0] } ?? [:])
             let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertEqual(after.windowOrder, [77, 88], name)
@@ -4061,7 +3999,7 @@ extension InventoryLifecycleTests {
                 now: Date(timeIntervalSince1970: 101), eligible: [
                     inventoryWindow(77, bounds: inventoryFrame, minimized: true),
                     inventoryWindow(88, bounds: inventoryFrame)
-                ], readOutcome: .success(count: 2), rawAXCgIDs: [77, 88])
+                ], readOutcome: .success, rawAXCgIDs: [77, 88])
             let returned = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
             XCTAssertEqual(returned.windowOrder, [77, 88], name)
             XCTAssertEqual(returned.windowsByID[77]?.token, token, name)
@@ -4082,7 +4020,7 @@ extension InventoryLifecycleTests {
                 tracker.installFixtureForTesting(inventoryApp(entries: [seat]))
                 tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: cg,
                     now: Date(timeIntervalSince1970: 100), eligible: [inventoryWindow(88, bounds: inventoryFrame)],
-                    readOutcome: .success(count: 1), rawAXCgIDs: rawAX)
+                    readOutcome: .success, rawAXCgIDs: rawAX)
                 let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
                 XCTAssertEqual(after.windowOrder, [88])
                 XCTAssertEqual(after.windowsByID[88]?.token, "confirmed-native-tab-seat")
@@ -4104,7 +4042,7 @@ extension InventoryLifecycleTests {
 
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: .failed,
             now: Date(timeIntervalSince1970: 100), eligible: windows,
-            readOutcome: .success(count: 2), rawAXCgIDs: [77, 88])
+            readOutcome: .success, rawAXCgIDs: [77, 88])
 
         let afterFailure = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(afterFailure.windowOrder, [77, 88])
@@ -4121,7 +4059,7 @@ extension InventoryLifecycleTests {
             boundsByWindowID: [77: moved, 88: inventoryFrame], parentWindowIDs: [77: 0, 88: 0])
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: recovered,
             now: Date(timeIntervalSince1970: 101), eligible: windows,
-            readOutcome: .success(count: 2), rawAXCgIDs: [77, 88])
+            readOutcome: .success, rawAXCgIDs: [77, 88])
 
         let afterRecovery = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(afterRecovery.windowOrder, [77, 88])
@@ -4141,7 +4079,7 @@ extension InventoryLifecycleTests {
         tracker.reconcileFixtureForTesting(pid: inventoryPID, cgSnapshot: .failed,
             now: Date(timeIntervalSince1970: 100), eligible: [
                 inventoryWindow(77, bounds: moved), inventoryWindow(88, bounds: inventoryFrame)
-            ], readOutcome: .success(count: 2), rawAXCgIDs: [77, 88])
+            ], readOutcome: .success, rawAXCgIDs: [77, 88])
 
         let after = try XCTUnwrap(tracker.fixtureAppForTesting(pid: inventoryPID))
         XCTAssertEqual(after.windowOrder, [88, 77])

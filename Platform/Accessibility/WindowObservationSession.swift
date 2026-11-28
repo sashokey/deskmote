@@ -1,8 +1,5 @@
 import ApplicationServices
 import Foundation
-#if DEBUG
-import os
-#endif
 
 protocol WindowObservationSession: Sendable {
     func add(_ notification: String, element: AXElementKey?) -> AXError
@@ -18,19 +15,13 @@ final class AXWindowObservationSession: WindowObservationSession, @unchecked Sen
         init(_ receive: @escaping @Sendable (AXElementKey, String) -> Void) { self.receive = receive }
     }
 
-    #if DEBUG
-    private static let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "window-height")
-    #endif
     private let observer: AXObserver
     private let application: AXUIElement
     private let callback: Callback
     private let access = RuntimeAccessibilityAccess.shared
 
     init?(pid: pid_t, receive: @escaping @Sendable (AXElementKey, String) -> Void) {
-        guard access.checkTrust(AXIsProcessTrusted) else {
-            #if DEBUG
-            Self.logger.notice("AXObserverCreate pid=\(pid) outcome=permission-unavailable")
-            #endif
+        guard access.checkTrust(AXIsProcessTrusted, retainStandaloneDenial: false) else {
             return nil
         }
         var observer: AXObserver?
@@ -42,9 +33,6 @@ final class AXWindowObservationSession: WindowObservationSession, @unchecked Sen
             }, &observer)
         }
         guard result == .success, let observer else {
-            #if DEBUG
-            Self.logger.notice("AXObserverCreate pid=\(pid) axError=\(result.rawValue) observerReturned=\(observer != nil)")
-            #endif
             return nil
         }
         self.observer = observer

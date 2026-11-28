@@ -1,37 +1,83 @@
+import Synchronization
 import XCTest
 
 @MainActor
 final class PermissionOnboardingTests: XCTestCase {
-    func testPermissionWatchdogGateRejectsOverlapAndStoppedGeneration() {
-        let gate = PermissionWatchdogGate()
-        XCTAssertNil(gate.beginProbe())
-        gate.start()
-        guard let oldGeneration = gate.beginProbe() else {
-            return XCTFail("first probe should start")
-        }
-        XCTAssertNil(gate.beginProbe())
-
-        gate.stop()
-        XCTAssertNil(gate.beginProbe())
-        XCTAssertFalse(gate.completeProbe(generation: oldGeneration))
-        gate.start()
-        XCTAssertNil(gate.beginProbe(for: oldGeneration))
-        guard let currentGeneration = gate.beginProbe() else {
-            return XCTFail("new generation probe should start")
-        }
-        XCTAssertFalse(gate.completeProbe(generation: oldGeneration))
-        XCTAssertTrue(gate.completeProbe(generation: currentGeneration))
+    func testHeldProbeCannotReopenAfterStopAndRestart() throws {
+        let clock = WatchdogTestClock()
+        let access = RuntimeAccessibilityAccess()
+        let ready = Mutex(0)
+        let watchdog = RuntimePermissionWatchdog(
+            access: access, now: { clock.now }, schedule: clock.schedule,
+            requestQuit: { XCTFail("A retired probe cannot quit") },
+            forceExit: { XCTFail("A held passive probe cannot force exit") },
+            notifyReady: { ready.withLock { $0 += 1 } }
+        )
+        access.activateRuntime { _ in watchdog.requiredPermissionLost() }
+        let firstRun = watchdog.start()
+        let retired = try XCTUnwrap(watchdog.beginProbe(for: firstRun))
+        watchdog.stop()
+        let currentRun = watchdog.start()
+        XCTAssertNil(watchdog.beginProbe(for: currentRun))
+        clock.advance(to: 5)
+        watchdog.completeProbe(retired, verdict: true)
+        XCTAssertFalse(watchdog.isReady)
+        XCTAssertEqual(ready.withLock { $0 }, 0)
+        XCTAssertNil(watchdog.beginProbe(for: firstRun))
+        let current = try XCTUnwrap(watchdog.beginProbe(for: currentRun))
+        watchdog.completeProbe(current, verdict: true)
+        XCTAssertTrue(watchdog.isReady)
+        XCTAssertEqual(ready.withLock { $0 }, 1)
     }
 
-    func testBusyMainThreadCoalescesSamplesWithoutLosingTheDenial() throws {
-        let gate = PermissionWatchdogGate()
-        let generation = gate.start()
-        XCTAssertEqual(try XCTUnwrap(gate.beginProbe()), generation)
-        XCTAssertTrue(gate.completeProbe(generation: generation, deliver: false))
-        XCTAssertEqual(try XCTUnwrap(gate.beginProbe()), generation)
-        XCTAssertFalse(gate.completeProbe(generation: generation, deliver: true))
-        XCTAssertEqual(gate.takeDelivery(generation: generation), false)
-        XCTAssertNil(gate.takeDelivery(generation: generation))
+    func testConfirmedLossRetainsTheThreeSecondExitFallback() throws {
+        for loss in [RuntimeAccessibilityAccess.Loss.negativeProbe, .nativeAPIDisabled] {
+            let clock = WatchdogTestClock()
+            let access = RuntimeAccessibilityAccess()
+            let quits = Mutex(0)
+            let exits = Mutex(0)
+            let watchdog = RuntimePermissionWatchdog(
+                access: access, now: { clock.now }, schedule: clock.schedule,
+                requestQuit: { quits.withLock { $0 += 1 } },
+                forceExit: { exits.withLock { $0 += 1 } }
+            )
+            access.activateRuntime { _ in watchdog.requiredPermissionLost() }
+            watchdog.start()
+            if loss == .negativeProbe {
+                watchdog.completeProbe(try XCTUnwrap(watchdog.beginProbe()), verdict: false)
+            } else {
+                XCTAssertEqual(access.call { .apiDisabled }, .apiDisabled)
+            }
+            XCTAssertFalse(access.allowsCalls)
+            XCTAssertEqual(quits.withLock { $0 }, 1)
+            watchdog.requiredPermissionLost()
+            watchdog.stop()
+            clock.advance(to: 2)
+            XCTAssertEqual(exits.withLock { $0 }, 0)
+            clock.advance(to: 3)
+            clock.advance(to: 5)
+            XCTAssertEqual(exits.withLock { $0 }, 1)
+            XCTAssertEqual(quits.withLock { $0 }, 1)
+        }
+    }
+
+    func testOrdinaryWatchdogStopDoesNotArmEmergencyExit() throws {
+        let clock = WatchdogTestClock()
+        let access = RuntimeAccessibilityAccess()
+        access.activateRuntime { _ in }
+        let exits = Mutex(0)
+        let watchdog = RuntimePermissionWatchdog(
+            access: access, now: { clock.now }, schedule: clock.schedule,
+            requestQuit: { XCTFail("Ordinary stop must not request quit") },
+            forceExit: { exits.withLock { $0 += 1 } }
+        )
+        watchdog.start()
+        let startup = try XCTUnwrap(watchdog.beginProbe())
+        watchdog.completeProbe(startup, verdict: true)
+        watchdog.stop()
+        clock.advance(to: 3)
+        XCTAssertEqual(exits.withLock { $0 }, 0)
+        XCTAssertFalse(watchdog.isReady)
     }
 
     func testNativeDenialBlocksLaterCallsEvenWithAStalePositiveProbe() {
@@ -231,37 +277,6 @@ final class PermissionOnboardingTests: XCTestCase {
         XCTAssertEqual(model.state, .granted)
     }
 
-    func testFirstFalseIsUncertainAndTwoSustainedFalsesAreLost() {
-        var detector = PermissionLossDetector()
-        XCTAssertEqual(detector.record(trusted: true, at: 0), .stable)
-        XCTAssertEqual(detector.record(trusted: false, at: 10), .uncertain)
-        XCTAssertEqual(detector.record(trusted: false, at: 14.999), .uncertain)
-        XCTAssertEqual(detector.record(trusted: false, at: 15), .lost)
-    }
-
-    func testSingleFalseNeverBecomesLostNoMatterHowLate() {
-        var detector = PermissionLossDetector()
-        XCTAssertEqual(detector.record(trusted: false, at: 0), .uncertain)
-        XCTAssertEqual(detector.record(trusted: true, at: 100), .stable)
-        XCTAssertEqual(detector.record(trusted: false, at: 200), .uncertain)
-    }
-
-    func testTrueResetsTheAnchor() {
-        var detector = PermissionLossDetector()
-        _ = detector.record(trusted: false, at: 0)
-        _ = detector.record(trusted: true, at: 1)
-        XCTAssertEqual(detector.record(trusted: false, at: 2), .uncertain)
-        XCTAssertEqual(detector.record(trusted: false, at: 6.999), .uncertain)
-        XCTAssertEqual(detector.record(trusted: false, at: 7), .lost)
-    }
-
-    func testEarlyArrivingFalseDoesNotResetTheAnchor() {
-        var detector = PermissionLossDetector()
-        XCTAssertEqual(detector.record(trusted: false, at: 10), .uncertain)
-        XCTAssertEqual(detector.record(trusted: false, at: 5), .uncertain)
-        XCTAssertEqual(detector.record(trusted: false, at: 15), .lost)
-    }
-
     func testTransientLaunchNeverPromptsOrStartsApp() {
         var machine = PermissionRecoveryMachine()
         let effects = machine.handle(.launched(location: .readOnlyVolume, trusted: false))
@@ -302,7 +317,7 @@ final class PermissionOnboardingTests: XCTestCase {
         let handler = EffectSpy()
         let model = AccessibilityPermissionModel(permissionService: spy.service, installLocation: .applications, now: { clock })
         let coordinator = PermissionRecoveryCoordinator(handler: handler, permissionService: spy.service,
-                                                        installLocation: .applications, now: { clock }, makeModel: { _, _ in model })
+                                                        installLocation: .applications, makeModel: { _, _ in model })
         defer { coordinator.quit() }
         coordinator.launched(trusted: false)
         for elapsed: TimeInterval in [0, 8, 60, 86_400] {
@@ -310,7 +325,6 @@ final class PermissionOnboardingTests: XCTestCase {
             model.checkNow()
             coordinator.applicationDidBecomeActive()
             coordinator.recheck()
-            coordinator.sampleTrust(false)
             XCTAssertNil(coordinator.presentation)
             XCTAssertFalse(handler.calls.contains("showGuide"))
             XCTAssertFalse(handler.calls.contains("updateGuide"))
@@ -326,7 +340,7 @@ final class PermissionOnboardingTests: XCTestCase {
         let handler = EffectSpy()
         let model = AccessibilityPermissionModel(permissionService: spy.service, installLocation: .applications, now: { clock })
         let coordinator = PermissionRecoveryCoordinator(handler: handler, permissionService: spy.service,
-                                                        installLocation: .applications, now: { clock }, makeModel: { _, _ in model })
+                                                        installLocation: .applications, makeModel: { _, _ in model })
         defer { coordinator.quit() }
         coordinator.launched(trusted: false)
         clock = 120
@@ -383,218 +397,6 @@ final class PermissionOnboardingTests: XCTestCase {
         let effects = machine.handle(.grantObserved(episode: episode))
         XCTAssertEqual(machine.phase, .running)
         XCTAssertTrue(effects.contains(.startApp))
-        XCTAssertFalse(effects.contains(.launchNewInstance(episode: episode)))
-    }
-
-    func testFirstFalseIsUncertainUntilTrustReturns() {
-        var machine = runningMachine()
-        XCTAssertEqual(machine.handle(.trustVerdict(.uncertain)), [])
-        XCTAssertEqual(machine.phase, .uncertain)
-        XCTAssertEqual(machine.handle(.trustVerdict(.stable)), [])
-        XCTAssertEqual(machine.phase, .running)
-    }
-
-    func testLostTrustSuspendsAndReRegistersWithTheSystem() {
-        var machine = runningMachine()
-        _ = machine.handle(.trustVerdict(.uncertain))
-        let effects = machine.handle(.trustVerdict(.lost))
-
-        guard case let .suspended(episode) = machine.phase else { return XCTFail("expected suspended") }
-        XCTAssertEqual(effects, [
-            .stopWatchdog,
-            .suspendPanelsAndStores,
-            .setActivationPolicy(.regular),
-            .showGuide,
-            .startPermissionEpisode(purpose: .runtimeRecovery, episode: episode),
-            .requestSystemPrompt,
-        ])
-    }
-
-    func testRecoveryGrantRelaunchesAndSuccessfulRelaunchTerminates() {
-        var machine = suspendedMachine()
-        guard case let .suspended(episode) = machine.phase else { return XCTFail("expected suspended") }
-
-        let granted = machine.handle(.grantObserved(episode: episode))
-        XCTAssertEqual(machine.phase, .relaunching(episode: episode))
-        XCTAssertEqual(granted, [.stopPermissionEpisode, .updateGuide, .launchNewInstance(episode: episode)])
-        XCTAssertEqual(machine.handle(.relaunchSucceeded(episode: episode)), [.terminateSelf])
-    }
-
-    func testRepeatedEventsDuringRelaunchDoNotStartASecondRelaunch() {
-        var machine = relaunchingMachine()
-        guard case let .relaunching(episode) = machine.phase else { return XCTFail("expected relaunching") }
-
-        XCTAssertEqual(machine.handle(.grantObserved(episode: episode)), [])
-        XCTAssertEqual(machine.handle(.trustVerdict(.lost)), [])
-        XCTAssertEqual(machine.phase, .relaunching(episode: episode))
-    }
-
-    func testStaleEpisodeCompletionsAreDropped() {
-        var machine = relaunchingMachine()
-        guard case let .relaunching(episode) = machine.phase else { return XCTFail("expected relaunching") }
-
-        XCTAssertEqual(machine.handle(.relaunchSucceeded(episode: episode &- 1)), [])
-        XCTAssertEqual(machine.handle(.relaunchFailed(episode: episode &+ 1, message: "x")), [])
-        XCTAssertEqual(machine.phase, .relaunching(episode: episode))
-    }
-
-    func testRelaunchFailureKeepsOldInstanceAliveAndGivesTheHotKeyBack() {
-        var machine = relaunchingMachine()
-        guard case let .relaunching(episode) = machine.phase else { return XCTFail("expected relaunching") }
-
-        let effects = machine.handle(.relaunchFailed(episode: episode, message: "Application not found"))
-        XCTAssertEqual(machine.phase, .relaunchFailed(episode: episode, message: "Application not found"))
-        XCTAssertEqual(effects, [.updateGuide])
-        XCTAssertFalse(effects.contains(.terminateSelf))
-    }
-
-    func testRetryStartsAnotherRelaunch() {
-        var machine = relaunchingMachine()
-        guard case let .relaunching(episode) = machine.phase else { return XCTFail("expected relaunching") }
-        _ = machine.handle(.relaunchFailed(episode: episode, message: "Application not found"))
-
-        let effects = machine.handle(.retryRequested)
-        XCTAssertEqual(machine.phase, .relaunching(episode: episode))
-        XCTAssertEqual(effects, [.updateGuide, .launchNewInstance(episode: episode)])
-    }
-
-    func testTerminationPreemptsEverythingAndSwallowsLateEvents() {
-        var machine = relaunchingMachine()
-        guard case let .relaunching(episode) = machine.phase else { return XCTFail("expected relaunching") }
-
-        let effects = machine.handle(.terminationRequested)
-        XCTAssertEqual(machine.phase, .terminating)
-        XCTAssertEqual(effects, [.stopWatchdog, .cancelRecoveryTask, .stopPermissionEpisode])
-
-        XCTAssertEqual(machine.handle(.relaunchSucceeded(episode: episode)), [])
-        XCTAssertEqual(machine.handle(.retryRequested), [])
-    }
-
-    func testOnlyConfirmedRecoveryCanPresentAStalledGuide() {
-        XCTAssertNil(
-            PermissionRecoveryMachine.presentation(phase: .onboarding(episode: 1), onboarding: .stalled)
-        )
-        XCTAssertEqual(
-            PermissionRecoveryMachine.presentation(phase: .suspended(episode: 2), onboarding: .stalled),
-            .recoveryStalled
-        )
-        XCTAssertNil(
-            PermissionRecoveryMachine.presentation(phase: .onboarding(episode: 1), onboarding: .waiting)
-        )
-        XCTAssertEqual(
-            PermissionRecoveryMachine.presentation(phase: .suspended(episode: 2), onboarding: .waiting),
-            .recoveryWaiting
-        )
-    }
-
-    func testNoGuideWhileRunning() {
-        XCTAssertNil(PermissionRecoveryMachine.presentation(phase: .running, onboarding: .waiting))
-        XCTAssertNil(PermissionRecoveryMachine.presentation(phase: .uncertain, onboarding: .waiting))
-        XCTAssertNil(PermissionRecoveryMachine.presentation(phase: .terminating, onboarding: .stalled))
-    }
-
-    func testStalledRecoveryUpdatesTheAlreadyPresentedGuide() {
-        var clock: TimeInterval = 0
-        let spy = PermissionSpy(trusted: true)
-        let handler = EffectSpy()
-        let coordinator = PermissionRecoveryCoordinator(
-            handler: handler, permissionService: spy.service, installLocation: .applications,
-            now: { clock }, makeModel: { _, _ in
-                AccessibilityPermissionModel(permissionService: spy.service, installLocation: .applications,
-                                             now: { clock })
-            }
-        )
-        defer { coordinator.quit() }
-        coordinator.launched(trusted: true)
-        spy.trusted = false
-        coordinator.sampleTrust(false)
-        clock = 6
-        coordinator.sampleTrust(false)
-        XCTAssertEqual(coordinator.presentation, .recoveryWaiting)
-        XCTAssertEqual(handler.calls.filter { $0 == "showGuide" }.count, 1)
-
-        clock = 15
-        coordinator.recheck()
-        coordinator.recheck()
-
-        XCTAssertEqual(coordinator.presentation, .recoveryStalled)
-        XCTAssertEqual(handler.calls.filter { $0 == "updateGuide" }.count, 1)
-        XCTAssertEqual(handler.calls.filter { $0 == "showGuide" }.count, 1)
-    }
-
-    func testQuitCancelsRecoveryLaunchBeforeTheQueuedTaskStarts() async {
-        var clock: TimeInterval = 0
-        let spy = PermissionSpy(trusted: true)
-        let handler = EffectSpy()
-        let coordinator = PermissionRecoveryCoordinator(handler: handler, permissionService: spy.service,
-            installLocation: .applications, now: { clock })
-        handler.onGuideUpdate = { [weak coordinator] in
-            if let coordinator, case .relaunching = coordinator.phase { coordinator.quit() }
-        }
-        coordinator.launched(trusted: true)
-        spy.trusted = false
-        coordinator.sampleTrust(false)
-        clock = 6
-        coordinator.sampleTrust(false)
-        spy.trusted = true
-        coordinator.recheck()
-        let deadline = ContinuousClock.now + .seconds(2)
-        while coordinator.phase != .terminating, ContinuousClock.now < deadline { await Task.yield() }
-        XCTAssertEqual(coordinator.phase, .terminating)
-        await Task.yield()
-        XCTAssertFalse(handler.calls.contains("launchNewInstance"))
-    }
-
-    func testRecoveryEpisodeUsesAFreshModelSoTheSystemPromptCanFireAgain() {
-        var clock: TimeInterval = 0
-        let spy = PermissionSpy(trusted: false)
-        let handler = EffectSpy()
-        var made: [AccessibilityPermissionModel] = []
-
-        let coordinator = PermissionRecoveryCoordinator(
-            handler: handler,
-            permissionService: spy.service,
-            installLocation: .applications,
-            now: { clock },
-            makeModel: { _, _ in
-                let model = AccessibilityPermissionModel(
-                    permissionService: spy.service,
-                    installLocation: .applications,
-                    now: { clock }
-                )
-                made.append(model)
-                return model
-            }
-        )
-
-        coordinator.launched(trusted: false)
-        XCTAssertEqual(made.count, 1)
-        XCTAssertEqual(spy.promptCount, 1)
-        XCTAssertNil(coordinator.presentation)
-
-        spy.trusted = true
-        made[0].checkNow()
-        XCTAssertTrue(handler.calls.contains("startApp"))
-        XCTAssertFalse(handler.calls.contains("launchNewInstance"))
-        XCTAssertNil(coordinator.presentation)
-
-        spy.trusted = false
-        clock = 10
-        coordinator.sampleTrust(false)
-        XCTAssertEqual(coordinator.phase, .uncertain)
-        XCTAssertNil(coordinator.presentation)
-
-        clock = 20
-        coordinator.sampleTrust(false)
-
-        XCTAssertEqual(made.count, 2)
-        XCTAssertFalse(made[0] === made[1])
-        XCTAssertEqual(spy.promptCount, 2)
-        XCTAssertEqual(coordinator.presentation, .recoveryWaiting)
-        XCTAssertTrue(handler.calls.contains("suspendPanelsAndStores"))
-        XCTAssertTrue(handler.calls.contains("stopWatchdog"))
-
-        coordinator.quit()
     }
 
     func testTransientCopyCoordinatorNeitherTerminatesNorPrompts() {
@@ -621,31 +423,42 @@ final class PermissionOnboardingTests: XCTestCase {
         )
     }
 
-    private func runningMachine() -> PermissionRecoveryMachine {
-        var machine = PermissionRecoveryMachine()
-        _ = machine.handle(.launched(location: .applications, trusted: true))
-        return machine
+}
+
+final class WatchdogTestClock: Sendable {
+    private struct State {
+        var now = DispatchTime(uptimeNanoseconds: 1)
+        var jobs: [(DispatchTime, @Sendable () -> Void)] = []
+    }
+    private let state = Mutex(State())
+
+    var now: DispatchTime { state.withLock { $0.now } }
+
+    func schedule(_ deadline: DispatchTime, _ run: @escaping @Sendable () -> Void) {
+        state.withLock { $0.jobs.append((deadline, run)) }
     }
 
-    private func suspendedMachine() -> PermissionRecoveryMachine {
-        var machine = runningMachine()
-        _ = machine.handle(.trustVerdict(.uncertain))
-        _ = machine.handle(.trustVerdict(.lost))
-        return machine
-    }
-
-    private func relaunchingMachine() -> PermissionRecoveryMachine {
-        var machine = suspendedMachine()
-        guard case let .suspended(episode) = machine.phase else { return machine }
-        _ = machine.handle(.grantObserved(episode: episode))
-        return machine
+    func advance(to seconds: Int) {
+        let limit = DispatchTime(uptimeNanoseconds: UInt64(seconds) * 1_000_000_000 + 1)
+        while let run = state.withLock({ state -> (@Sendable () -> Void)? in
+            guard let index = state.jobs.indices.min(by: {
+                state.jobs[$0].0 < state.jobs[$1].0
+            }), state.jobs[index].0 <= limit else {
+                state.now = limit
+                return nil
+            }
+            let (deadline, run) = state.jobs.remove(at: index)
+            state.now = deadline
+            return run
+        }) {
+            run()
+        }
     }
 }
 
 @MainActor
 private final class EffectSpy: PermissionEffectHandler {
     var calls: [String] = []
-    var launchResult: Result<Void, Error> = .success(())
     var onGuideUpdate: (() -> Void)?
 
     func startApp() { calls.append("startApp") }
@@ -657,12 +470,6 @@ private final class EffectSpy: PermissionEffectHandler {
     func openApplicationsFolder() { calls.append("openApplications") }
     func startWatchdog() { calls.append("startWatchdog") }
     func stopWatchdog() { calls.append("stopWatchdog") }
-    func suspendPanelsAndStores() { calls.append("suspendPanelsAndStores") }
-
-    func launchNewInstance(episode: UInt64) async -> Result<Void, Error> {
-        calls.append("launchNewInstance")
-        return launchResult
-    }
     func terminateSelf() { calls.append("terminateSelf") }
 }
 

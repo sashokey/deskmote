@@ -32,6 +32,8 @@ final class DeskMoteModuleToggle {
     private let startAction: (Bool) -> StartResult
     private let stopAction: () -> Void
     private var waitingForPermission = false
+    var mayStartWithAccessibility: () -> Bool = { true }
+    var requestStartupPermission: () -> Void = {}
 
     init(id: String, title: String, defaults: UserDefaults, requiresAccessibility: Bool = false,
          start: @escaping (Bool) -> StartResult, stop: @escaping () -> Void) {
@@ -93,6 +95,14 @@ final class DeskMoteModuleToggle {
 
     private func activate(prompt: Bool) {
         guard !isRunning else { return }
+        if requiresAccessibility, !mayStartWithAccessibility() {
+            waitingForPermission = true
+            if prompt {
+                defaults.set(true, forKey: key)
+                requestStartupPermission()
+            }
+            return
+        }
         switch startAction(prompt) {
         case .running:
             isRunning = true
@@ -108,17 +118,30 @@ final class DeskMoteModuleToggle {
 
 @MainActor
 enum DeskMoteModuleRegistry {
-    static func production(registerWindow: @escaping UtilityWindowRegistration) -> [DeskMoteModule] {
+    static func makeLeadingSlotFactory(
+        makeFull: (@MainActor () -> TaskbarLeadingSlotFactory)? = nil
+    ) -> TaskbarLeadingSlotFactory? {
+        #if DESKMOTE_BASE
+        nil
+        #elseif DESKMOTE_TEST
+        makeFull?()
+        #else
+        makeFull?() ?? makeProductionLeadingSlotFactory()
+        #endif
+    }
+
+    static func production(registerWindow: @escaping UtilityWindowRegistration,
+                           watchdog: RuntimePermissionWatchdog) -> [DeskMoteModule] {
         #if DESKMOTE_BASE || DESKMOTE_TEST
         []
         #else
-        [commandShift(), naturalSwitch(), batteryRun(registerWindow: registerWindow)]
+        [commandShift(watchdog: watchdog), naturalSwitch(), batteryRun(registerWindow: registerWindow)]
         #endif
     }
 
     #if !DESKMOTE_BASE && !DESKMOTE_TEST
-    private static func commandShift() -> DeskMoteModule {
-        let service = CommandShiftModule()
+    private static func commandShift(watchdog: RuntimePermissionWatchdog) -> DeskMoteModule {
+        let service = CommandShiftModule(hasPermission: { watchdog.isReady })
         let toggle = DeskMoteModuleToggle(
             id: "command-shift", title: String(localized: "Use Shift–Command to Switch Input Sources"),
             defaults: .standard, requiresAccessibility: true,

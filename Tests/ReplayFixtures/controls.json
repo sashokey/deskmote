@@ -1,0 +1,284 @@
+[
+  {
+    "name": "empty_replays_cannot_pass_without_checks-1",
+    "mode": "placementReplay",
+    "payload": "{\"name\": \"empty\", \"initialOrderedWindowIDs\": [], \"steps\": []}",
+    "accepted": false,
+    "error": "Scenario must contain at least one step"
+  },
+  {
+    "name": "empty_replays_cannot_pass_without_checks-2",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"empty\", \"steps\": []}",
+    "accepted": false,
+    "error": "Scenario must contain at least one step"
+  },
+  {
+    "name": "identity_replay_accepts_an_ax_identity_after_native_confirmation-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"minimized\", \"observations\": [{\"kind\": \"minimized\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": true, \"track\": true, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"minimized-side-evidence\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"native confirmation\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 3, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"restored-via-bridge\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"confirmed repeat\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 4, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"signature-streak-accessibility\", \"expectedConfidence\": \"high\"}]}]}",
+    "accepted": true,
+    "lastIdentity": "ax-8001-transient-2"
+  },
+  {
+    "name": "identity_replay_disappearance_retires_the_previous_frame_as_positive_evidence-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"minimized\", \"observations\": [{\"kind\": \"minimized\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": true, \"track\": true, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"minimized-side-evidence\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"disappeared at different frame\", \"observations\": [{\"kind\": \"disappeared\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"521:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 3, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"frame-replay-accessibility\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"native number after disappearance\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 4, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_disappearance_retires_the_previous_frame_as_positive_evidence-2",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"minimized\", \"observations\": [{\"kind\": \"minimized\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": true, \"track\": true, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"minimized-side-evidence\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"disappeared at different frame\", \"observations\": [{\"kind\": \"disappeared\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"521:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 3, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"frame-replay-accessibility\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"native number after disappearance\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"521:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 4, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_does_not_treat_an_ax_conflict_as_a_different_window-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_keeps_a_repeated_ax_conflict_unconfirmed-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"repeat conflict\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"signature-replay-accessibility\", \"expectedConfidence\": \"medium\"}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_mismatch_ends_the_diagnostic_line-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"cg-window-number-reuse-replay\", \"mode\": \"replay\", \"expectedStableIdentity\": true, \"steps\": [{\"label\": \"first-owner\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"expectedDecision\": \"newWindow\"}]}, {\"label\": \"ownership-change\", \"observations\": [{\"kind\": \"disappeared\", \"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1, \"expectedDecision\": \"knownWindow\"}, {\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\"}]}, {\"label\": \"same-new-owner\", \"observations\": [{\"kind\": \"titleChanged\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Renamed fixture\", \"bounds\": \"40:60:900:700\", \"isMinimized\": false, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"cg-window-id-bound\"}]}]}",
+    "accepted": false
+  },
+  {
+    "name": "identity_replay_rejects_ambiguous_endpoints_for_both_comparisons-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": true, \"steps\": [{\"label\": \"before\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"expectedDecision\": \"ambiguous\"}]}, {\"label\": \"after\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"expectedDecision\": \"ambiguous\", \"atSeconds\": 1}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_rejects_ambiguous_endpoints_for_both_comparisons-2",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"before\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"expectedDecision\": \"ambiguous\"}]}, {\"label\": \"after\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"isMinimized\": false, \"atSeconds\": 1}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_rejects_ambiguous_endpoints_for_both_comparisons-3",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"before\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"isMinimized\": false}]}, {\"label\": \"after\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"expectedDecision\": \"ambiguous\", \"atSeconds\": 1}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_requires_a_positive_exact_native_bridge-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"minimized\", \"observations\": [{\"kind\": \"minimized\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": true, \"track\": true, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"minimized-side-evidence\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"insufficient native evidence\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 3, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}, {\"label\": \"repeat native evidence\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 4, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}, {\"label\": \"repeat AX conflict\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 5, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_requires_a_positive_exact_native_bridge-2",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"minimized\", \"observations\": [{\"kind\": \"minimized\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": true, \"track\": true, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"minimized-side-evidence\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"insufficient native evidence\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": null, \"isMinimized\": false, \"track\": true, \"atSeconds\": 3, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}, {\"label\": \"repeat native evidence\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": null, \"isMinimized\": false, \"track\": true, \"atSeconds\": 4, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}, {\"label\": \"repeat AX conflict\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 5, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_requires_a_positive_exact_native_bridge-3",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"baseline-a\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 0, \"expectedDecision\": \"newWindow\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"conflicting-b\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\", \"expectedReason\": \"conflicting-coarse-signature\", \"expectedConfidence\": \"low\"}]}, {\"label\": \"minimized\", \"observations\": [{\"kind\": \"minimized\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": true, \"track\": true, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"minimized-side-evidence\", \"expectedConfidence\": \"medium\"}]}, {\"label\": \"insufficient native evidence\", \"observations\": [{\"kind\": \"disappeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 3, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}, {\"label\": \"repeat native evidence\", \"observations\": [{\"kind\": \"disappeared\", \"source\": \"coreGraphics\", \"pid\": 8001, \"cgWindowID\": 21, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 4, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}, {\"label\": \"repeat AX conflict\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 8001, \"cgWindowID\": null, \"title\": \"Shared AX Title\", \"appName\": \"DemoApp\", \"bounds\": \"520:120:800:600\", \"isMinimized\": false, \"track\": true, \"atSeconds\": 5, \"expectedDecision\": null, \"expectedReason\": null, \"expectedConfidence\": null}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires confirmed endpoint identities"
+  },
+  {
+    "name": "identity_replay_requires_tracked_endpoints_even_for_unstable_identity-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"cg-window-number-reuse-replay\", \"mode\": \"replay\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"first-owner\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"expectedDecision\": \"newWindow\", \"track\": false}]}, {\"label\": \"ownership-change\", \"observations\": [{\"kind\": \"disappeared\", \"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1, \"expectedDecision\": \"knownWindow\"}, {\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\"}]}, {\"label\": \"same-new-owner\", \"observations\": [{\"kind\": \"titleChanged\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Renamed fixture\", \"bounds\": \"40:60:900:700\", \"isMinimized\": false, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"cg-window-id-bound\"}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires tracked endpoints"
+  },
+  {
+    "name": "identity_replay_requires_tracked_endpoints_even_for_unstable_identity-2",
+    "mode": "replay",
+    "payload": "{\"name\": \"cg-window-number-reuse-replay\", \"mode\": \"replay\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"first-owner\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"expectedDecision\": \"newWindow\"}]}, {\"label\": \"ownership-change\", \"observations\": [{\"kind\": \"disappeared\", \"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1, \"expectedDecision\": \"knownWindow\"}, {\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1, \"expectedDecision\": \"newWindow\"}]}, {\"label\": \"same-new-owner\", \"observations\": [{\"kind\": \"titleChanged\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Renamed fixture\", \"bounds\": \"40:60:900:700\", \"isMinimized\": false, \"atSeconds\": 2, \"expectedDecision\": \"knownWindow\", \"expectedReason\": \"cg-window-id-bound\", \"track\": false}]}]}",
+    "accepted": false,
+    "error": "replay scenario requires tracked endpoints"
+  },
+  {
+    "name": "invalid_replays_fail_without_a_trap-1",
+    "mode": "replay",
+    "payload": "{broken",
+    "accepted": false
+  },
+  {
+    "name": "invalid_replays_fail_without_a_trap-2",
+    "mode": "replay",
+    "payload": "{\"name\": \"fixture\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"one\", \"observations\": [{\"kind\": \"invalid\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\"}]}]}",
+    "accepted": false
+  },
+  {
+    "name": "invalid_replays_fail_without_a_trap-3",
+    "mode": "replay",
+    "payload": "{\"name\": \"fixture\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"one\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"invalid\", \"pid\": 42, \"isMinimized\": false, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\"}]}]}",
+    "accepted": false
+  },
+  {
+    "name": "invalid_replays_fail_without_a_trap-4",
+    "mode": "replay",
+    "payload": "{\"name\": \"fixture\", \"expectedStableIdentity\": false, \"steps\": [{\"label\": \"one\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"title\": \"Fixture\", \"bounds\": \"1e30:0:800:600\"}]}]}",
+    "accepted": false
+  },
+  {
+    "name": "invalid_replays_fail_without_a_trap-5",
+    "mode": "placementReplay",
+    "payload": "{\"name\": \"duplicate\", \"initialOrderedWindowIDs\": [\"one\", \"one\"], \"steps\": []}",
+    "accepted": false
+  },
+  {
+    "name": "invalid_replays_fail_without_a_trap-6",
+    "mode": "placementReplay",
+    "payload": "{\"name\": \"status\", \"initialOrderedWindowIDs\": [\"one\"], \"steps\": [{\"label\": \"one\", \"windowID\": \"one\", \"newStatus\": \"invalid\", \"atSeconds\": 0, \"expectedOrder\": [\"one\"]}]}",
+    "accepted": false
+  },
+  {
+    "name": "single_observation_can_assert_an_ambiguous_decision-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": true, \"steps\": [{\"label\": \"observation\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"expectedDecision\": \"ambiguous\"}]}]}",
+    "accepted": true
+  },
+  {
+    "name": "single_observation_can_assert_an_ambiguous_decision-2",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": true, \"steps\": [{\"label\": \"observation\", \"observations\": [{\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"expectedDecision\": \"knownWindow\"}]}]}",
+    "accepted": false
+  },
+  {
+    "name": "single_step_cannot_use_an_unrelated_expectation_to_accept_an_ambiguous_endpoint-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"identity-verification\", \"expectedStableIdentity\": true, \"steps\": [{\"label\": \"mixed observations\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"isMinimized\": false, \"expectedDecision\": \"newWindow\"}, {\"kind\": \"unchanged\", \"source\": \"accessibility\", \"pid\": 42, \"isMinimized\": false, \"track\": true}]}]}",
+    "accepted": false,
+    "error": "single-step replay requires an explicit ambiguous decision for an unconfirmed endpoint"
+  },
+  {
+    "name": "single_step_replay_needs_an_independent_expectation-1",
+    "mode": "replay",
+    "payload": "{\"name\": \"minimize-restore-replay\", \"mode\": \"replay\", \"expectedStableIdentity\": true, \"steps\": [{\"label\": \"baseline\", \"observations\": [{\"kind\": \"appeared\", \"source\": \"coreGraphics\", \"pid\": 1001, \"cgWindowID\": 5001, \"title\": \"Demo Window\", \"appName\": \"DemoApp\", \"bounds\": \"100:100:800:600\", \"isMinimized\": false}]}]}",
+    "accepted": false,
+    "error": "single-step replay requires a decision expectation"
+  },
+  {
+    "name": "transition_replay_accepts_a_confirmed_pending_close-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"confirmation\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": true,
+    "lastStatus": "closedPending"
+  },
+  {
+    "name": "transition_replay_keeps_rebound_window_and_its_close_request-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"old close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"old window parked\", \"observation\": {\"source\": \"accessibility\", \"pid\": 42, \"cgWindowID\": null, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": true, \"kind\": \"minimized\", \"atSeconds\": 0.6}, \"expectedStatus\": \"minimized\"}, {\"label\": \"new native window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"restored\", \"atSeconds\": 0.75}, \"expectedStatus\": \"active\"}, {\"label\": \"new close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"unchanged\", \"atSeconds\": 0.9}, \"trackCloseAtSeconds\": 0.9, \"expectedStatus\": \"active\"}, {\"label\": \"late disappearance of old window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"discarded\"}, {\"label\": \"replacement remains active\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"unchanged\", \"atSeconds\": 1.25}, \"expectedStatus\": \"active\"}, {\"label\": \"exact confirmation of new close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"disappeared\", \"atSeconds\": 1.5}, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": true,
+    "lastIdentity": "cg-21"
+  },
+  {
+    "name": "transition_replay_keeps_rebound_window_and_its_close_request-2",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"old close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"old window parked\", \"observation\": {\"source\": \"accessibility\", \"pid\": 42, \"cgWindowID\": null, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"hidden\", \"atSeconds\": 0.6}, \"expectedStatus\": \"hidden\"}, {\"label\": \"new native window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"unhidden\", \"atSeconds\": 0.75}, \"expectedStatus\": \"active\"}, {\"label\": \"new close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"unchanged\", \"atSeconds\": 0.9}, \"trackCloseAtSeconds\": 0.9, \"expectedStatus\": \"active\"}, {\"label\": \"late disappearance of old window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"discarded\"}, {\"label\": \"replacement remains active\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"unchanged\", \"atSeconds\": 1.25}, \"expectedStatus\": \"active\"}, {\"label\": \"exact confirmation of new close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"isFocusedWindow\": true, \"kind\": \"disappeared\", \"atSeconds\": 1.5}, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": true,
+    "lastIdentity": "cg-21"
+  },
+  {
+    "name": "transition_replay_keeps_reused_number_active_when_old_owner_closes-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"window number reused\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\", \"isFocusedWindow\": true, \"atSeconds\": 0.75}, \"expectedStatus\": \"active\"}, {\"label\": \"old window closed\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"closedPending\"}, {\"label\": \"new window remains active\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 1.25}, \"expectedStatus\": \"active\"}]}",
+    "accepted": true
+  },
+  {
+    "name": "transition_replay_rejects_ax_disappearance_with_a_remembered_window_number-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"AX loss with cached number\", \"observation\": {\"source\": \"accessibility\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"disappeared\"}, {\"label\": \"later Core Graphics confirmation\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1.25}, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": true
+  },
+  {
+    "name": "transition_replay_rejects_ax_only_close_confirmation-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"accessibility\", \"pid\": 42, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"accessibility\", \"pid\": 42, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"window missing from AX\", \"observation\": {\"source\": \"accessibility\", \"pid\": 42, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"disappeared\"}]}",
+    "accepted": true
+  },
+  {
+    "name": "transition_replay_rejects_close_confirmation_from_different_owner-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"different process\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"closedPending\", \"trackCloseAtSeconds\": 0.5}]}",
+    "accepted": false,
+    "lastStatus": "discarded"
+  },
+  {
+    "name": "transition_replay_rejects_close_confirmation_from_different_owner-2",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"different process\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": false,
+    "lastStatus": "discarded"
+  },
+  {
+    "name": "transition_replay_rejects_close_confirmation_from_different_owner-3",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"window number reused\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\", \"atSeconds\": 0.75}, \"expectedStatus\": \"inactive\"}, {\"label\": \"different process\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 43, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": false,
+    "lastStatus": "disappeared"
+  },
+  {
+    "name": "transition_replay_rejects_close_requested_after_disappearance-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"first disappearance\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"disappeared\"}, {\"label\": \"duplicate disappearance\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 3}, \"trackCloseAtSeconds\": 2, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": false,
+    "error": "unexpected lifecycle status"
+  },
+  {
+    "name": "transition_replay_rejects_inexact_native_close_evidence-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"different window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"discarded\", \"trackCloseAtSeconds\": 0.5}, {\"label\": \"original window visible\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\", \"atSeconds\": 1.25}, \"expectedStatus\": \"inactive\"}, {\"label\": \"original window gone\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1.5}, \"expectedStatus\": \"disappeared\"}]}",
+    "accepted": true
+  },
+  {
+    "name": "transition_replay_rejects_inexact_native_close_evidence-2",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"different window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"discarded\"}, {\"label\": \"original window gone\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1.5}, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": true
+  },
+  {
+    "name": "transition_replay_rejects_inexact_native_close_evidence-3",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"unknown window number\", \"observation\": {\"source\": \"accessibility\", \"pid\": 42, \"cgWindowID\": null, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"disappeared\"}, {\"label\": \"original window visible\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\", \"atSeconds\": 1.25}, \"expectedStatus\": \"inactive\"}, {\"label\": \"original window gone\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1.5}, \"expectedStatus\": \"disappeared\"}]}",
+    "accepted": true
+  },
+  {
+    "name": "transition_replay_rejects_inexact_native_close_evidence-4",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"close request\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"unchanged\", \"atSeconds\": 0.5}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"inactive\"}, {\"label\": \"new seat number\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\", \"atSeconds\": 0.75}, \"expectedStatus\": \"inactive\"}, {\"label\": \"different window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 22, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"disappeared\"}]}",
+    "accepted": true
+  },
+  {
+    "name": "transition_replay_rejects_unconfirmed_close-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"unknown window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"kind\": \"disappeared\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1}, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": false
+  },
+  {
+    "name": "transition_replay_rejects_unconfirmed_close-2",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"close request for unknown window\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"kind\": \"disappeared\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"atSeconds\": 1}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"closedPending\"}]}",
+    "accepted": false
+  },
+  {
+    "name": "transition_replay_retires_request_after_early_disappearance-1",
+    "mode": "transitionReplay",
+    "payload": "{\"name\": \"close-verification\", \"steps\": [{\"label\": \"baseline\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\"}, \"expectedStatus\": \"inactive\"}, {\"label\": \"early disappearance\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 0.25}, \"trackCloseAtSeconds\": 0.5, \"expectedStatus\": \"disappeared\"}, {\"label\": \"duplicate disappearance\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1}, \"expectedStatus\": \"disappeared\"}, {\"label\": \"reopened\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"appeared\", \"atSeconds\": 1.25}, \"expectedStatus\": \"inactive\"}, {\"label\": \"disappearance after reopening\", \"observation\": {\"source\": \"coreGraphics\", \"pid\": 42, \"cgWindowID\": 21, \"title\": \"Fixture\", \"bounds\": \"0:30:800:600\", \"isMinimized\": false, \"kind\": \"disappeared\", \"atSeconds\": 1.5}, \"expectedStatus\": \"disappeared\"}]}",
+    "accepted": true
+  }
+]

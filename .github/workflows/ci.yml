@@ -52,7 +52,6 @@ jobs:
           python3 -m unittest discover -s Scripts -p 'test_*.py'
           node --test Scripts/check_release_workflow.mjs
           python3 Scripts/check_localization.py
-          python3 Scripts/check_debug_switches.py
 
       - name: Test full build
         run: bash Scripts/test.sh full
@@ -64,6 +63,11 @@ jobs:
         env:
           DESKMOTE_VERSION: ${{ inputs.version }}
         run: bash Scripts/build.sh base
+
+      - name: Build and verify no-finder app
+        env:
+          DESKMOTE_VERSION: ${{ inputs.version }}
+        run: bash Scripts/build.sh no-finder
 
       - name: Build and verify full ZIP
         id: package

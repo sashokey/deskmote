@@ -67,37 +67,6 @@ enum PermissionOnboardingState: Equatable {
 }
 
 
-struct PermissionLossDetector: Equatable {
-    enum Verdict: Equatable {
-        case stable
-        case uncertain
-        case lost
-    }
-
-    static let minimumSustained: TimeInterval = 5
-
-    private var firstFalseAt: TimeInterval?
-    private var consecutiveFalse = 0
-
-    init() {}
-
-    mutating func record(trusted: Bool, at: TimeInterval) -> Verdict {
-        guard !trusted else {
-            firstFalseAt = nil
-            consecutiveFalse = 0
-            return .stable
-        }
-
-        if firstFalseAt == nil { firstFalseAt = at }
-        consecutiveFalse += 1
-
-        let elapsed = max(0, at - (firstFalseAt ?? at))
-        if consecutiveFalse >= 2, elapsed >= Self.minimumSustained { return .lost }
-        return .uncertain
-    }
-}
-
-
 enum AccessibilitySettingsLink {
     static let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
 }

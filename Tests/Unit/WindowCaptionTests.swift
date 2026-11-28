@@ -24,9 +24,17 @@ final class WindowDisplayTitleTests: XCTestCase {
         let cache = AppDisplayNameCache()
         var loads = 0
         _ = cache.value(for: "first") { loads += 1; return "First" }
-        for index in 0..<512 { _ = cache.value(for: "app-\(index)") { "App" } }
+        let generation = cache.generation
+        _ = cache.value(for: "first") { XCTFail("Expected cached name"); return nil }
+        for index in 0..<511 { _ = cache.value(for: "app-\(index)") { "App" } }
+        XCTAssertEqual(cache.generation, generation)
+        _ = cache.value(for: "overflow") { "App" }
+        XCTAssertEqual(cache.generation, generation &+ 1)
         _ = cache.value(for: "first") { loads += 1; return "First" }
         XCTAssertEqual(loads, 2)
+        let beforeInvalidation = cache.generation
+        cache.invalidate(bundleID: "first")
+        XCTAssertEqual(cache.generation, beforeInvalidation &+ 1)
     }
 
     func testNonemptyTitleIsReturnedUnchanged() {

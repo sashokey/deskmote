@@ -15,17 +15,18 @@ Use the repository's default branch, `master`, for explicitly authorized direct 
 - Build for macOS 27 or later and Apple silicon. Use Xcode 27.2 (27B52), Swift 6, Git, Python 3 and Node.js.
 - Use the GitHub Actions `xcode-27` runner. The scripts select the same Xcode locally and in CI. Set `DEVELOPER_DIR` to its `Contents/Developer` only if installed at another path. Make that Xcode the command-line default on hosted runners so child processes launched by XCTest select the same toolchain.
 - Keep `README.md` and this file as the repository’s Markdown files.
-
+- Use injected or offscreen fixtures for automated testing on macOS. Use physical Macs for any separately authorized native verification. Do not look for, provision, launch, or use virtual machines for DeskMote.
 - Run all local tests outside the sandbox, including Xcode tests, standalone test binaries, Python unit tests and Node test suites. Escalate the specific test command. Run signing, packaging and static checks in the sandbox.
 - For DeskMote builds on Xcode 27.2 (27B52) that export `Resources/AppIcon.icon`, run the Xcode build command outside the sandbox. The sandboxed `actool` export fails with `Icon export exited with status 255`. Check the Xcode version and whether the build exports the icon before escalating the build command.
 
 ## Architecture to preserve
 
 - The DeskMote target owns the taskbar, cross-application window operations, menu bar icon and login registration. Use actual `SMAppService.mainApp` status for the menu checkmark. A reopen restores the same status item.
-- Register optional modules in `DeskMoteModuleRegistry.production(registerWindow:)`. The empty registry also starts the core. Keep Command Shift, Natural Switch and Battery Run as separate Swift targets. Enable input modules only after a successful start, stop them on disable, and restore saved selections at launch.
+- Register optional modules in `DeskMoteModuleRegistry.production(registerWindow:)`. The empty registry also starts the core. Keep Apps, Command Shift, Natural Switch and Battery Run as separate Swift targets. Enable input modules only after a successful start, stop them on disable, and restore saved selections at launch.
 - Register shown utility windows through the shared callback. Read their state and execute window actions through AppKit. For visible utility windows, use `NSWindow.isOnActiveSpace` for taskbar visibility even while Space membership reads are catching up. Retain the last AppKit-confirmed Space for minimized and hidden utility windows until the membership read agrees. Keep DeskMote excluded from external window discovery. Exercise minimization, closure, reopening, display and Space routing with registered and unregistered windows.
 - Use Accessibility as the app’s privacy permission. The core needs it for windows and Command Shift uses it for the event tap. Keep the core taskbar pointer-driven and leave Apps search text input to AppKit. Do not add core keyboard handlers, input taps or tests that post or forward key events. Command Shift retains its own shortcut and existing event semantics. Natural Switch follows external mouse presence while enabled and leaves the last direction in place on disable.
-- Give each extension an independent target and embed phase entry. Use `DeskMoteWidgetBundle` to add widgets. Retain the air quality widget’s kind, intent type and input parameter names for installed instances. Give the widget the sandbox and HTTPS client entitlements. Finder Sync captures the folder and file type and submits them to its embedded XPC service. Authenticate both peers against their installed code signatures and let the service perform exclusive creation. Preserve numbered names and a valid ZIP with an empty folder.
+- Embed Finder File Creator and its XPC service in Full. Authenticate both peers against their installed code signatures. Keep exclusive file creation, numbered names and valid ZIP contents in the service.
+- Command Shift owns direct input-state reads and the passive Quartz session tap. While its popup is open, Apps may observe `.leftMouseDown` and preserves delivery of the original event. AppKit supplies window-local hover, native control and drag events.
 - Keep app identifiers stable. Verify the graph alongside the package because an excluded extension or library can otherwise return as an implicit Xcode dependency.
 
 ## Maintenance
@@ -35,6 +36,17 @@ Use DeskMote’s history and release tag archives to identify the source corresp
 When the user reports a bug, including a message that says only `баг`, open the first response with whether a fix is known, plausible but unverified, or still unknown. State the expected scope of code changes and the added runtime cost in CPU, GPU and RAM. Label estimates and identify any costs that are unknown.
 
 Send every proposed solution to an independent reviewer subagent before recommending or implementing it.
+
+**Planning and execution**
+
+- Use `superpowers:writing-plans` for every plan. Pair it with `mattpocock-skills:codebase-design` for new features and `mattpocock-skills:improve-codebase-architecture` for refactoring and fixes.
+- Follow `superpowers:using-superpowers` as the primary workflow and use `superpowers:executing-plans` and `mattpocock-skills:codebase-design` for every plan execution.
+
+**Plan review**
+
+1. Send the full text of every plan, including consolidated plans, to a fresh independent reviewer subagent. Repeat the full review after every edit. Give the reviewer the user's intended outcome, constraints, accepted decisions, and the source and dependencies needed to assess the plan.
+2. Have the reviewer check every task and acceptance criterion against the user's intent and the current baseline. Require them to flag choices that would worsen the outcome for the user, including choices the user requested. Share material downsides with the user, backed by the reviewer's evidence, trade-off and feasible alternative when available.
+3. Record the independent verdict for the exact current revision of each plan. Require an approving verdict before marking it ready or starting implementation. Address findings within the approved scope and submit the revised plan in full again.
 
 Run focused checks by default. Run a full test suite or produce an application build only when the user explicitly requests that operation.
 
@@ -59,15 +71,9 @@ Any authorized artifact cleanup must run its policy checks before obtaining Acti
 
 After `Re-run all jobs`, a resume must match successful validation and the versioned build with failed publication in the verified attempt. Use the single `DeskMote` artifact created during its successful upload step. Download by artifact ID and check its recorded digest. Stop on missing, expired or ambiguous artifacts, or a mismatched tag revision.
 
-### Dev diagnostics and performance
+### Production evidence
 
-Build Debug with `DESKMOTE_VARIANT=full` and bundle identifier `io.github.sashokey.deskmote.dev`. Keep the release bundle name `DeskMote.app` and display name `DeskMote`. Sign the app and embedded bundles locally with an ad hoc signature. Use a reduced variant only when explicitly requested. Set each embedded target's bundle identifier under the Dev app's namespace and use the matching Finder XPC service name. Verify that the full Dev app links Command Shift, Natural Switch and Battery Run, and that the signed bundle contains both app extensions and the Finder XPC service. Keep both production and Dev self-identities out of inventory and helper ownership. Enable `DOCK_INVENTORY_LOG` and `DOCK_CLICK_TRACE` only for an agreed diagnostic run. Collect their bounded journals from one instance in the Dev app's local log directory.
-
-Use `ActionResourceLog` for Dev action and native-call intervals. Record elapsed time, process CPU time, CPU percentage relative to one core, and physical footprint before, after and as a delta. Overlapping actions share process counters. Use the signpost `trace-id` to align Instruments GPU time and utilization with the action. Record unavailable GPU metrics as unavailable when the system cannot attribute them to AppKit actions. Compile the measurement and its call sites out of Release.
-
-Compare the same configuration, diagnostics, display setup, windows and interval lengths. Mark idle, window switching and Space switching separately. Compare Release with Release when isolating runtime cost. Replay the same events before and after a change and count actual AX, WindowServer and Space calls separately from queued work, including failed attempts and size writes. The 100-move regression removes two extra full AX reads and two full WindowServer captures. The 30-event same-destination Space replay uses one in-flight read and one latest pending read. These are controlled test counts.
-
-For an incident, correlate the app version and source revision, process and boot, permission or lifecycle transition, native return code, window identity, display and Space. Capture app and system logs for the relevant process and time interval, including the previous build and boot when available. Installing a new build does not by itself erase unified logs. Distinguish a native exit from a crash, a rejected effect from an unconfirmed effect, and a missing log from a missing event. Repair missing evidence at the existing boundary before adding calls. Keep diagnostic data local.
+Use system observations, package metadata and injected automated checks to investigate production issues. Store verification artifacts outside the app. Keep product binaries free of DeskMote-owned logging, diagnostics and external command ingress. Read Battery Run history from the system journal on demand with `/usr/bin/pmset -g log`. Keep all evidence de-identified and local unless publication is authorized.
 
 ## Build and verify
 
@@ -76,23 +82,19 @@ bash Scripts/test.sh full
 bash Scripts/test.sh base
 bash Scripts/build.sh full
 bash Scripts/build.sh base
-bash Scripts/build.sh no-widget
 bash Scripts/build.sh no-finder
 python3 -m unittest discover -s Scripts -p 'test_*.py'
 node --test Scripts/check_release_workflow.mjs
 python3 Scripts/check_localization.py
-python3 Scripts/check_debug_switches.py
 ```
 
-The full app contains `DeskMoteWidgets.appex` and `DeskMoteFinder.appex`. The two exclusion builds contain only the other extension. The base build contains neither extension and builds without the three optional Swift targets. Each build verifies the application, deployment target, revision, architecture, versions, nested signatures and entitlements. The full test command also runs module, widget, Finder file-creation and WindowLab tests.
+Full contains Apps, Command Shift, Natural Switch, Battery Run, and the signed Finder extension and XPC service. Base contains the core. `no-finder` retains the four optional Swift targets. Keep Debug as a local XCTest configuration with the same product identity and behavior.
 
-CI tests and verifies the full and base variants from the same commit. The reusable workflow verifies the archived app after extraction and uploads only the full ZIP as the `DeskMote` artifact. Automated tests use injected inventory, window actions, permission, and system settings boundaries to avoid real window and Accessibility access.
-
-Run the packaged Release binary check for both variants before a release commit. An Xcode build can succeed while `verify_release_diagnostics` rejects imports for ordinary unified logs. Scope logging and its bookkeeping to Debug as well as the resource sampler. Keep user-facing compatibility notices in Release and include the diagnostic details directly.
+Verify Release Full and Base packages before the release commit. The release builds check source and link-map ownership, package layout, native registration, architecture, versions, and nested signatures and entitlements. CI also audits `no-finder`. Keep replay fixtures and test adapters in XCTest. Store test output and package verification outside product bundles.
 
 ### Extended core checks
 
-Run coverage and the constrained Swift executor for nontrivial core changes. Keep DerivedData and XCTest data in a location accessible to the runner, such as a temporary directory. When checking deployment availability, run `Scripts/check_availability_warnings.py` on the relevant test, build and WindowLab logs. Retain logs and result bundles on failure. Use the build script for the arm64 Release checks and `Scripts/package_release.sh` to verify the archive when changing packaging.
+Run coverage and the constrained Swift executor for nontrivial core changes. Keep DerivedData and XCTest data in a location accessible to the runner, such as a temporary directory. When checking deployment availability, run `Scripts/check_availability_warnings.py` on the relevant test, build logs. Retain logs and result bundles on failure. Use the build script for the arm64 Release checks and `Scripts/package_release.sh` to verify the archive when changing packaging.
 
 ```bash
 set -euo pipefail
@@ -114,8 +116,8 @@ suites=(
   InventoryLifecycleTests AppTrackerPeriodicBatchTests AppRuntimeTests
   WindowCommandLifecycleTests WindowObservationLifecycleTests
   AppIconResolverTests PanelLifecycleTests
-  TaskbarSpaceStoreTests TaskbarBehaviorTests WindowHeightAdjustmentTests ApplicationBehaviorTests
-  AppTrackerDisplayAttributionTests ActionResourceLogTests
+  TaskbarSpaceStoreTests TaskbarBehaviorTests WindowHeightFallbackTests ApplicationBehaviorTests
+  AppTrackerDisplayAttributionTests
 )
 only=()
 for suite in "${suites[@]}"; do only+=("-only-testing:DeskMoteTests/$suite"); done
@@ -129,7 +131,7 @@ Report line coverage for `DeskMote.app` alone. Test sources and duplicated appli
 
 ## Release
 
-Publish changes directly to `master`. Use `vN` as the Git tag, release title, displayed version and ZIP version. Start at `v1` and increase `N` by one at every release, including corrections. The application and both extensions use `N.0.0` for `CFBundleShortVersionString` and `N` for `CFBundleVersion`.
+Publish changes directly to `master`. Use `vN` as the Git tag, release title, displayed version and ZIP version. Start at `v1` and increase `N` by one at every release, including corrections. The application, Finder extension and XPC service use `N.0.0` for `CFBundleShortVersionString` and `N` for `CFBundleVersion`.
 
 1. Set `version`, `draft`, `prerelease` and `notes` in `.github/release.json` on `master`. Cover all shipped changes since the last published tag in the notes. Use `[skip ci]` in the candidate commit to suppress push-triggered publication. Set `draft: false` for publication and use `draft: true` when the user asks for a draft.
 2. Dispatch standalone `ci.yml` on the candidate and complete [Release approval](#release-approval). Verify that the version has no existing tag or release. If a push-triggered `Release` started, cancel it before it creates a tag and verify that publication has not begun.
@@ -179,7 +181,7 @@ No thumbnails or screen capture are allowed. A separate button has no hover popu
 
 During a group drag, keep the committed order as the priority for combining buttons while moving their live layout slots to the proposed position. Recompute the priority after committing the move. A resize or inventory change can still remove the dragged button and cancel the move.
 
-Accessibility remains necessary for window management. App Sandbox is incompatible with the retained cross-application Accessibility operations. See [Apple's restrictions](https://developer.apple.com/documentation/security/protecting-user-data-with-app-sandbox). Do not add privacy permissions to solve unrelated implementation issues. Derive core fullscreen visibility and taskbar routing from window and Space state. The optional Command Shift tap runs only for its own input-source shortcut. Treat window titles and diagnostic reports as potentially sensitive. They must not be uploaded automatically.
+Accessibility remains necessary for window management. App Sandbox is incompatible with the retained cross-application Accessibility operations. See [Apple's restrictions](https://developer.apple.com/documentation/security/protecting-user-data-with-app-sandbox). Do not add privacy permissions to solve unrelated implementation issues. Derive core fullscreen visibility and taskbar routing from window and Space state. Command Shift observes only its own input-source shortcut through its passive tap. Treat window titles and diagnostic reports as potentially sensitive. They must not be uploaded automatically.
 
 ## Apps launcher
 
@@ -191,19 +193,13 @@ All follows the system Apps catalog. Query the Spotlight application index withi
 
 The lower running-app row uses system application identity. Resolve Finder from system bundle metadata and reserve its leading slot outside the running scroller, even when its process is absent. For a running app with a bundle URL, use the native application-open/reopen action so an app such as Finder can open a window. Keep the running indicator and context actions tied to live state.
 
-Reuse one prepared `AppsMenuView` per panel, releasing its cache when the display disconnects. A cold click shows the container before loading the catalog. Reset search and transient menu state on reuse. Keep the 190 ms opening and closing animations and Reduce Motion. During the slide, move the prepared view vertically, hit-test its visible portion using the current position, and reverse from that position if it closes early. Cover cold/warm opening, in-motion click, closing and reopening, and isolate catalog fixtures from shared preferences.
+Reuse one prepared `AppsMenuView` per panel, releasing its cache when the display disconnects. A cold click shows the container before loading the catalog. Reset search and transient menu state on reuse. Show the current snapshot on a warm open and request a refresh when the opening animation settles, or after present with Reduce Motion. Cancel a pending refresh on close. Reconcile visible content and hover once after the final scroll position on a List, Category or Grid switch, while keeping AppKit scroll reflection active. Keep the last rendered List bitmap while a view is detached. Refresh it on a real window scale or appearance change, or when the source artwork changes. Keep the 190 ms opening and closing animations and Reduce Motion. During the slide, move the prepared view vertically, hit-test its visible portion using the current position, and reverse from that position if it closes early. Cover cold/warm opening, in-motion click, closing and reopening, and isolate catalog fixtures from shared preferences.
 
 ## Permission startup and recovery
 
 On a normal installed launch without Accessibility permission, remain an accessory application and request only the native system prompt. Poll for the grant without opening a DeskMote guide or repeating the prompt. Elapsed time, an initial denial, or an ungranted permission is not proof of a broken permission record. A late grant starts the taskbar once in the same process. Quitting while waiting prevents a later grant from starting it.
 
-Keep explanations for transient or read-only installations, sustained permission loss after startup, and failed recovery relaunches. Preserve the permission-loss debounce, panel suspension, recovery guidance, and retry behavior. Do not reset privacy permissions or introduce new ones to test first-launch behavior. Use injected permission states for automated checks.
-
-### Critical Accessibility revocation incident
-
-Removing Accessibility from a running Dev build was followed by a session-wide input freeze. The cursor still moved, but clicks and key presses had no effect. The freeze was already visible when the lid was opened. The journal records TCC deleting the grant and the same DeskMote process requesting the AX server 21 seconds later. It contains no matching lid-open event or stack trace that establishes the cause of the whole-session freeze. A separate revocation report had an AppKit termination event and no crash report. Preserve the termination source and recovery path in Dev logs.
-
-Stop new core AX IPC on the first negative permission sample or native `apiDisabled` error. Keep the permission probe independent of the main thread and the existing debounce for recovery UI. Test with injected failures and a blocked main thread. Reproduce live removal only in an isolated macOS instance where a frozen session can be reset independently.
+Keep the installation guide for transient or read-only copies and the system Accessibility prompt on initial trusted-app setup. Once runtime starts, native `.apiDisabled` or a negative sample from the current probe seals AX admission and retires pending results. The five-second trust timer and the 100 ms window scan progress independently. A physical probe keeps its slot until it returns, including across stop and restart. A current positive result establishes readiness. Command Shift uses a passive tap. Confirmed loss requests normal termination and arms the existing three-second exit fallback. Exercise the probe, loss, sleep, and wake paths with injected states and a blocked main thread.
 
 ## Embedded helper windows
 
@@ -245,13 +241,13 @@ Keep one inventory backoff and the latest coalesced event per process generation
 
 Read minimized state, title, position, size, role, and subrole in one AX attribute batch per window. Preserve individual AX errors. Use scalar reads for unsupported batches or ambiguous fields within the original budget. Apply the inventory backoff after a batch timeout.
 
-Queued AX subscription removal belongs to its observation session. Stopping that session cancels pending cleanup, releases its queued elements, and prevents the next native removal from starting. An already admitted call may drain. Retiring an element from a live session still removes all required notifications. Release phantom-held diagnostic episodes when their seats retire. Admission history used only by tests is Debug-only. Runtime diagnostics use the bounded inventory log rather than unconditional console dumps.
+Queued AX subscription removal belongs to its observation session. Stopping that session cancels pending cleanup, releases its queued elements, and prevents the next native removal from starting. An already admitted call may drain. Retiring an element from a live session still removes all required notifications. Keep inventory inspection and test probes within XCTest.
 
 Read managed layouts and targeted window memberships off the main actor. A blocked membership read must allow panel visibility to update. Check Space generation and window identity before accepting results. On an unverified Space ABI or malformed system result, suspend affected projections and show one diagnostic notice per error code with the event, macOS and source revision. In Dev, find the corresponding unified log entry in taskbar-spaces.
 
 Keep panel visibility, window membership and exact confirmed focus as independent facts. The panel projects them by physical display and active Space. An activation request alone cannot light the active indicator. Preserve the last confirmed result through a transient unread focus sample when its identity is still current. Use typed failure handling for native API changes. Notices must identify the failed operation and reason, affected feature, relevant event and platform/build context so the matching Dev trace can be found.
 
-Keep the per-window Space membership read authoritative in Release and in Debug verification mode. Use `DOCK_SPACE_BATCH_MODE=verify` to compare per-Space results in runtime diagnostics before enabling the batched path. Cover moved, minimized, hidden, fullscreen, and shared-Space windows in automated tests. Retain scalar lookup for parked windows and missing results. Discard the capture when its layout changes or its read budget expires.
+Keep the per-window Space membership read authoritative. Exercise moves, minimized and hidden windows, fullscreen, and multiple displays with injected membership reads.
 
 During a group drag, reuse text measurements and move only the dragged frames while the insertion slot is unchanged. A combined/overflow list stores window models and asks NSTableView for reusable rows near its viewport. Cancel a removed row's delayed file hover before reuse, and rebind its title, selection and exact-window actions.
 
@@ -261,13 +257,9 @@ An unresolved application icon can be cached between renders, but application la
 
 ## Window height and native Fill
 
-`WindowHeightAdjustment` consumes geometry independently of inventory and panel rendering. Use the actually visible, unoccluded Small panel frame for the same display and active Desktop. Read the exact focused window once per geometry operation. Require both vertical edges to match `NSScreen.visibleFrame` exactly and require overlap. Shorten to the panel top with one immediate `AXSize` write, preserving position and width. Skip own, minimized and fullscreen windows. Leave the resulting size on quit.
+The 100 ms window scan is the only trigger for height correction. The existing scan queue owns the timer and CG snapshots. The existing serial AX worker uses the latest valid snapshot and never replays superseded rows. Eligible windows have an exact top at the visible work area or at that top plus the visible panel height, and their bottom crosses the top of the panel. Use current width for AXSize or preserve X and size for AXPosition. Keep the exact owning display, Desktop, window identity and trust checks. Do not observe input, add a cooldown or audit CG-negative windows. Preserve the corrected frame on quit.
 
-`AXWindowMoved` and `AXWindowResized` report geometry. Native Fill from the green-button menu or a configured title-bar double-click remains owned by macOS. The same exact geometry from a resize qualifies. Ordinary refocus of an existing window only establishes a baseline. Evaluate an already exact first frame once when AX creation or launch focus proves it belongs to a new window. Keep creation evidence tied to that first frame. Discard obsolete completion after focus, binding, layout or geometry changes using local state. A notification caused by the size write and duplicate frames must not repeat it. Keep `DOCK_WINDOW_LIFT=0`. The removed tiling heuristics, geometry tolerance, animation, timers, automatic retries, extra pre-write AX read and quit restoration stay out of this path.
-
-Cold launches such as Slack can open directly at the qualifying height. In the PhpStorm incident, early observation and focus reads returned `kAXErrorCannotComplete` and inventory found the window before focus was confirmed. Keep the remaining existing launch attempts alive until the current window's focus can be established. Use the already obtained focus and first-frame evidence. Keep the new-window rule independent of app names and avoid additional recurring work.
-
-Moving the system Dock can reserve space on one display and cause WindowManager to expand an already filled window on the display it leaves. A custom tiler can choose its own target frame but does not change native Fill's contract. Native tiling state and geometry are distinct, and the investigation found no dependable external completion notification for the stock gesture. Preserve the geometry rule. With drag-to-top, macOS can report intermediate frames, retile after a successful size write, or report a top edge different from the selected working area. Do not widen tolerance, change focus-only behavior, or add retry/timing guesses without new evidence and scope approval. In Dev, correlate `window-height` notification, binding and layout revision, display and work area, the full frame before `AXSize`, result, and the next already-scheduled AX read. That next read is a later observation.
+Bind timing and resource checks to the exact Release revision and use injected or external measurement tools. Verify focus and window inventory progression independently of window height correction.
 
 ## Inventory and action identity
 
@@ -326,7 +318,7 @@ Keep test coverage for the following behaviors.
 - No-screen startup, display disconnect/reconnect, and separate handling of missing display UUIDs. Native panel creation is replaced in lifecycle tests so no window is shown.
 - Bounded process-generation caching and cleanup after process termination.
 - System-only initial permission prompting, continued waiting without a guide or repeated prompt, late grants, grants arriving during startup, and quitting before a grant. Confirmed runtime recovery and transient-install guides remain covered separately.
-- Display attribution, topology changes, state-based fullscreen visibility, and clearance for focused windows that enter exact working-height geometry.
+- Display attribution, topology changes, state-based fullscreen visibility, and clearance for focused windows that align with the top of the working area and enter the panel.
 - Separate labeled buttons, content-sized short captions including the exact `.` reference, the measured 74-point compressed width for long captions, pixel rounding, combining under crowding, expansion after space returns, and accessible overflow.
 - Whole-application group moves selected by the dragged leading/trailing edge crossing the neighboring group midpoint, unequal widths and different grab positions, stable repeated pointer events, round trips without persistence, preserved member order, mouse-up outside, and windows/apps or available width changing during a drag.
 - No hover popup for separate buttons. Icon/title lists for combined groups and overflow only.
@@ -338,7 +330,7 @@ Keep test coverage for the following behaviors.
 - The Windows state hierarchy, applied to both AppKit appearances: similar hover/active body fill, stronger active edge, stronger fill on active hover, and darker held presses. The active underline is 11 by 2 points with a one-point bottom gap. Its horizontal center must equal the icon center exactly, including at 1x where its left edge falls between pixels. Check both the view/backing geometry and the centers of the actually rendered icon and indicator at 1x and 2x. A half-pixel centering tolerance hides the defect.
 - Bottom-edge hit testing and hover tracking at 1x and 2x, exact-window clicks, combined/overflow lists, file-hover activation, preserved horizontal gaps, and cancelled clicks outside the bar. Raster comparisons verify that larger hit targets do not change the 28-point visible buttons.
 - Ordered common menu commands, sections driven by the installed modules, checked visibility toggling in both directions, native-restored visibility, icon restoration and independent login/quit actions.
-- Launch-at-login state, localization, debug-switch registration, pinned toolchain selection, release publication, and verification of the artifact retention policy when changing it.
+- Launch-at-login state, localization, pinned toolchain selection, release publication, and verification of the artifact retention policy when changing it.
 
 Coverage reports identify untested paths. A count or percentage alone does not establish correct behavior. Automated tests cannot establish real Accessibility interoperability, native WindowServer animation, or hot-plug behavior on every Mac.
 
@@ -348,17 +340,17 @@ Coverage reports identify untested paths. A count or percentage alone does not e
 
 Title-update regressions replay repeated browser tab open/close titles and chat/application-name transitions through the production runtime and presenter into native button captions and Accessibility labels. Drain queued updates without waiting for a quiet interval. Assert each accepted title replaces its predecessor while the button identity and window order remain stable. Reader and inventory tests separately cover unread titles, known empty values and window replacement.
 
-`WindowHeightAdjustmentTests` delivers focused-window Accessibility notifications through the production observer. Assert one size-only write on entry into exact working-height geometry, and cover duplicate events, another display, unavailable Accessibility, and no write while the destination panel is hidden.
+`WindowHeightFallbackTests` uses injected snapshots, AX operations and ticks to cover the two vertical geometries, stale results, held reads, exact AX writes and progress from the latest snapshot.
 
 `ApplicationBehaviorTests` enters through AppDelegate for first launch, late grants, reopen, permission suspension, recovery and termination. Replace native presentation and application/process operations so these checks never open windows, modify TCC, terminate other processes or change the user's desktop. Runtime, panel orchestration and permission coordination stay real.
 
-When changing these paths, prove the corresponding regression test rejects a missing action or write: disconnected toggle/activate/close/reorder, omitted normal termination, unconditional command failure, skipped unminimize, skipped lift write, and skipped reopen icon restoration. A compilation failure does not count as detecting the regression. Run the complete suite after restoring the implementation.
+When changing these paths, prove the corresponding regression test rejects a missing action or write: disconnected toggle/activate/close/reorder, omitted normal termination, unconditional command failure, skipped unminimize, skipped lift write, and skipped reopen icon restoration. A compilation failure does not count as detecting the regression. Run the authorized verification after restoring the implementation.
 
 Coverage summaries select the `DeskMote.app` target. Test sources and duplicated source copies belong outside the application metric. Tests must assert the end effect of each core flow. No aggregate line percentage establishes that contract.
 
 ### Runtime behavior
 
-Use automated tests with injected Accessibility operations to verify candidate builds. Investigate issues observed in production using runtime diagnostics. The user manages DeskMote’s own macOS Accessibility permission. Never ask the user to grant macOS Accessibility permission to Codex or its tools.
+Use automated tests with injected Accessibility operations to verify candidate builds. Investigate production behavior with de-identified system observations and candidate tests. The user manages DeskMote’s own macOS Accessibility permission. Never ask the user to grant macOS Accessibility permission to Codex or its tools.
 
 #### Window-manager behavior
 
@@ -391,12 +383,12 @@ Use automated tests with injected Accessibility operations to verify candidate b
 | Hide status icon and restart | The icon disappears while taskbar operation continues. The choice survives application restart and login/reboot. |
 | Reopen the running app from Applications | The same status item reappears. Its visible state is saved. No second taskbar instance or new document window appears. |
 | Open the taskbar menu while the icon is hidden | Hide Status Bar Icon stays enabled and checked. Selecting it restores the icon and clears the checkmark. Selecting it again hides the icon. Opening or refreshing the menu alone does not change visibility. Open at Login and Quit remain independent. |
-| Fill on both displays | Fill from the green-button menu and configured title-bar double-click works for narrow windows and after restoring a smaller size. When both vertical edges match the working area, the window clears the visible panel while its top, left and width stay fixed. Resizing to the same edges follows the same rule. Quit leaves the resulting window size in place. |
+| Fill on both displays | Fill from the green-button menu and configured title-bar double-click works for narrow windows and after restoring a smaller size. When the window's top matches the working area's top and the window overlaps the panel, the window clears the panel while its top, left and width stay fixed. A move or resize entering the same geometry follows the same rule. Quit leaves the resulting window size in place. |
 | Two displays, Spaces and moving windows | Each bar shows windows on the current Space of that display, including minimized windows assigned there. Windows on other Spaces, including fullscreen Spaces, are omitted. Moving a window between displays in either direction updates its button on the destination without waiting for the periodic Space refresh. Unrelated buttons retain their manual order. Switching back restores the buttons in their manual order. Grouping and close actions use only the visible windows. |
 | Mission Control from Desktop or fullscreen | The taskbar is hidden on both monitors by native AppKit transient-window behavior. On leaving Mission Control, it returns on regular Desktops and stays hidden on fullscreen Spaces. No input observation is used. |
 | Disconnect/reconnect, sleep/wake | No stale panels, duplicate buttons, or inaccessible windows after attribution settles. |
 | Fullscreen and Spaces transitions | The bar follows actual window/Space state and returns after the transition. Pending popups/actions are cancelled. A brief appearance during the transition animation is possible because input-based prehiding has been removed. |
-| Accessibility revoked/restored | Panels and pending actions suspend safely. Core operation resumes after permission recovery. Automated tests inject trust changes and cover the optional shortcut module independently. |
+| Accessibility revoked while running | The app denies new AX operations, discards stale results, and requests termination. A held probe keeps its slot across restart. Automated tests inject loss and hangs. |
 | Native Dock | Its preferences and process remain untouched. |
 
 For production failures, record OS, scale, display arrangement, version, source revision, steps and observations. In repository documentation, use de-identified information for examples and results. Exclude local account names, personal paths, dates and timestamps. Describe the user's computer only as a MacBook with Apple silicon.
@@ -413,7 +405,6 @@ For production failures, record OS, scale, display arrangement, version, source 
 | Toggle `Auto-Switch Scroll Direction` with an external mouse and trackpad | The enabled module selects the direction as devices change. Disabling stops updates. |
 | Restart, then log out and back in with `Open at Login` enabled | Disable `Reopen windows when logging back in` before logging out. DeskMote starts and restores only enabled modules. The checkmark tracks system login registration. |
 | Select `Hide Status Bar Icon`, then reopen DeskMote | The single status icon returns and the taskbar remains available. |
-| Add the widget in `Edit Widgets` | The gallery lists both sizes. A new widget requests `Source URL`. A compatible HTTPS page produces current readings. |
 | Toggle Finder File Creator in `System Settings → General → Login Items & Extensions → Extensions → By Category → File Providers` | Click ⓘ to see the switch. Right-click a local writable folder’s background. The two direct creation commands appear when enabled and disappear when disabled. `New Text Document` creates an empty `New Text Document.txt` and `New Compressed (zipped) Folder` creates a ZIP containing an empty folder. Neither opens a window or overwrites an existing item. |
 
 ### Accessory and embedded application admission
@@ -424,13 +415,13 @@ Verify the same helper inventory through seed, scan and launch retry, with owner
 
 Exercise top-level nonmodal AXDialog settings windows through the real AX reader and inventory filter. Confirmed settings windows appear. Modal, unread, nested and floating utility surfaces do not. Closing and reopening a tracked accessory window must use its existing observer without an app-only card or a periodic-admission delay.
 
-Mutation checks must detect removed signer equality, path containment, host generation validation, dialog boundaries and native AX ownership filtering. Keep mutation copies separate from the source used for release. Use production diagnostics for the AX roles that Steam and Terminal Profiles expose and the window commands they accept.
+Mutation checks must detect removed signer equality, path containment, host generation validation, dialog boundaries and native AX ownership filtering. Keep mutation copies separate from the source used for release. Use system window and Accessibility observations to establish native roles and accepted commands.
 
 ### Review regression coverage
 
 Use the production lifecycle controllers with injected AX sessions and a monotonic clock. Keep the test views offscreen and do not revoke live Accessibility permission.
 
-- For the geometry observer, cover blocked startup, registration and reads, rapid app and focus changes, stop, stale callbacks, transient errors, fallback recovery and bounded retries.
+- For the height poller, cover a held read, failed captures, stale proof, stop/restart and progress from the latest snapshot. Keep independent observer and focus tests for window inventory.
 - For a long-settled session, assert zero fast per-window queries. Then fast probes include only transitioning windows and expire after the response interval. Verify event-driven refresh and fallback discovery of external geometry changes with a fake clock and counted probe calls.
 - For inventory, closing the last window leaves no synthetic card and retains the application observer. Process churn releases mutation generations. A late response from an old process cannot consume a replacement process's in-flight read.
 - For icons, unresolved lookup retries on launch and activation, repeated renders use the cache, resolver lifetime is independent of notifications, and icon recovery refreshes an existing button without an inventory update.
@@ -441,7 +432,7 @@ The constrained Swift-executor pass covers geometry observation, height adjustme
 
 Hold a second application's periodic AX read and verify that the first application's ready title is published and its next event completes before releasing the second reader. Keep unread, stale-token, generation-replacement and stop coverage. Count running-application enumeration across an ownership batch with multiple helpers and a missing PID. Expect one candidate snapshot while host-generation changes and signature failures still reject bindings. A cancelled batch must not enumerate or check signatures.
 
-Block one subscription removal, queue more, stop the observer and restart with a fresh session. After the admitted call drains, no further removal may target the old session. Live retirement still unsubscribes normally. Repeatedly retire phantom-held seats while their process survives and assert that diagnostic state returns to its live cardinality. Independent minimized startup windows must retain their seats without unconditional debug output.
+Block one subscription removal, queue more, stop the observer and restart with a fresh session. After the admitted call drains, no further removal may target the old session. Live retirement still unsubscribes normally. Repeatedly retire phantom-held seats while their process survives. Verify independent minimized startup windows retain their seats.
 
 Space observation tests must prove off-main layout and membership reads, independent panel visibility, and rejection of results from earlier lifecycle and Space generations.
 
@@ -467,4 +458,4 @@ Exercise the production AX reader and inventory admission for a successful empty
 
 Keep two overlapping independent custom roots through repeated focus changes without token transfer or tab history. Delay an old inventory after its focus read, commit a newer focused-window result, then verify eligibility and active state before releasing a trailing inventory. Convert a root to a native child while AX succeeds or is unread. Remove its independent seat without a tombstone, retain it when native parent data is missing, and allow a detached root to return. Verify exact minimize, restore and close through the production executor without changing siblings.
 
-These tests and an offscreen native WindowServer parent probe establish the generic mechanism. Use production diagnostics to establish a third-party application's AX behavior. Correlate its PID and window ID with the source SHA, discovery path and observed commands.
+These tests and an offscreen native WindowServer parent probe establish the generic mechanism. Use system window and Accessibility observations to establish native behavior. Correlate its PID and window ID with the source SHA, discovery path and observed commands.

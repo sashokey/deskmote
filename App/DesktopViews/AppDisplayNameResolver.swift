@@ -4,6 +4,7 @@ import CoreServices
 @MainActor
 enum AppDisplayNameResolver {
     private static let displayNameCache = AppDisplayNameCache()
+    static var cacheGeneration: UInt64 { displayNameCache.generation }
     private static let workspaceObservers: [NSObjectProtocol] = {
         let center = NSWorkspace.shared.notificationCenter
         let names: [Notification.Name] = [

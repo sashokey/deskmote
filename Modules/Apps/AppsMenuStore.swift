@@ -33,8 +33,6 @@ enum AppsMenuCatalogMode: String, CaseIterable, Codable {
 
 @MainActor
 final class AppsMenuStore {
-    static let shared = AppsMenuStore()
-
     private static let pinsKey = "deskmote.appsMenu.pins"
     private static let catalogModeKey = "deskmote.appsMenu.catalogMode"
     private static let expandedKey = "deskmote.appsMenu.expanded"
@@ -50,13 +48,15 @@ final class AppsMenuStore {
 
     typealias ReadIndex = @MainActor ([URL]) async -> [AppsMenuIndexedApplication]?
 
+    private let isDeskMote: @Sendable (String?) -> Bool
     private let defaults: UserDefaults
     private let applicationDirectories: [URL]?
     private let readIndex: ReadIndex?
     private let suppliedSystemFileManager: AppsMenuApplication?
-    private let openApplication: @MainActor (URL) -> Void
+    private let openApplication: @MainActor (URL, OpenIntent) -> Void
     private let runningApplicationSnapshot: () -> [NSRunningApplication]
     private let readIcon: @MainActor (URL) async -> NSImage
+    private let catalogNow: () -> ContinuousClock.Instant
     private let applicationIcons = NSCache<NSURL, NSImage>()
     private var iconCompletions: [URL: [(NSImage) -> Void]] = [:]
     private var queuedIconURLs: [URL] = []
@@ -79,12 +79,14 @@ final class AppsMenuStore {
         }
     }
 
-    init(defaults: UserDefaults = .standard, applicationDirectories: [URL]? = nil,
+    init(isDeskMote: @escaping @Sendable (String?) -> Bool = { _ in false },
+         defaults: UserDefaults = .standard, applicationDirectories: [URL]? = nil,
          runningApplicationSnapshot: @escaping () -> [NSRunningApplication] = { NSWorkspace.shared.runningApplications },
          readIcon: (@MainActor (URL) async -> NSImage)? = nil,
          readIndex: ReadIndex? = nil,
          systemFileManager: AppsMenuApplication? = nil,
-         openApplication: (@MainActor (URL) -> Void)? = nil) {
+         catalogNow: @escaping () -> ContinuousClock.Instant = { .now },
+         openApplication: (@MainActor (URL, OpenIntent) -> Void)? = nil) {
         let catalogIndex: ReadIndex?
         if let readIndex {
             catalogIndex = readIndex
@@ -93,13 +95,15 @@ final class AppsMenuStore {
         } else {
             catalogIndex = nil
         }
+        self.isDeskMote = isDeskMote
         self.defaults = defaults
         self.applicationDirectories = applicationDirectories
         self.readIndex = catalogIndex
         suppliedSystemFileManager = systemFileManager
-        self.openApplication = openApplication ?? Self.openWorkspaceApplication
+        self.openApplication = openApplication ?? { Self.openWorkspaceApplication(at: $0, intent: $1) }
         self.runningApplicationSnapshot = runningApplicationSnapshot
         self.readIcon = readIcon ?? { await Self.workspaceIcon(at: $0) }
+        self.catalogNow = catalogNow
         applicationIcons.countLimit = 256
         if let data = defaults.data(forKey: Self.catalogKey), data.count <= Self.maxCatalogCacheBytes,
            let catalog = try? JSONDecoder().decode(StoredCatalog.self, from: data),
@@ -123,7 +127,7 @@ final class AppsMenuStore {
     }
 
     func loadCatalog() async -> AppsMenuCatalog {
-        if let catalogSnapshot, let lastCatalogRefresh, lastCatalogRefresh.duration(to: .now) < .seconds(5) {
+        if let catalogSnapshot, let lastCatalogRefresh, lastCatalogRefresh.duration(to: catalogNow()) < .seconds(5) {
             return catalogSnapshot
         }
         return await (catalogRead ?? beginCatalogRead()).value
@@ -137,17 +141,13 @@ final class AppsMenuStore {
         let directories = applicationDirectories
         let readIndex = readIndex
         let suppliedSystemFileManager = suppliedSystemFileManager
-        let read = Task { [weak self] in
-            #if DEBUG
-            let span = ActionResourceLog.begin("apps.catalog.read")
-            defer { span?.finish() }
-            #endif
+        let read = Task { [weak self, isDeskMote] in
             async let installed = Self.discoverInstalledApplications(in: directories, fileManager: suppliedSystemFileManager)
             let all: [AppsMenuApplication]?
             if let readIndex {
                 let roots = directories ?? Self.defaultApplicationDirectories()
                 let indexed = await readIndex(roots)
-                all = await Self.discoverIndexedApplications(indexed, in: roots)
+                all = await Self.discoverIndexedApplications(indexed, in: roots, isDeskMote: isDeskMote)
             } else {
                 all = await installed
             }
@@ -162,7 +162,7 @@ final class AppsMenuStore {
 
     private func updateCatalogSnapshot(_ snapshot: AppsMenuCatalog) {
         catalogRead = nil
-        lastCatalogRefresh = .now
+        lastCatalogRefresh = catalogNow()
         guard snapshot != catalogSnapshot else { return }
         catalogSnapshot = snapshot
         let catalog = StoredCatalog(directories: applicationDirectories, applications: snapshot.installed,
@@ -185,7 +185,7 @@ final class AppsMenuStore {
 
     @concurrent
     private nonisolated static func discoverIndexedApplications(
-        _ indexed: [AppsMenuIndexedApplication]?, in directories: [URL]
+        _ indexed: [AppsMenuIndexedApplication]?, in directories: [URL], isDeskMote: @Sendable (String?) -> Bool
     ) async -> [AppsMenuApplication]? {
         guard let indexed else { return nil }
         let roots = directories.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
@@ -205,7 +205,7 @@ final class AppsMenuStore {
                   let metadata = bundle.infoDictionary,
                   (metadata["LSBackgroundOnly"] as? Bool != true || metadata["LSUIElement"] as? Bool == true) else { continue }
             let identifier = nonEmpty(bundle.bundleIdentifier) ?? url.path
-            guard identifier != "com.apple.apps.launcher", !ApplicationIdentity.isDeskMote(identifier),
+            guard identifier != "com.apple.apps.launcher", !isDeskMote(identifier),
                   identifiers.insert(identifier).inserted else { continue }
             let name = nonEmpty(entry.displayName) ?? FileManager.default.displayName(atPath: url.path)
             applications.append(.init(id: identifier, name: displayTitle(name), url: url,
@@ -331,10 +331,29 @@ final class AppsMenuStore {
         let isActive: Bool
     }
 
+    struct RunningEntry: Equatable {
+        let id: String
+        let application: NSRunningApplication
+        let bundleIdentifier: String?
+        let url: URL?
+        let name: String
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.id == rhs.id && lhs.name == rhs.name && lhs.url == rhs.url &&
+                lhs.bundleIdentifier == rhs.bundleIdentifier && lhs.application.isEqual(rhs.application)
+        }
+    }
+
     static func runningApplications<Application>(in snapshot: [Application],
                                                   state: (Application) -> RunningApplicationState) -> [Application] {
+        identifiedRunningApplications(in: snapshot, state: state).map(\.application)
+    }
+
+    private static func identifiedRunningApplications<Application>(
+        in snapshot: [Application], state: (Application) -> RunningApplicationState
+    ) -> [(id: String, application: Application, info: RunningApplicationState)] {
         var indices: [String: Int] = [:]
-        var applications: [(application: Application, isActive: Bool)] = []
+        var applications: [(id: String, application: Application, info: RunningApplicationState)] = []
         for application in snapshot {
             let info = state(application)
             guard info.pid > 0, info.policy == .regular, !info.isTerminated else { continue }
@@ -347,22 +366,28 @@ final class AppsMenuStore {
                 identity = "pid:\(info.pid)"
             }
             if let index = indices[identity] {
-                if info.isActive, !applications[index].isActive {
-                    applications[index] = (application, true)
+                if info.isActive, !applications[index].info.isActive {
+                    applications[index] = (identity, application, info)
                 }
             } else {
                 indices[identity] = applications.count
-                applications.append((application, info.isActive))
+                applications.append((identity, application, info))
             }
         }
-        return applications.map(\.application)
+        return applications
     }
 
-    func runningApplications() -> [NSRunningApplication] {
-        Self.runningApplications(in: runningApplicationSnapshot()) { application in
+    func runningEntries() -> [RunningEntry] {
+        Self.identifiedRunningApplications(in: runningApplicationSnapshot()) { application in
             .init(pid: application.processIdentifier, bundleIdentifier: application.bundleIdentifier,
                   url: application.bundleURL, policy: application.activationPolicy,
                   isTerminated: application.isTerminated, isActive: application.isActive)
+        }.map { entry in
+            let info = entry.info
+            let name = entry.application.localizedName ?? info.bundleIdentifier ??
+                info.url?.deletingPathExtension().lastPathComponent ?? String(info.pid)
+            return RunningEntry(id: entry.id, application: entry.application, bundleIdentifier: info.bundleIdentifier,
+                                url: info.url, name: name)
         }
     }
 
@@ -404,36 +429,32 @@ final class AppsMenuStore {
         return icon
     }
 
-    func launch(_ application: AppsMenuApplication) {
-        openApplication(application.url)
+    enum OpenIntent: Equatable {
+        case background
+        case foreground
+    }
+
+    func launch(_ application: AppsMenuApplication, intent: OpenIntent) {
+        openApplication(application.url, intent)
     }
 
     func reopen(_ application: NSRunningApplication) {
         if let url = application.bundleURL, url.isFileURL {
-            openApplication(url)
+            openApplication(url, .foreground)
         } else {
-            #if DEBUG
-            let span = ActionResourceLog.begin("apps.application.activate")
-            defer { span?.finish() }
-            #endif
             application.activate(options: [])
         }
     }
 
-    private static func openWorkspaceApplication(at url: URL) {
+    static func openConfiguration(for intent: OpenIntent) -> NSWorkspace.OpenConfiguration {
         let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        let completion: (@Sendable (NSRunningApplication?, (any Error)?) -> Void)?
-        #if DEBUG
-        if let span = ActionResourceLog.begin("apps.application.open") {
-            completion = { _, _ in span.finish() }
-        } else {
-            completion = nil
-        }
-        #else
-        completion = nil
-        #endif
-        NSWorkspace.shared.openApplication(at: url, configuration: configuration, completionHandler: completion)
+        configuration.activates = intent == .foreground
+        return configuration
+    }
+
+    private static func openWorkspaceApplication(at url: URL, intent: OpenIntent) {
+        let configuration = openConfiguration(for: intent)
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration, completionHandler: nil)
     }
 
     func pin(_ application: AppsMenuApplication) {
@@ -526,10 +547,6 @@ final class AppsMenuStore {
     }
 
     private func updatePins(_ edit: (inout [AppsMenuPin]) -> Void) {
-        #if DEBUG
-        let span = ActionResourceLog.begin("apps.pin.persist")
-        defer { span?.finish() }
-        #endif
         var updated = pins
         edit(&updated)
         guard updated != pins, let data = try? JSONEncoder().encode(updated) else { return }

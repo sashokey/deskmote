@@ -1,8 +1,5 @@
 import CoreGraphics
 import Foundation
-#if DEBUG
-import os
-#endif
 
 struct SpaceReadFailure: Error, Hashable, Sendable, CustomStringConvertible {
     enum Reason: String, Sendable {
@@ -124,13 +121,7 @@ enum ManagedSpaceLayoutReader {
         }
         return copySpaces.flatMap { copy in
             SpaceNativeReader.connectionID().flatMap { connection in
-                #if DEBUG
-                let resources = ActionResourceLog.begin("native.spaces.layouts")
-                #endif
                 let response = copy(connection)?.takeRetainedValue()
-                #if DEBUG
-                resources?.finish()
-                #endif
                 guard let result = response else { return failure(.nullResponse) }
                 guard CFGetTypeID(result) == CFArrayGetTypeID() else { return failure(.invalidType, field: "response") }
                 return parseChecked(result)
@@ -209,27 +200,13 @@ enum ManagedSpaceLayoutReader {
 }
 
 enum WindowSpaceObservation {
+    #if DESKMOTE_TEST
     enum Mode: String {
         case standard
-        case verify
         case batch
 
-        static var live: Self {
-            #if DEBUG
-            DebugSwitch.spaceBatchMode.value().flatMap(Self.init(rawValue:)) ?? .standard
-            #else
-            .standard
-            #endif
-        }
     }
 
-    #if DEBUG
-    private static let logger = Logger(subsystem: "io.github.sashokey.deskmote", category: "space-membership")
-    #endif
-
-    static func capture(_ requests: [WindowSpaceRequest]) -> WindowSpaceSnapshot? {
-        capture(requests, cancellation: OperationCancellation())
-    }
 
     static func capture(_ requests: [WindowSpaceRequest], cancellation: OperationCancellation,
                         maximumDuration: TimeInterval = 1,
@@ -260,7 +237,7 @@ enum WindowSpaceObservation {
     static func readMemberships(_ requests: [WindowSpaceRequest], layouts: [String: SpaceLayoutSnapshot],
                                 cancellation: OperationCancellation, maximumDuration: TimeInterval = 1,
                                 uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-                                mode: Mode = .batch,
+                                mode: Mode,
                                 membership: (Int) -> Result<[Int], SpaceReadFailure> = WindowSpaceMembershipReader.readSpaceIDs,
                                 windowsInSpace: (Int) -> Result<Set<Int>, SpaceReadFailure> = WindowSpaceMembershipReader.readWindowNumbers)
         -> Result<SpaceMembershipRead, SpaceReadFailure> {
@@ -275,26 +252,8 @@ enum WindowSpaceObservation {
                                         windowsInSpace: (Int) -> Result<Set<Int>, SpaceReadFailure>)
         -> Result<SpaceMembershipRead, SpaceReadFailure> {
         var failures: [SpaceReadFailure] = []
-        var uniqueNumbers: Set<Int> = []
-        let numbers = requests.map { Int($0.identity.windowID) }.filter { uniqueNumbers.insert($0).inserted }
-
-        func record(_ failure: SpaceReadFailure) {
-            if !failures.contains(failure) { failures.append(failure) }
-        }
-
-        func readByWindow(using cached: [Int: Set<Int>]) -> [Int: Set<Int>]? {
-            var result = cached
-            for number in numbers where result[number] == nil {
-                guard budget.canContinue else { return nil }
-                switch membership(number) {
-                case .success(let ids): result[number] = Set(ids)
-                case .failure(let failure): record(failure)
-                }
-            }
-            return result
-        }
-
         func readBySpace() -> [Int: Set<Int>]? {
+            let uniqueNumbers = Set(requests.map { Int($0.identity.windowID) })
             let scalarOnly = Set(requests.filter { $0.isParked || !$0.isOnDesktop || $0.isUtility }
                 .map { Int($0.identity.windowID) })
             let eligible = uniqueNumbers.subtracting(scalarOnly)
@@ -317,7 +276,7 @@ enum WindowSpaceObservation {
                         result[number, default: []].insert(space)
                     }
                 case .failure(let failure):
-                    record(failure)
+                    failures.append(failure)
                     return nil
                 }
             }
@@ -325,14 +284,34 @@ enum WindowSpaceObservation {
         }
 
         let cache = mode == .batch ? readBySpace() ?? [:] : [:]
-        guard let result = readByWindow(using: cache), budget.canContinue else { return interrupted() }
-        if mode == .verify, let batched = readBySpace(), let candidate = readByWindow(using: batched) {
-            #if DEBUG
-            logger.notice("space batch parity matches=\(result == candidate, privacy: .public) windows=\(numbers.count, privacy: .public) batchedWindows=\(batched.count, privacy: .public)")
-            #endif
+        return readByWindow(requests, budget: budget, membership: membership, cache: cache, initialFailures: failures)
+    }
+    #endif
+
+    static func readMemberships(_ requests: [WindowSpaceRequest], cancellation: OperationCancellation)
+        -> Result<SpaceMembershipRead, SpaceReadFailure> {
+        let budget = OperationReadBudget(maximumDuration: 1, cancellation: cancellation)
+        return readByWindow(requests, budget: budget, membership: WindowSpaceMembershipReader.readSpaceIDs)
+    }
+
+    private static func readByWindow(_ requests: [WindowSpaceRequest], budget: OperationReadBudget,
+                                     membership: (Int) -> Result<[Int], SpaceReadFailure>,
+                                     cache: [Int: Set<Int>] = [:], initialFailures: [SpaceReadFailure] = [])
+        -> Result<SpaceMembershipRead, SpaceReadFailure> {
+        var failures = initialFailures
+        var result = cache
+        var read = Set(cache.keys)
+        for request in requests {
+            let number = Int(request.identity.windowID)
+            guard read.insert(number).inserted else { continue }
+            guard budget.canContinue else { return interrupted() }
+            switch membership(number) {
+            case .success(let ids): result[number] = Set(ids)
+            case .failure(let failure):
+                if !failures.contains(failure) { failures.append(failure) }
+            }
         }
         guard budget.canContinue else { return interrupted() }
-
         var memberships: [WindowSpaceIdentity: Set<Int>] = [:]
         for request in requests {
             memberships[request.identity] = result[Int(request.identity.windowID)]
@@ -348,19 +327,23 @@ enum WindowSpaceObservation {
 
 enum WindowSpaceMembershipReader {
     private typealias CopySpacesForWindows = @convention(c) (Int32, Int32, CFArray) -> Unmanaged<CFTypeRef>?
+    static let membershipAPI = "SLSCopySpacesForWindows"
+    private static let copySpaces = SpaceNativeReader.function(membershipAPI, as: CopySpacesForWindows.self)
+
+    #if DESKMOTE_TEST
     private typealias CopyWindowsForSpace = @convention(c) (
         Int32, UInt32, CFArray, UInt32, UnsafeMutablePointer<UInt64>, UnsafeMutablePointer<UInt64>
     ) -> Unmanaged<CFTypeRef>?
 
-    static let membershipAPI = "SLSCopySpacesForWindows"
     static let batchAPI = "SLSCopyWindowsWithOptionsAndTags"
-    private static let copySpaces = SpaceNativeReader.function(membershipAPI, as: CopySpacesForWindows.self)
     private static let copyWindows = SpaceNativeReader.function(batchAPI, as: CopyWindowsForSpace.self)
 
     static func windowNumbers(forSpaceID spaceID: Int) -> Set<Int>? { try? readWindowNumbers(spaceID).get() }
+    #endif
 
     static func spaceIDs(forWindowNumber windowNumber: Int) -> [Int]? { try? readSpaceIDs(windowNumber).get() }
 
+    #if DESKMOTE_TEST
     static func readWindowNumbers(_ spaceID: Int) -> Result<Set<Int>, SpaceReadFailure> {
         guard spaceID > 0 else {
             return .failure(SpaceReadFailure(api: batchAPI, reason: .invalidValue, field: "Space ID", value: spaceID))
@@ -370,17 +353,13 @@ enum WindowSpaceMembershipReader {
                 var setTags: UInt64 = 0
                 var clearTags: UInt64 = 0
                 let numbers = [NSNumber(value: spaceID)] as CFArray
-                #if DEBUG
-                let resources = ActionResourceLog.begin("native.spaces.windowsForSpace")
-                #endif
                 let response = copy(connection, 0, numbers, 0x7, &setTags, &clearTags)?.takeRetainedValue()
-                #if DEBUG
-                resources?.finish()
-                #endif
                 return SpaceNativeReader.identifiers(response, api: batchAPI).map(Set.init)
             }
         }
     }
+
+    #endif
 
     static func readSpaceIDs(_ windowNumber: Int) -> Result<[Int], SpaceReadFailure> {
         guard windowNumber > 0 else {
@@ -390,13 +369,7 @@ enum WindowSpaceMembershipReader {
         return copySpaces.flatMap { copy in
             SpaceNativeReader.connectionID().flatMap { connection in
                 let numbers = [NSNumber(value: windowNumber)] as CFArray
-                #if DEBUG
-                let resources = ActionResourceLog.begin("native.spaces.membership")
-                #endif
                 let response = copy(connection, 0x7, numbers)?.takeRetainedValue()
-                #if DEBUG
-                resources?.finish()
-                #endif
                 return SpaceNativeReader.identifiers(response, api: membershipAPI)
             }
         }

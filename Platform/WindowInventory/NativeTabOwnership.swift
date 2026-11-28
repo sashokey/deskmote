@@ -94,9 +94,6 @@ enum PhantomSeatDecision {
 
     struct Evaluation: Equatable {
         let permitsSeatRelease: Bool
-        #if DEBUG
-        let retentionReasons: Set<HoldReason>
-        #endif
     }
 
     static func evaluate(
@@ -110,14 +107,8 @@ enum PhantomSeatDecision {
         hasCoframedAXSibling: Bool
     ) -> Evaluation {
         var permitsSeatRelease = true
-        #if DEBUG
-        var reasons: Set<HoldReason> = []
-        #endif
         func hold(_ reason: HoldReason) {
             permitsSeatRelease = false
-            #if DEBUG
-            reasons.insert(reason)
-            #endif
         }
         if everSeenVisible { hold(.everSeenVisible) }
         if axAbsentFor < threshold { hold(.absenceGraceNotElapsed) }
@@ -126,11 +117,7 @@ enum PhantomSeatDecision {
         if axPresentSiblingCount < 1 { hold(.noAXPresentSibling) }
         if !confirmedDormantWindow { hold(.dormantWindowUnconfirmed) }
         if !hasCoframedAXSibling { hold(.noCoframedAXSibling) }
-        #if DEBUG
-        return Evaluation(permitsSeatRelease: permitsSeatRelease, retentionReasons: reasons)
-        #else
         return Evaluation(permitsSeatRelease: permitsSeatRelease)
-        #endif
     }
 
     static func permitsSeatRelease(
@@ -156,6 +143,3 @@ enum PhantomSeatDecision {
     }
 }
 
-#if DEBUG
-extension PhantomSeatDecision.HoldReason: Codable {}
-#endif

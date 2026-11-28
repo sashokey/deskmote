@@ -9,10 +9,9 @@ source Scripts/lib/release_binary.sh
 variant="${1:-}"
 case "$variant" in
   full) configuration=full; excluded_targets='' ;;
-  base) configuration=base; excluded_targets='CommandShift|NaturalSwitch|BatteryRun|DeskMoteWidgets|DeskMoteFinder|DeskMoteFinderService' ;;
-  no-widget) configuration=no_widget; excluded_targets='DeskMoteWidgets' ;;
+  base) configuration=base; excluded_targets='CommandShift|NaturalSwitch|BatteryRun|DeskMoteApps|DeskMoteFinder|DeskMoteFinderService' ;;
   no-finder) configuration=no_finder; excluded_targets='DeskMoteFinder|DeskMoteFinderService' ;;
-  *) printf 'Usage: bash Scripts/build.sh {full|base|no-widget|no-finder} [--local vN]\n' >&2; exit 2 ;;
+  *) printf 'Usage: bash Scripts/build.sh {full|base|no-finder} [--local vN]\n' >&2; exit 2 ;;
 esac
 shift
 if [[ "$#" -ne 0 && ( "$#" -ne 2 || "$1" != --local || "$variant" != full ) ]]; then
@@ -55,6 +54,7 @@ xcodebuild build \
   ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
   DESKMOTE_VARIANT="$configuration" \
   CODE_SIGNING_ALLOWED=NO \
+  LD_GENERATE_MAP_FILE=YES \
   CLANG_ENABLE_CODE_COVERAGE=NO CLANG_COVERAGE_MAPPING=NO \
   MARKETING_VERSION="$number.0.0" CURRENT_PROJECT_VERSION="$number" \
   DESKMOTE_PUBLIC_VERSION="$version" DESKMOTE_SOURCE_REVISION="$revision" \
@@ -66,6 +66,7 @@ if [[ -n "$excluded_targets" ]] &&
   exit 1
 fi
 
+python3 Scripts/check_release_inputs.py "$variant" "$output/DerivedData" >&2
 app="$output/DerivedData/Build/Products/Release/DeskMote.app"
 binary="$app/Contents/MacOS/DeskMote"
 cp LICENSE "$app/Contents/Resources/LICENSE"
@@ -75,9 +76,6 @@ verify_release_binary "$binary" >&2
 sign() {
   codesign --force --sign - --timestamp=none --options runtime "$@"
 }
-if [[ -d "$app/Contents/PlugIns/DeskMoteWidgets.appex" ]]; then
-  sign --entitlements Extensions/Widgets/Widget.entitlements "$app/Contents/PlugIns/DeskMoteWidgets.appex"
-fi
 if [[ -d "$app/Contents/PlugIns/DeskMoteFinder.appex" ]]; then
   finder="$app/Contents/PlugIns/DeskMoteFinder.appex"
   sign "$finder/Contents/XPCServices/DeskMoteFinderService.xpc"
@@ -87,7 +85,4 @@ sign "$app"
 
 python3 Scripts/check_availability_warnings.py "$output/xcodebuild.log" >&2
 python3 Scripts/check_bundle.py "$app" "$variant" "$version" "$revision" >&2
-if [[ -d "$app/Contents/PlugIns/DeskMoteWidgets.appex" ]]; then
-  python3 Tests/Widgets/CheckIntent.py "$app" >&2
-fi
 printf '%s\n' "$app"

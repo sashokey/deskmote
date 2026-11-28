@@ -4,9 +4,15 @@ import Darwin
 enum PowerHistoryLoader {
     private static let queue = DispatchQueue(label: "DeskMote.BatteryRun.PowerHistory", qos: .utility)
 
-    static func load(using read: @escaping @Sendable () -> PowerHistory?) async -> PowerHistory? {
+    static func loadSnapshot(
+        readJournal: @escaping @Sendable () -> String?,
+        readWatts: @escaping @Sendable () -> PowerWatts
+    ) async -> BatteryDisplaySnapshot {
         await withCheckedContinuation { continuation in
-            queue.async { continuation.resume(returning: read()) }
+            queue.async {
+                let report = readJournal().map { PowerHistory(from: $0, before: Date()).batteryReport() }
+                continuation.resume(returning: BatteryDisplaySnapshot(report: report, watts: readWatts()))
+            }
         }
     }
 

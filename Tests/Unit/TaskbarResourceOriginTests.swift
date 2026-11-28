@@ -53,10 +53,8 @@ final class TaskbarResourceOriginTests: XCTestCase {
         }
         let inventory = OriginInventory(DockSnapshot(
             windows: Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) }), orderedWindowIDs: records.map(\.id)))
-        let log = WindowInventoryAnomalyLog(configuration: .init(enabled: false, directoryURL: directory,
-            maxFileSize: 1_048_576, archiveCount: 0))
-        let runtime = AppRuntime(inventoryLog: log, tracker: inventory)
-        let ordering = StripOrderStore(defaults: OriginMemoryDefaults(), bootTimeProvider: { 1 }, inventoryLog: log)
+        let runtime = AppRuntime(tracker: inventory)
+        let ordering = StripOrderStore(defaults: OriginMemoryDefaults(), bootTimeProvider: { 1 })
         let topology = DisplayTopologyStore(initialSnapshot: .init(physicalDisplayCount: 1,
             identifiedDisplayUUIDs: ["fixture"], attributionTable: .init(displays: [
                 .init(uuid: "fixture", cgFrame: CGRect(x: 0, y: 0, width: 1920, height: 1080))

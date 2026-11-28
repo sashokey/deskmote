@@ -8,12 +8,12 @@ from check_availability_warnings import availability_warnings
 class AvailabilityWarningsTests(unittest.TestCase):
     def test_reports_app_and_tool_warnings_once_but_ignores_sdk_diagnostics(self):
         warning = "/repo/App/View.swift:4: warning: API is only available in macOS 27.0 or newer"
-        tool = "/repo/Tools/DeskMoteWindowLab/CommandLine/main.swift:8: warning: API is only available in macOS 27.0 or newer"
+        tool = "/repo/App/DesktopAppLifecycle/DeskMoteApp.swift:8: warning: API is only available in macOS 27.0 or newer"
         sdk = "/SDK/Foundation.swift:9: warning: API is only available in macOS 27.0 or newer"
         with tempfile.TemporaryDirectory() as directory:
             log = pathlib.Path(directory) / "build.log"
             module = "/repo/Modules/BatteryRun/My File.swift:8:10: warning: API is only available in macOS 28 or newer"
-            extension = "/repo/Extensions/Widgets/Widget.swift:8:10: error: API is only available in macOS 28 or newer"
+            extension = "/repo/Extensions/FinderFileCreator/FinderSync.swift:8:10: error: API is only available in macOS 28 or newer"
             log.write_text("\n".join([warning, warning, tool, module, extension, sdk, "BUILD SUCCEEDED"]))
             self.assertEqual(availability_warnings([log]), [warning, tool, module, extension])
 

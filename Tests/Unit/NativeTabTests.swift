@@ -94,7 +94,7 @@ final class PhantomSeatDecisionTests: XCTestCase {
             cgStillPresent: true, axReadSawWindows: true, axPresentSiblingCount: 1,
             confirmedDormantWindow: false, hasCoframedAXSibling: true
         )
-        XCTAssertEqual(evaluation.retentionReasons, [.dormantWindowUnconfirmed])
+        XCTAssertFalse(evaluation.permitsSeatRelease)
     }
 
     func testDormantWindowWithoutCoframedSiblingCannotHeal() {
@@ -104,10 +104,10 @@ final class PhantomSeatDecisionTests: XCTestCase {
             cgStillPresent: true, axReadSawWindows: true, axPresentSiblingCount: 1,
             confirmedDormantWindow: true, hasCoframedAXSibling: false
         )
-        XCTAssertEqual(evaluation.retentionReasons, [.noCoframedAXSibling])
+        XCTAssertFalse(evaluation.permitsSeatRelease)
     }
 
-    func testEvaluationExportsAllFailedGates() {
+    func testEvaluationRejectsWhenEveryGateFails() {
         let evaluation = PhantomSeatDecision.evaluate(
             everSeenVisible: true,
             axAbsentFor: 9.9,
@@ -118,15 +118,6 @@ final class PhantomSeatDecisionTests: XCTestCase {
         )
 
         XCTAssertFalse(evaluation.permitsSeatRelease)
-        XCTAssertEqual(evaluation.retentionReasons, [
-            .everSeenVisible,
-            .absenceGraceNotElapsed,
-            .cgMissing,
-            .noEligibleWindows,
-            .noAXPresentSibling,
-            .dormantWindowUnconfirmed,
-            .noCoframedAXSibling,
-        ])
     }
 
     func testEvaluationExportsEachFailedGate() {
@@ -161,13 +152,12 @@ final class PhantomSeatDecisionTests: XCTestCase {
             )),
         ]
 
-        for (reason, evaluation) in cases {
+        for (_, evaluation) in cases {
             XCTAssertFalse(evaluation.permitsSeatRelease)
-            XCTAssertEqual(evaluation.retentionReasons, [reason])
         }
     }
 
-    func testEvaluationHasNoHoldReasonsWhenAllGatesPass() {
+    func testEvaluationPermitsReleaseWhenAllGatesPass() {
         let evaluation = PhantomSeatDecision.evaluate(
             everSeenVisible: false,
             axAbsentFor: 10,
@@ -178,7 +168,6 @@ final class PhantomSeatDecisionTests: XCTestCase {
         )
 
         XCTAssertTrue(evaluation.permitsSeatRelease)
-        XCTAssertTrue(evaluation.retentionReasons.isEmpty)
     }
 }
 

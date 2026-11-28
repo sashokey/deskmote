@@ -16,11 +16,7 @@ final class FinderFileCreationHandler: NSObject, FinderFileCreationProtocol {
         do {
             _ = try FileCreator.create(fileType, in: directory, expectedDirectory: captured)
             reply(true)
-        } catch let failure as POSIXError {
-            FinderFileCreationIPC.logger.error("Finder file creation failed with errno \(failure.code.rawValue, privacy: .public)")
-            reply(false)
         } catch {
-            FinderFileCreationIPC.logger.error("Finder file creation failed")
             reply(false)
         }
     }
@@ -29,8 +25,9 @@ final class FinderFileCreationHandler: NSObject, FinderFileCreationProtocol {
 final class FinderFileCreationListener: NSObject, NSXPCListenerDelegate {
     private let peerRequirement: String
 
-    init(peerRequirement: String) {
-        self.peerRequirement = peerRequirement
+    init?(extensionURL: URL) {
+        guard let requirement = FinderFileCreationIPC.requirement(for: extensionURL) else { return nil }
+        peerRequirement = requirement
     }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {

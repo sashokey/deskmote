@@ -104,7 +104,7 @@ final class ProcessGenerationCache<Value: Sendable>: Sendable {
         lhs.tv_sec == rhs.tv_sec && lhs.tv_usec == rhs.tv_usec
     }
 
-    #if DEBUG
+    #if DESKMOTE_TEST
     var countForTesting: Int { storage.withLock { $0.entries.count } }
     #endif
 }

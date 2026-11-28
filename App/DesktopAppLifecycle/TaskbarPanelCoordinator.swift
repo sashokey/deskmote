@@ -4,7 +4,6 @@ import Combine
 @MainActor
 final class PanelCoordinator: NSObject {
     var panelHeight: CGFloat { TaskbarMetrics.height }
-    static let panelLevelOverride: NSWindow.Level? = DebugSwitch.panelLevel.value().flatMap(Int.init).map { NSWindow.Level(rawValue: $0) }
     let runtime: AppRuntime
     let stripOrderStore: StripOrderStore
     let spaceStore: TaskbarSpaceStore
@@ -15,13 +14,10 @@ final class PanelCoordinator: NSObject {
     var taskbarPresenter: TaskbarPresenter?
     var isSuspendedForPermissionLoss = false
     var displayTopologySubscription: AnyCancellable?
-    #if DEBUG
-    let taskbarVisibilityJournal = TaskbarVisibilityJournal.live()
-    var panelVisibilityObserver: NSObjectProtocol?
-    #endif
     var lastHideWasForFullscreen = false
     var visibilityState = PanelVisibilityState.unknown
     var panelsAreVisible = false
+    var leadingSlotFactory: TaskbarLeadingSlotFactory?
     var onAccessoryInteraction: ((PanelCoordinator, AccessoryKind) -> Bool)?
 
     enum AccessoryKind { case explicit, implicit, backgroundClick }
@@ -55,41 +51,24 @@ final class PanelCoordinator: NSObject {
 
     func start() -> Bool {
         guard !isSuspendedForPermissionLoss, dockPanel == nil else { return false }
-        #if DEBUG
-        let span = ActionResourceLog.begin("taskbar.panel.attach")
-        defer { span?.finish() }
-        #endif
         guard setupDockPanel() else { return false }
         presentInitialPanels()
         subscribeSettings()
-        #if DEBUG
-        startPanelVisibilityObservation()
-        #endif
         return true
     }
 
     isolated deinit {
-        #if DEBUG
-        stopPanelVisibilityObservation()
-        #endif
         taskbarView?.taskbarContent.prepareForHiding()
     }
 
     func tearDown(source: String = "teardown") {
         guard !isSuspendedForPermissionLoss else { return }
-        #if DEBUG
-        let span = ActionResourceLog.begin("taskbar.panel.release")
-        defer { span?.finish() }
-        #endif
         isSuspendedForPermissionLoss = true
         panelsAreVisible = false
         visibilityState = .unknown
         displayTopologySubscription?.cancel()
         displayTopologySubscription = nil
         taskbarPresenter?.setPanelVisible(false)
-        #if DEBUG
-        stopPanelVisibilityObservation()
-        #endif
         orderDockSurfaceOut(source: source)
         taskbarPresenter = nil
         dockContentHost = nil
